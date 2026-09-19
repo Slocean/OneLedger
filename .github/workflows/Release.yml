@@ -76,7 +76,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "release_name=OneLedger ${RAW}" >> "$GITHUB_OUTPUT"
-          echo "zip_name=OneLedger-${RAW}-win.zip" >> "$GITHUB_OUTPUT"
+          echo "exe_name=OneLedger.exe" >> "$GITHUB_OUTPUT"
           echo "Resolved version=$RAW tag=$TAG"
 
       - name: Setup Node.js
@@ -98,22 +98,18 @@ jobs:
       - name: Pack desktop app
         run: npm run pack
 
-      - name: Zip portable app and hash
+      - name: Hash exe
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $src = "release\desktop\OneLedger"
-          if (-not (Test-Path -LiteralPath "$src\OneLedger.exe")) {
+          $exe = "release\OneLedger.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
             throw "OneLedger.exe missing after pack"
           }
-          $zipName = "${{ steps.ver.outputs.zip_name }}"
-          $zipPath = Join-Path "release" $zipName
-          if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
-          Compress-Archive -Path "$src\*" -DestinationPath $zipPath -Force
-          $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash *$zipName" | Set-Content -LiteralPath "$zipPath.sha256" -Encoding ascii
-          Get-ChildItem release | Select-Object Name, Length
-          Get-Content -LiteralPath "$zipPath.sha256"
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *OneLedger.exe" | Set-Content -LiteralPath "release\OneLedger.exe.sha256" -Encoding ascii
+          Get-ChildItem release -File | Select-Object Name, Length
+          Get-Content -LiteralPath "release\OneLedger.exe.sha256"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -124,8 +120,8 @@ jobs:
           prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
           generate_release_notes: true
           files: |
-            release/${{ steps.ver.outputs.zip_name }}
-            release/${{ steps.ver.outputs.zip_name }}.sha256
+            release/OneLedger.exe
+            release/OneLedger.exe.sha256
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
