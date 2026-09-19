@@ -5,17 +5,21 @@ use crate::store;
 use crate::sync::{apply_remote_memories, authorize_node, sync_with_remote};
 use crate::util::{hash_token, new_id, now_iso, safe_equal, APP_VERSION, DATA_SCHEMA_VERSION, PROTOCOL_VERSION};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use rust_embed::RustEmbed;
 use rusqlite::Connection;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
+
+#[derive(RustEmbed)]
+#[folder = "web-assets/"]
+struct WebAssets;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -69,22 +73,37 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sync/push", post(sync_push))
         .route("/mcp", get(mcp_get).post(mcp_post))
         .layer(CorsLayer::permissive())
-        .with_state(state);
-
-    if web_dir.join("index.html").exists() {
-        api.route("/", get({
-            let web_dir = web_dir.clone();
-            move || serve_index(web_dir.clone())
-        }))
-        .fallback_service(ServeDir::new(web_dir))
-    } else {
-        api
-    }
+        .with_state(state)
+        .route("/", get(serve_root))
+        .fallback(serve_embedded);
+    let _ = web_dir;
+    api
 }
 
-async fn serve_index(web_dir: PathBuf) -> impl IntoResponse {
-    let html = std::fs::read_to_string(web_dir.join("index.html")).unwrap_or_else(|_| "OneLedger".into());
-    Html(html)
+async fn serve_root() -> Response {
+    serve_asset("index.html")
+}
+
+async fn serve_embedded(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    serve_asset(if path.is_empty() { "index.html" } else { path })
+}
+
+fn serve_asset(path: &str) -> Response {
+    match WebAssets::get(path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            ([(header::CONTENT_TYPE, mime.essence_str())], file.data.to_vec()).into_response()
+        }
+        None => {
+            if path != "index.html" {
+                if let Some(file) = WebAssets::get("index.html") {
+                    return Html(String::from_utf8_lossy(&file.data).into_owned()).into_response();
+                }
+            }
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 async fn health() -> impl IntoResponse {

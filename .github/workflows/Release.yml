@@ -5,7 +5,7 @@ name: Release
 #   npm run release
 #   Actions → Run workflow
 #
-# 成品：Tauri NSIS 安装包 OneLedger.exe（不是 Electron）
+# 成品：OneLedger-Setup.exe（安装版）+ OneLedger-Portable.exe（便携版）
 
 on:
   workflow_dispatch:
@@ -118,14 +118,15 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "release\OneLedger.exe"
-          if (-not (Test-Path -LiteralPath $exe)) {
-            throw "OneLedger.exe missing after Tauri pack"
+          foreach ($name in @("OneLedger-Setup.exe", "OneLedger-Portable.exe")) {
+            $exe = Join-Path "release" $name
+            if (-not (Test-Path -LiteralPath $exe)) {
+              throw "$name missing after Tauri pack"
+            }
+            $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash *$name" | Set-Content -LiteralPath "$exe.sha256" -Encoding ascii
           }
-          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash *OneLedger.exe" | Set-Content -LiteralPath "release\OneLedger.exe.sha256" -Encoding ascii
           Get-ChildItem release -File | Select-Object Name, Length
-          Get-Content -LiteralPath "release\OneLedger.exe.sha256"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -136,8 +137,10 @@ jobs:
           prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
           generate_release_notes: true
           files: |
-            release/OneLedger.exe
-            release/OneLedger.exe.sha256
+            release/OneLedger-Setup.exe
+            release/OneLedger-Setup.exe.sha256
+            release/OneLedger-Portable.exe
+            release/OneLedger-Portable.exe.sha256
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

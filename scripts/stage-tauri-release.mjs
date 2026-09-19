@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const nsisDir = join(root, "src-tauri", "target", "release", "bundle", "nsis");
+const portableSrc = join(root, "src-tauri", "target", "release", "OneLedger.exe");
 const outDir = join(root, "release");
 
 function findSetup(dir) {
@@ -21,9 +22,15 @@ const setup = findSetup(nsisDir);
 if (!setup) {
   throw new Error(`Tauri NSIS installer missing under ${nsisDir}`);
 }
+if (!existsSync(portableSrc)) {
+  throw new Error(`portable exe missing: ${portableSrc}`);
+}
 
 mkdirSync(outDir, { recursive: true });
-const dest = join(outDir, "OneLedger.exe");
-copyFileSync(setup, dest);
-writeFileSync(join(outDir, "ONELEDGER_SOURCE.txt"), `${setup}\n`);
-console.log(`tauri installer -> ${dest}`);
+const setupDest = join(outDir, "OneLedger-Setup.exe");
+const portableDest = join(outDir, "OneLedger-Portable.exe");
+copyFileSync(setup, setupDest);
+copyFileSync(portableSrc, portableDest);
+writeFileSync(join(outDir, "ONELEDGER_SOURCE.txt"), `setup ${setup}\nportable ${portableSrc}\n`);
+console.log(`installer -> ${setupDest}`);
+console.log(`portable  -> ${portableDest}`);

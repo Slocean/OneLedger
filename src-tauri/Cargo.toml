@@ -26,6 +26,8 @@ rand = "0.8"
 ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rust-embed = "8"
+mime_guess = "2"
 
 [profile.release]
 panic = "abort"
