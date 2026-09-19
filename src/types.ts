@@ -1,6 +1,6 @@
-export const APP_VERSION = "0.1.0";
+export const APP_VERSION = "0.2.0";
 export const CONFIG_SCHEMA_VERSION = 1;
-export const DATA_SCHEMA_VERSION = 1;
+export const DATA_SCHEMA_VERSION = 2;
 export const PROTOCOL_VERSION = 1;
 
 export type StorageDriver = "sqlite" | "postgres";
@@ -8,6 +8,7 @@ export type SyncRole = "local" | "leaf" | "hub";
 export type DistillProvider = "none" | "openai-compatible";
 export type Sensitivity = "public" | "internal" | "pii" | "secret";
 export type MemoryStatus = "inbox" | "proposed" | "active" | "forgotten";
+export type QueueStatus = "proposed" | "rejected";
 export type MemoryScopeKind = "global" | "project" | "personal";
 
 export interface AppConfig {
@@ -28,6 +29,9 @@ export interface AppConfig {
   collect: {
     cursor: boolean;
     claude: boolean;
+    codex: boolean;
+    continue: boolean;
+    projects: boolean;
     intervalMin: number;
     extraRoots: string[];
   };
@@ -41,6 +45,7 @@ export interface AppConfig {
     scanEnabled: boolean;
     allowInternalInSearch: boolean;
   };
+  updateUrl: string;
   adminToken: string;
 }
 
@@ -56,6 +61,7 @@ export interface MemoryRecord {
   source: string;
   originNode: string;
   contentHash: string;
+  supersededBy: string | null;
   createdAt: string;
   updatedAt: string;
   forgottenAt: string | null;
@@ -70,6 +76,8 @@ export interface InboxRecord {
   scopeId: string;
   sensitivity: Sensitivity;
   redacted: number;
+  queueStatus: QueueStatus;
+  conflictIds: string[];
   createdAt: string;
 }
 
@@ -99,6 +107,7 @@ export interface CollectResult {
   source: string;
   scannedFiles: number;
   ingested: number;
+  queued: number;
   skipped: number;
   redacted: number;
 }

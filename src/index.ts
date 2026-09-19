@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { serve } from "@hono/node-server";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { openDb, type Db } from "./db/driver.js";
 import { Store } from "./memory/store.js";
@@ -23,7 +25,9 @@ async function ensureDefaultKey(service: MemoryService, store: Store): Promise<v
   const keys = await store.listKeys();
   if (keys.length > 0) return;
   const issued = await service.issueKey("default-agent");
-  console.log(`Issued first MCP key (store it now): ${issued.token}`);
+  const keyFile = join(homeDir(), "FIRST_MCP_KEY.txt");
+  writeFileSync(keyFile, `${issued.token}\n`, "utf8");
+  console.log(`Issued first MCP key. Saved to ${keyFile}`);
 }
 
 function printBanner(config: ReturnType<typeof loadConfig>): void {

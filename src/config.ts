@@ -27,8 +27,11 @@ export function defaultConfig(): AppConfig {
     collect: {
       cursor: true,
       claude: true,
+      projects: true,
       intervalMin: 30,
       extraRoots: [],
+      codex: true,
+      continue: true,
     },
     distill: {
       provider: "none",
@@ -40,6 +43,7 @@ export function defaultConfig(): AppConfig {
       scanEnabled: true,
       allowInternalInSearch: true,
     },
+    updateUrl: "",
     adminToken: randomSecret(24),
   };
 }

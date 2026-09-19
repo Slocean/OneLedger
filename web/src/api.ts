@@ -35,6 +35,18 @@ export const api = {
   config: () => request<Record<string, unknown>>("/api/config"),
   saveConfig: (body: unknown) => request<{ ok: boolean }>("/api/config", { method: "PUT", body: JSON.stringify(body) }),
   memories: () => request<{ memories: Memory[] }>("/api/memories"),
+  remember: (body: string, title?: string, promote = false) =>
+    request<{ inboxId: string; memoryId?: string; redacted: boolean; queued: boolean }>("/api/remember", {
+      method: "POST",
+      body: JSON.stringify({ body, title, promote }),
+    }),
+  promote: (id: string, supersedeIds: string[] = []) =>
+    request<{ memory: Memory }>(`/api/inbox/${id}/promote`, {
+      method: "POST",
+      body: JSON.stringify({ supersedeIds }),
+    }),
+  reject: (id: string) => request<{ ok: boolean }>(`/api/inbox/${id}/reject`, { method: "POST" }),
+  updates: () => request<{ current: string; latest?: string; update?: boolean }>("/api/updates"),
   inbox: () => request<{ inbox: Inbox[] }>("/api/inbox"),
   audit: () => request<{ audit: Audit[]; redactions: Redaction[] }>("/api/audit"),
   collect: () => request<{ results: Collect[] }>("/api/collect", { method: "POST" }),
@@ -57,9 +69,12 @@ export interface Memory {
 export interface Inbox {
   id: string;
   title: string;
+  body: string;
   source: string;
   sensitivity: string;
   createdAt: string;
+  queueStatus: string;
+  conflictIds: string[];
 }
 
 export interface Audit {
@@ -79,6 +94,7 @@ export interface Collect {
   source: string;
   scannedFiles: number;
   ingested: number;
+  queued: number;
   skipped: number;
   redacted: number;
 }

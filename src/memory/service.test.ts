@@ -27,16 +27,30 @@ describe("MemoryService", () => {
     return { db, store, service };
   }
 
-  it("promotes a clean note and searches it back", async () => {
+  it("promotes a clean note when asked and searches it back", async () => {
     const { db, service } = await setup();
     const saved = await service.remember({
       body: "Always run check before merging worker branches.",
       source: "test",
       actor: "test",
+      promote: true,
     });
     expect(saved.memoryId).toBeTruthy();
     const hits = await service.search("worker branches", "test");
     expect(hits.some((item) => item.body.includes("check"))).toBe(true);
+    await db.close();
+  });
+
+  it("queues global notes that are not project conventions", async () => {
+    const { db, store, service } = await setup();
+    const saved = await service.remember({
+      body: "Prefer a gold ledger palette in OneLedger UI.",
+      source: "mcp:cursor",
+      actor: "test",
+    });
+    expect(saved.queued).toBe(true);
+    expect(saved.memoryId).toBeUndefined();
+    expect((await store.listInbox())[0]?.title).toContain("gold");
     await db.close();
   });
 
@@ -51,7 +65,7 @@ describe("MemoryService", () => {
     expect(saved.memoryId).toBeUndefined();
     const hits = await service.search("never leak", "test");
     expect(hits).toEqual([]);
-    const inbox = await store.listInbox();
+    const inbox = await store.listInbox(50, "rejected");
     expect(inbox[0]?.body).not.toContain("sk-abcdefghijklmnopqrstuvwxyz123456");
     await db.close();
   });

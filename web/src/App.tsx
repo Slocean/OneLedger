@@ -11,7 +11,7 @@ import {
   type SyncReport,
 } from "./api";
 
-type Tab = "overview" | "memories" | "collect" | "sync" | "keys" | "settings";
+type Tab = "overview" | "memories" | "queue" | "collect" | "sync" | "keys" | "settings";
 
 export function App() {
   const [token, setTokenState] = useState(getToken());
@@ -66,6 +66,7 @@ export function App() {
           [
             ["overview", "总览"],
             ["memories", "记忆"],
+            ["queue", "蒸馏队列"],
             ["collect", "收集"],
             ["sync", "同步"],
             ["keys", "MCP 密钥"],
@@ -79,6 +80,7 @@ export function App() {
       </nav>
       {tab === "overview" ? <Overview /> : null}
       {tab === "memories" ? <Memories /> : null}
+      {tab === "queue" ? <QueuePanel /> : null}
       {tab === "collect" ? <CollectPanel /> : null}
       {tab === "sync" ? <SyncPanel /> : null}
       {tab === "keys" ? <KeysPanel /> : null}
@@ -89,8 +91,12 @@ export function App() {
 
 function Overview() {
   const [status, setStatus] = useState<Awaited<ReturnType<typeof api.status>> | null>(null);
+  const [update, setUpdate] = useState("");
   useEffect(() => {
     void api.status().then(setStatus);
+    void api.updates().then((data) => {
+      setUpdate(data.update ? `有新版本 ${data.latest}` : `当前 ${data.current}`);
+    });
   }, []);
   if (!status) return <p className="muted">读取中…</p>;
   return (
@@ -112,6 +118,7 @@ function Overview() {
         <p>角色 {status.role}</p>
         <p>存储 {status.storage}</p>
         <p>监听 {status.bind}</p>
+        <p>{update}</p>
       </div>
     </div>
   );
@@ -119,11 +126,45 @@ function Overview() {
 
 function Memories() {
   const [items, setItems] = useState<Memory[]>([]);
+  const [draft, setDraft] = useState("");
+  const [promote, setPromote] = useState(false);
+  const [note, setNote] = useState("");
+  const refresh = () => void api.memories().then((data) => setItems(data.memories));
   useEffect(() => {
-    void api.memories().then((data) => setItems(data.memories));
+    void refresh();
   }, []);
   return (
     <div className="list">
+      <form
+        className="form"
+        onSubmit={async (event) => {
+          event.preventDefault();
+          if (!draft.trim()) return;
+          const result = await api.remember(draft.trim(), undefined, promote);
+          setDraft("");
+          setNote(
+            result.redacted
+              ? "已拦截敏感内容，原文没有进检索库。"
+              : result.queued
+                ? "已进蒸馏队列，等待复核。"
+                : "已写入总账。",
+          );
+          refresh();
+        }}
+      >
+        <label>
+          手写一条记忆
+          <textarea rows={4} value={draft} onChange={(event) => setDraft(event.target.value)} />
+        </label>
+        <label>
+          <input type="checkbox" checked={promote} onChange={(event) => setPromote(event.target.checked)} />
+          管理员直接晋升（跳过队列）
+        </label>
+        <button className="primary" type="submit">
+          入账
+        </button>
+        {note ? <p className="ok">{note}</p> : null}
+      </form>
       {items.length === 0 ? <p className="muted">还没有正式记忆。</p> : null}
       {items.map((item) => (
         <article className="item" key={item.id}>
@@ -132,6 +173,48 @@ function Memories() {
             {item.scopeKind} · {item.source} · {item.sensitivity}
           </p>
           <p>{item.body}</p>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function QueuePanel() {
+  const [inbox, setInbox] = useState<Inbox[]>([]);
+  const refresh = () => void api.inbox().then((data) => setInbox(data.inbox));
+  useEffect(() => {
+    void refresh();
+  }, []);
+  return (
+    <div className="list">
+      <p className="muted">项目约定可自动晋升。MCP / 全局笔记默认进队列。有冲突时晋升会作废旧条。</p>
+      {inbox.length === 0 ? <p className="muted">队列是空的。</p> : null}
+      {inbox.map((item) => (
+        <article className="item" key={item.id}>
+          <h3>{item.title}</h3>
+          <p>
+            {item.source} · 冲突 {item.conflictIds.length}
+          </p>
+          <p>{item.body}</p>
+          <div className="row">
+            <button
+              className="primary"
+              onClick={async () => {
+                await api.promote(item.id, item.conflictIds);
+                refresh();
+              }}
+            >
+              晋升{item.conflictIds.length ? "并取代冲突" : ""}
+            </button>
+            <button
+              onClick={async () => {
+                await api.reject(item.id);
+                refresh();
+              }}
+            >
+              驳回
+            </button>
+          </div>
         </article>
       ))}
     </div>
@@ -170,8 +253,8 @@ function CollectPanel() {
       </div>
       {results.map((item) => (
         <p key={item.source}>
-          {item.source}：扫描 {item.scannedFiles}，入库 {item.ingested}，跳过 {item.skipped}，脱敏{" "}
-          {item.redacted}
+          {item.source}：扫描 {item.scannedFiles}，入库 {item.ingested}，排队 {item.queued}，跳过 {item.skipped}
+          ，脱敏 {item.redacted}
         </p>
       ))}
       <h3>隔离区（只记类型，不记原文）</h3>
@@ -232,7 +315,19 @@ function KeysPanel() {
       >
         签发一把 Agent 密钥
       </button>
-      {issued ? <div className="banner">只显示一次：{issued}</div> : null}
+      {issued ? (
+        <div className="banner">
+          只显示一次：{issued}
+          <pre>{`{
+  "mcpServers": {
+    "oneledger": {
+      "url": "http://127.0.0.1:7443/mcp",
+      "headers": { "Authorization": "Bearer ${issued}" }
+    }
+  }
+}`}</pre>
+        </div>
+      ) : null}
       {keys.map((key) => (
         <div className="item" key={key.id}>
           <h4>{key.name}</h4>
@@ -257,13 +352,25 @@ function SettingsPanel() {
     nodeKey: "",
     cursor: true,
     claude: true,
+    projects: true,
+    extraRoots: "",
+    codex: true,
+    continue: true,
+    updateUrl: "",
   });
   const [saved, setSaved] = useState("");
   useEffect(() => {
     void api.config().then((config) => {
       const storage = config.storage as { driver: string; sqlitePath: string; postgresUrl: string };
       const sync = config.sync as { role: string; remoteUrl: string; nodeKey: string };
-      const collect = config.collect as { cursor: boolean; claude: boolean };
+      const collect = config.collect as {
+        cursor: boolean;
+        claude: boolean;
+        projects: boolean;
+        extraRoots: string[];
+        codex: boolean;
+        continue: boolean;
+      };
       setForm({
         bind: String(config.bind),
         port: Number(config.port),
@@ -275,6 +382,11 @@ function SettingsPanel() {
         nodeKey: sync.nodeKey,
         cursor: collect.cursor,
         claude: collect.claude,
+        projects: collect.projects,
+        extraRoots: (collect.extraRoots ?? []).join("\n"),
+        codex: collect.codex,
+        continue: collect.continue,
+        updateUrl: String(config.updateUrl ?? ""),
       });
     });
   }, []);
@@ -297,7 +409,18 @@ function SettingsPanel() {
             remoteUrl: form.remoteUrl,
             nodeKey: form.nodeKey,
           },
-          collect: { cursor: form.cursor, claude: form.claude },
+          collect: {
+            cursor: form.cursor,
+            claude: form.claude,
+            projects: form.projects,
+            extraRoots: form.extraRoots
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean),
+            codex: form.codex,
+            continue: form.continue,
+          },
+          updateUrl: form.updateUrl,
         });
         setSaved("已写入本机配置。改了监听地址或存储驱动时，请重启 oneledger serve。");
       }}
@@ -364,6 +487,43 @@ function SettingsPanel() {
           onChange={(event) => setForm({ ...form, claude: event.target.checked })}
         />
         收集 Claude Code memory
+      </label>
+      <label>
+        <input
+          type="checkbox"
+          checked={form.codex}
+          onChange={(event) => setForm({ ...form, codex: event.target.checked })}
+        />
+        收集 Codex ~/.codex
+      </label>
+      <label>
+        <input
+          type="checkbox"
+          checked={form.continue}
+          onChange={(event) => setForm({ ...form, continue: event.target.checked })}
+        />
+        收集 Continue ~/.continue
+      </label>
+      <label>
+        <input
+          type="checkbox"
+          checked={form.projects}
+          onChange={(event) => setForm({ ...form, projects: event.target.checked })}
+        />
+        收集项目约定（AGENTS.md / CLAUDE.md / .cursor/rules）
+      </label>
+      <label>
+        扫描根目录（每行一个；留空则扫当前工作目录）
+        <textarea
+          rows={3}
+          value={form.extraRoots}
+          onChange={(event) => setForm({ ...form, extraRoots: event.target.value })}
+          placeholder="E:\Project"
+        />
+      </label>
+      <label>
+        版本检查 URL（latest.json，可留空）
+        <input value={form.updateUrl} onChange={(event) => setForm({ ...form, updateUrl: event.target.value })} />
       </label>
       <button className="primary" type="submit">
         保存

@@ -1,7 +1,8 @@
-import type { AppConfig, MemoryRecord } from "../types.js";
+import type { AppConfig } from "../types.js";
 import { PROTOCOL_VERSION } from "../types.js";
 import type { Store } from "../memory/store.js";
 import { nowIso } from "../util.js";
+import { applyRemoteMemories } from "./apply.js";
 
 export interface SyncReport {
   pulled: number;
@@ -31,15 +32,8 @@ export async function syncWithRemote(store: Store, config: AppConfig): Promise<S
     if (!pullRes.ok) {
       return { pulled: 0, pushed: 0, skipped: false, error: `pull ${pullRes.status}` };
     }
-    const pulled = (await pullRes.json()) as { memories: MemoryRecord[] };
-    let applied = 0;
-    for (const memory of pulled.memories ?? []) {
-      if (memory.sensitivity === "secret") continue;
-      const current = await store.getMemory(memory.id);
-      if (current && current.rev >= memory.rev) continue;
-      await store.upsertMemory(memory);
-      applied += 1;
-    }
+    const pulled = (await pullRes.json()) as { memories: Parameters<typeof applyRemoteMemories>[1] };
+    const applied = await applyRemoteMemories(store, pulled.memories ?? []);
 
     const outgoing = (await store.changedSince(since)).filter((item) => item.sensitivity !== "secret");
     const pushRes = await fetch(`${base}/api/sync/push`, {

@@ -11,3 +11,9 @@ config.local.json
 .DS_Store
 Thumbs.db
 web/dist/
+release/
+desktop/runtime/
+desktop/prod/
+build-assets/
+src-tauri/target/
+src-tauri/gen/schemas/

@@ -3,15 +3,17 @@ import { join } from "node:path";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { APP_VERSION, PROTOCOL_VERSION, type AppConfig, type MemoryRecord } from "../types.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { APP_VERSION, DATA_SCHEMA_VERSION, PROTOCOL_VERSION, type AppConfig, type MemoryRecord } from "../types.js";
 import { loadConfig, publicConfig, saveConfig } from "../config.js";
 import { homeDir } from "../paths.js";
 import { hashToken, safeEqual } from "../util.js";
 import type { MemoryService } from "../memory/service.js";
 import type { Store } from "../memory/store.js";
 import { runCollectors } from "../collect/runner.js";
+import { applyRemoteMemories } from "../sync/apply.js";
 import { authorizeNode, syncWithRemote } from "../sync/engine.js";
-import { allowedTools, callTool, toolSchemas } from "../mcp/tools.js";
+import { allowedTools, createMcpServer } from "../mcp/create.js";
 
 export interface AppContext {
   config: AppConfig;
@@ -84,6 +86,7 @@ export function createApp(ctx: AppContext): Hono {
       if (patch.distill.apiKey === "•••• set") next.distill.apiKey = ctx.config.distill.apiKey;
     }
     if (patch.security) next.security = { ...next.security, ...patch.security };
+    if (typeof patch.updateUrl === "string") next.updateUrl = patch.updateUrl;
     saveConfig(next);
     await ctx.reload();
     return c.json({ ok: true, config: publicConfig(ctx.config) });
@@ -92,6 +95,57 @@ export function createApp(ctx: AppContext): Hono {
   app.get("/api/memories", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
     return c.json({ memories: await ctx.service.list() });
+  });
+
+  app.post("/api/remember", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json()) as { body?: string; title?: string; promote?: boolean };
+    if (!body.body?.trim()) return c.json({ error: "body required" }, 400);
+    const result = await ctx.service.remember({
+      body: body.body,
+      title: body.title,
+      source: "ui",
+      actor: "admin",
+      promote: body.promote,
+    });
+    return c.json(result);
+  });
+
+  app.post("/api/inbox/:id/promote", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json().catch(() => ({}))) as { supersedeIds?: string[] };
+    const memory = await ctx.service.promoteInbox(c.req.param("id"), "admin", body.supersedeIds ?? []);
+    if (!memory) return c.json({ error: "not found" }, 404);
+    return c.json({ memory });
+  });
+
+  app.post("/api/inbox/:id/reject", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const ok = await ctx.service.rejectInbox(c.req.param("id"), "admin");
+    return c.json({ ok }, ok ? 200 : 404);
+  });
+
+  app.get("/api/version", (c) =>
+    c.json({
+      version: APP_VERSION,
+      protocol: PROTOCOL_VERSION,
+      dataSchema: DATA_SCHEMA_VERSION,
+    }),
+  );
+
+  app.get("/api/updates", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    if (!ctx.config.updateUrl.trim()) {
+      return c.json({ current: APP_VERSION, latest: APP_VERSION, update: false });
+    }
+    try {
+      const response = await fetch(ctx.config.updateUrl);
+      const json = (await response.json()) as { version?: string };
+      const latest = json.version ?? APP_VERSION;
+      return c.json({ current: APP_VERSION, latest, update: latest !== APP_VERSION });
+    } catch (error) {
+      return c.json({ current: APP_VERSION, error: error instanceof Error ? error.message : String(error) }, 502);
+    }
   });
 
   app.get("/api/inbox", async (c) => {
@@ -150,82 +204,23 @@ export function createApp(ctx: AppContext): Hono {
   app.post("/api/sync/push", async (c) => {
     if (!authorizeNode(ctx.config, c.req.header("authorization"))) return c.json({ error: "unauthorized" }, 401);
     const body = (await c.req.json()) as { memories?: MemoryRecord[] };
-    let applied = 0;
-    for (const memory of body.memories ?? []) {
-      if (memory.sensitivity === "secret") continue;
-      const current = await ctx.store.getMemory(memory.id);
-      if (current && current.rev >= memory.rev) continue;
-      await ctx.store.upsertMemory(memory);
-      applied += 1;
-    }
+    const applied = await applyRemoteMemories(ctx.store, body.memories ?? []);
     return c.json({ applied });
   });
 
-  app.post("/mcp", async (c) => {
+  app.all("/mcp", async (c) => {
     const token = bearer(c.req.header("authorization"));
     if (!token) return c.json({ error: "unauthorized" }, 401);
     const key = await ctx.store.findKeyByHash(hashToken(token));
     if (!key) return c.json({ error: "unauthorized" }, 401);
     await ctx.store.touchKey(key.id);
-    const rpc = (await c.req.json()) as {
-      jsonrpc?: string;
-      id?: string | number;
-      method?: string;
-      params?: { name?: string; arguments?: Record<string, unknown> };
-    };
-    const id = rpc.id ?? 1;
-    if (rpc.method === "initialize") {
-      return c.json({
-        jsonrpc: "2.0",
-        id,
-        result: {
-          protocolVersion: "2025-03-26",
-          capabilities: { tools: {} },
-          serverInfo: { name: "oneledger", version: APP_VERSION },
-        },
-      });
-    }
-    if (rpc.method === "tools/list") {
-      return c.json({
-        jsonrpc: "2.0",
-        id,
-        result: {
-          tools: Object.entries(toolSchemas).map(([name, spec]) => ({
-            name,
-            description: spec.description,
-            inputSchema: spec.jsonSchema,
-          })),
-        },
-      });
-    }
-    if (rpc.method === "tools/call") {
-      const name = rpc.params?.name ?? "";
-      if (!allowedTools(key.tools).has(name)) {
-        return c.json({
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32001, message: "tool not permitted for this key" },
-        });
-      }
-      try {
-        const result = await callTool(ctx.service, name, rpc.params?.arguments ?? {}, key.name);
-        return c.json({
-          jsonrpc: "2.0",
-          id,
-          result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
-        });
-      } catch (error) {
-        return c.json({
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32000, message: error instanceof Error ? error.message : String(error) },
-        });
-      }
-    }
-    if (rpc.method?.startsWith("notifications/")) {
-      return c.body(null, 204);
-    }
-    return c.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "method not found" } });
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+    const server = createMcpServer(ctx.service, key.name, allowedTools(key.tools));
+    await server.connect(transport);
+    return transport.handleRequest(c.req.raw);
   });
 
   const webDir = findWebDir();

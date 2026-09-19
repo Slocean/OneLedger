@@ -1,5 +1,5 @@
 import type { Db } from "../db/driver.js";
-import type { ApiKeyRecord, InboxRecord, MemoryRecord } from "../types.js";
+import type { ApiKeyRecord, InboxRecord, MemoryRecord, QueueStatus } from "../types.js";
 import { newId, nowIso } from "../util.js";
 
 interface MemoryRow {
@@ -14,6 +14,7 @@ interface MemoryRow {
   source: string;
   origin_node: string;
   content_hash: string;
+  superseded_by: string | null;
   created_at: string;
   updated_at: string;
   forgotten_at: string | null;
@@ -39,6 +40,8 @@ interface InboxRow {
   scope_id: string;
   sensitivity: InboxRecord["sensitivity"];
   redacted: number;
+  queue_status?: QueueStatus;
+  conflict_ids?: string;
   created_at: string;
 }
 
@@ -55,6 +58,7 @@ function mapMemory(row: MemoryRow): MemoryRecord {
     source: row.source,
     originNode: row.origin_node,
     contentHash: row.content_hash,
+    supersededBy: row.superseded_by ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     forgottenAt: row.forgotten_at,
@@ -84,6 +88,8 @@ function mapInbox(row: InboxRow): InboxRecord {
     scopeId: row.scope_id,
     sensitivity: row.sensitivity,
     redacted: row.redacted,
+    queueStatus: row.queue_status ?? "proposed",
+    conflictIds: row.conflict_ids ? row.conflict_ids.split(",").filter(Boolean) : [],
     createdAt: row.created_at,
   };
 }
@@ -98,8 +104,8 @@ export class Store {
       ...record,
     };
     await this.db.run(
-      `INSERT INTO inbox (id, title, body, source, scope_kind, scope_id, sensitivity, redacted, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO inbox (id, title, body, source, scope_kind, scope_id, sensitivity, redacted, created_at, queue_status, conflict_ids)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         row.id,
         row.title,
@@ -110,17 +116,28 @@ export class Store {
         row.sensitivity,
         row.redacted,
         row.createdAt,
+        row.queueStatus,
+        row.conflictIds.join(","),
       ],
     );
     return row;
   }
 
-  async listInbox(limit = 50): Promise<InboxRecord[]> {
+  async getInbox(id: string): Promise<InboxRecord | undefined> {
+    const row = await this.db.get<InboxRow>("SELECT * FROM inbox WHERE id = ?", [id]);
+    return row ? mapInbox(row) : undefined;
+  }
+
+  async listInbox(limit = 50, status: QueueStatus = "proposed"): Promise<InboxRecord[]> {
     const rows = await this.db.all<InboxRow>(
-      "SELECT * FROM inbox ORDER BY created_at DESC LIMIT ?",
-      [limit],
+      "SELECT * FROM inbox WHERE queue_status = ? ORDER BY created_at DESC LIMIT ?",
+      [status, limit],
     );
     return rows.map(mapInbox);
+  }
+
+  async rejectInbox(id: string): Promise<void> {
+    await this.db.run("UPDATE inbox SET queue_status = 'rejected' WHERE id = ?", [id]);
   }
 
   async deleteInbox(id: string): Promise<void> {
@@ -139,8 +156,8 @@ export class Store {
     await this.db.run(
       `INSERT INTO memories (
          id, rev, title, body, scope_kind, scope_id, sensitivity, status, source,
-         origin_node, content_hash, created_at, updated_at, forgotten_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         origin_node, content_hash, created_at, updated_at, forgotten_at, superseded_by
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          rev = excluded.rev,
          title = excluded.title,
@@ -153,7 +170,8 @@ export class Store {
          origin_node = excluded.origin_node,
          content_hash = excluded.content_hash,
          updated_at = excluded.updated_at,
-         forgotten_at = excluded.forgotten_at`,
+         forgotten_at = excluded.forgotten_at,
+         superseded_by = excluded.superseded_by`,
       [
         record.id,
         record.rev,
@@ -169,6 +187,7 @@ export class Store {
         record.createdAt,
         record.updatedAt,
         record.forgottenAt,
+        record.supersededBy,
       ],
     );
   }
@@ -181,6 +200,14 @@ export class Store {
   async listMemories(limit = 100): Promise<MemoryRecord[]> {
     const rows = await this.db.all<MemoryRow>(
       "SELECT * FROM memories WHERE status != 'forgotten' ORDER BY updated_at DESC LIMIT ?",
+      [limit],
+    );
+    return rows.map(mapMemory);
+  }
+
+  async listActive(limit = 200): Promise<MemoryRecord[]> {
+    const rows = await this.db.all<MemoryRow>(
+      "SELECT * FROM memories WHERE status = 'active' ORDER BY updated_at DESC LIMIT ?",
       [limit],
     );
     return rows.map(mapMemory);
@@ -213,7 +240,9 @@ export class Store {
     const forgotten = await this.db.get<{ n: number }>(
       "SELECT COUNT(*) AS n FROM memories WHERE status = 'forgotten'",
     );
-    const inbox = await this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM inbox");
+    const inbox = await this.db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM inbox WHERE queue_status = 'proposed'",
+    );
     return {
       active: Number(active?.n ?? 0),
       inbox: Number(inbox?.n ?? 0),

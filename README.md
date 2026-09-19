@@ -1,6 +1,6 @@
 # OneLedger
 
-自托管的 Agent 记忆总账：本机收集、安全扫描、蒸馏、MCP 供给其他 Code Agent 调用，并可与远端节点同步。
+自托管的 Agent 记忆总账：本机收集、安全扫描、蒸馏队列、MCP 供给其他 Code Agent 调用，并可与远端节点同步。版本 `0.2.0`。
 
 服务器地址和存储后端不写死，在管理界面里配置。默认本机 SQLite；中心节点可改接 Postgres。
 
@@ -8,13 +8,16 @@
 
 - Node.js 22+
 
+默认只在本机跑，不依赖任何远程代码托管。数据在 `~/.oneledger`（可用 `ONELEDGER_HOME` 改）。
+
 ## 启动
 
 ```bash
 npm install
 npm run check
 npm run build
-npm run dev
+npm run desktop
+npm run pack
 ```
 
 浏览器打开 `http://127.0.0.1:7443/`，用 `~/.oneledger/config.json` 里的 `adminToken` 登录管理台（Windows 上通常是 `C:\Users\<you>\.oneledger\config.json`）。数据目录可用 `ONELEDGER_HOME` 覆盖。

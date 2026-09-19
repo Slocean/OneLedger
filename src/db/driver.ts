@@ -4,7 +4,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import pg from "pg";
 import type { AppConfig } from "../types.js";
 import { DATA_SCHEMA_VERSION } from "../types.js";
-import { MIGRATIONS } from "./sql.js";
+import { INIT_SQL } from "./sql.js";
 
 export interface Db {
   driver: "sqlite" | "postgres";
@@ -102,13 +102,31 @@ export async function openDb(config: AppConfig): Promise<Db> {
 }
 
 async function migrate(db: Db): Promise<void> {
-  await db.exec(MIGRATIONS[0]);
+  await db.exec(INIT_SQL);
   const row = await db.get<{ version: number }>("SELECT MAX(version) AS version FROM schema_migrations");
-  const current = row?.version ?? 0;
-  if (current < DATA_SCHEMA_VERSION) {
-    await db.run("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", [
-      DATA_SCHEMA_VERSION,
-      new Date().toISOString(),
-    ]);
+  let current = Number(row?.version ?? 0);
+  if (current < 1) {
+    await db.run("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", [1, new Date().toISOString()]);
+    current = 1;
   }
+  if (current < 2) {
+    await addColumn(db, "inbox", "queue_status", "TEXT NOT NULL DEFAULT 'proposed'");
+    await addColumn(db, "inbox", "conflict_ids", "TEXT NOT NULL DEFAULT ''");
+    await addColumn(db, "memories", "superseded_by", "TEXT");
+    await db.run("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", [2, new Date().toISOString()]);
+    current = 2;
+  }
+  if (current < DATA_SCHEMA_VERSION) {
+    throw new Error(`Database is behind schema ${DATA_SCHEMA_VERSION}; update OneLedger.`);
+  }
+}
+
+async function addColumn(db: Db, table: string, column: string, definition: string): Promise<void> {
+  if (db.driver === "sqlite") {
+    const cols = await db.all<{ name: string }>(`PRAGMA table_info(${table})`);
+    if (cols.some((col) => col.name === column)) return;
+    await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    return;
+  }
+  await db.exec(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
 }

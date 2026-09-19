@@ -1,5 +1,4 @@
-export const MIGRATIONS: string[] = [
-  `
+export const INIT_SQL = `
   CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL
@@ -68,5 +67,4 @@ export const MIGRATIONS: string[] = [
 
   CREATE INDEX IF NOT EXISTS memories_status_updated ON memories(status, updated_at);
   CREATE INDEX IF NOT EXISTS memories_hash ON memories(content_hash);
-  `,
-];
+`;

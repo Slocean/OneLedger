@@ -1,0 +1,8 @@
+{
+  "name": "oneledger",
+  "version": "0.2.0",
+  "private": true,
+  "description": "OneLedger desktop shell",
+  "author": "OneLedger",
+  "main": "main.mjs"
+}

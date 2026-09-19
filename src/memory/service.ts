@@ -1,4 +1,6 @@
-import type { AppConfig, CollectResult, MemoryRecord, MemoryScopeKind, Sensitivity } from "../types.js";
+import type { CollectResult, MemoryRecord, MemoryScopeKind, Sensitivity } from "../types.js";
+import type { AppConfig } from "../types.js";
+import { findConflicts, shouldAutoPromote } from "../distill/conflict.js";
 import { distillText } from "../distill/pipeline.js";
 import { scanAndRedact } from "../security/scan.js";
 import { clipTitle, hashToken, newId, nowIso, sha256 } from "../util.js";
@@ -13,6 +15,7 @@ export interface RememberInput {
   scopeKind?: MemoryScopeKind;
   scopeId?: string;
   actor: string;
+  promote?: boolean;
 }
 
 export class MemoryService {
@@ -25,7 +28,13 @@ export class MemoryService {
     return this.config.sync.nodeKey.slice(0, 8) || "local";
   }
 
-  async remember(input: RememberInput): Promise<{ inboxId: string; memoryId?: string; redacted: boolean }> {
+  async remember(input: RememberInput): Promise<{
+    inboxId: string;
+    memoryId?: string;
+    redacted: boolean;
+    queued: boolean;
+    conflicts: string[];
+  }> {
     const scanned = this.config.security.scanEnabled
       ? scanAndRedact(input.body)
       : { cleanText: input.body, hits: [], highest: "public" as const };
@@ -39,12 +48,14 @@ export class MemoryService {
         scopeId: input.scopeId ?? "",
         sensitivity: "secret",
         redacted: 1,
+        queueStatus: "rejected",
+        conflictIds: [],
       });
       for (const hit of scanned.hits) {
         await this.store.addRedaction(input.source, hit.type, inbox.id);
       }
       await this.store.audit(input.actor, "remember.redacted", inbox.id);
-      return { inboxId: inbox.id, redacted: true };
+      return { inboxId: inbox.id, redacted: true, queued: false, conflicts: [] };
     }
 
     const distilled = await distillText(this.config, scanned.cleanText);
@@ -53,9 +64,10 @@ export class MemoryService {
     const existing = await this.store.findActiveByHash(hash);
     if (existing) {
       await this.store.audit(input.actor, "remember.dedup", existing.id);
-      return { inboxId: "", memoryId: existing.id, redacted: false };
+      return { inboxId: "", memoryId: existing.id, redacted: false, queued: false, conflicts: [] };
     }
 
+    const conflicts = findConflicts(distilled, title, await this.store.listActive());
     const inbox = await this.store.insertInbox({
       title,
       body: distilled,
@@ -64,16 +76,40 @@ export class MemoryService {
       scopeId: input.scopeId ?? "",
       sensitivity: scanned.highest,
       redacted: scanned.hits.length > 0 ? 1 : 0,
+      queueStatus: "proposed",
+      conflictIds: conflicts.map((item) => item.id),
     });
 
-    const memory = await this.promoteInbox(inbox.id, input.actor);
-    return { inboxId: inbox.id, memoryId: memory?.id, redacted: inbox.redacted === 1 };
+    if (
+      shouldAutoPromote({
+        source: input.source,
+        sensitivity: scanned.highest,
+        conflicts,
+        promote: input.promote,
+      })
+    ) {
+      const memory = await this.promoteInbox(inbox.id, input.actor, conflicts.map((item) => item.id));
+      return {
+        inboxId: inbox.id,
+        memoryId: memory?.id,
+        redacted: inbox.redacted === 1,
+        queued: false,
+        conflicts: conflicts.map((item) => item.id),
+      };
+    }
+
+    await this.store.audit(input.actor, "memory.queued", inbox.id);
+    return {
+      inboxId: inbox.id,
+      redacted: inbox.redacted === 1,
+      queued: true,
+      conflicts: conflicts.map((item) => item.id),
+    };
   }
 
-  async promoteInbox(inboxId: string, actor: string): Promise<MemoryRecord | undefined> {
-    const items = await this.store.listInbox(200);
-    const inbox = items.find((item) => item.id === inboxId);
-    if (!inbox || inbox.sensitivity === "secret") return undefined;
+  async promoteInbox(inboxId: string, actor: string, supersedeIds: string[] = []): Promise<MemoryRecord | undefined> {
+    const inbox = await this.store.getInbox(inboxId);
+    if (!inbox || inbox.sensitivity === "secret" || inbox.queueStatus === "rejected") return undefined;
 
     const memory: MemoryRecord = {
       id: newId("mem"),
@@ -87,14 +123,35 @@ export class MemoryService {
       source: inbox.source,
       originNode: this.nodeId(),
       contentHash: sha256(`${inbox.title}\n${inbox.body}`),
+      supersededBy: null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
       forgottenAt: null,
     };
     await this.store.upsertMemory(memory);
+    for (const oldId of supersedeIds.length ? supersedeIds : inbox.conflictIds) {
+      const current = await this.store.getMemory(oldId);
+      if (!current || current.status !== "active") continue;
+      await this.store.upsertMemory({
+        ...current,
+        rev: current.rev + 1,
+        status: "forgotten",
+        supersededBy: memory.id,
+        updatedAt: nowIso(),
+        forgottenAt: nowIso(),
+      });
+    }
     await this.store.deleteInbox(inbox.id);
     await this.store.audit(actor, "memory.promote", memory.id);
     return memory;
+  }
+
+  async rejectInbox(inboxId: string, actor: string): Promise<boolean> {
+    const inbox = await this.store.getInbox(inboxId);
+    if (!inbox) return false;
+    await this.store.rejectInbox(inboxId);
+    await this.store.audit(actor, "memory.reject", inboxId);
+    return true;
   }
 
   async search(query: string, actor: string, limit = 8): Promise<MemoryRecord[]> {
@@ -132,6 +189,7 @@ export class MemoryService {
     files: Array<{ path: string; text: string; scopeId?: string }>,
   ): Promise<CollectResult> {
     let ingested = 0;
+    let queued = 0;
     let skipped = 0;
     let redacted = 0;
     for (const file of files) {
@@ -150,12 +208,13 @@ export class MemoryService {
       });
       if (result.redacted) redacted += 1;
       else if (result.memoryId) ingested += 1;
+      else if (result.queued) queued += 1;
       else skipped += 1;
     }
-    return { source, scannedFiles: files.length, ingested, skipped, redacted };
+    return { source, scannedFiles: files.length, ingested, queued, skipped, redacted };
   }
 
-  async issueKey(name: string, tools = "memory.search,memory.remember,memory.forget") {
+  async issueKey(name: string, tools = "memory.search,memory.remember,memory.forget,memory.list") {
     const token = `ol_${crypto.randomUUID().replaceAll("-", "")}`;
     const record = {
       id: newId("key"),

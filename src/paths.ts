@@ -30,3 +30,7 @@ export function cursorAgentStoresDir(): string {
   }
   return join(homedir(), ".config", "Cursor", "AgentStores", "cursor_agent_stores");
 }
+
+export function toolHome(name: string, envName: string): string {
+  return process.env[envName]?.trim() || join(homedir(), name);
+}

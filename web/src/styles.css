@@ -135,6 +135,7 @@ textarea {
 
 .form input,
 .form select,
+.form textarea,
 .gate input {
   background: #100e0b;
   color: var(--ink);
