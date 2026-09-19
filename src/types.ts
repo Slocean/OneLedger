@@ -1,6 +1,6 @@
 export const APP_VERSION = "0.2.0";
 export const CONFIG_SCHEMA_VERSION = 1;
-export const DATA_SCHEMA_VERSION = 2;
+export const DATA_SCHEMA_VERSION = 3;
 export const PROTOCOL_VERSION = 1;
 
 export type StorageDriver = "sqlite" | "postgres";
@@ -10,6 +10,23 @@ export type Sensitivity = "public" | "internal" | "pii" | "secret";
 export type MemoryStatus = "inbox" | "proposed" | "active" | "forgotten";
 export type QueueStatus = "proposed" | "rejected";
 export type MemoryScopeKind = "global" | "project" | "personal";
+export type AgentKind = "cursor" | "claude" | "codex" | "continue" | "project" | "custom";
+
+export interface AgentRecord {
+  id: string;
+  name: string;
+  kind: AgentKind;
+  builtin: boolean;
+  enabled: boolean;
+  rootPath: string;
+  lastScannedAt: string | null;
+  lastScannedFiles: number;
+  lastIngested: number;
+  lastQueued: number;
+  lastRedacted: number;
+  lastError: string;
+  createdAt: string;
+}
 
 export interface AppConfig {
   schemaVersion: typeof CONFIG_SCHEMA_VERSION;

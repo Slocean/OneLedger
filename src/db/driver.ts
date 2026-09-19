@@ -116,6 +116,27 @@ async function migrate(db: Db): Promise<void> {
     await db.run("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", [2, new Date().toISOString()]);
     current = 2;
   }
+  if (current < 3) {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        builtin INTEGER NOT NULL,
+        enabled INTEGER NOT NULL,
+        root_path TEXT NOT NULL,
+        last_scanned_at TEXT,
+        last_scanned_files INTEGER NOT NULL DEFAULT 0,
+        last_ingested INTEGER NOT NULL DEFAULT 0,
+        last_queued INTEGER NOT NULL DEFAULT 0,
+        last_redacted INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+    `);
+    await db.run("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", [3, new Date().toISOString()]);
+    current = 3;
+  }
   if (current < DATA_SCHEMA_VERSION) {
     throw new Error(`Database is behind schema ${DATA_SCHEMA_VERSION}; update OneLedger.`);
   }

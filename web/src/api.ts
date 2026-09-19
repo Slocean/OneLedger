@@ -50,6 +50,13 @@ export const api = {
   inbox: () => request<{ inbox: Inbox[] }>("/api/inbox"),
   audit: () => request<{ audit: Audit[]; redactions: Redaction[] }>("/api/audit"),
   collect: () => request<{ results: Collect[] }>("/api/collect", { method: "POST" }),
+  agents: () => request<{ agents: AgentRow[] }>("/api/agents"),
+  createAgent: (name: string, rootPath: string) =>
+    request<{ agent: AgentRow }>("/api/agents", { method: "POST", body: JSON.stringify({ name, rootPath }) }),
+  updateAgent: (id: string, patch: { enabled?: boolean; rootPath?: string; name?: string }) =>
+    request<{ agent: AgentRow }>(`/api/agents/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
+  deleteAgent: (id: string) => request<{ ok: boolean }>(`/api/agents/${id}`, { method: "DELETE" }),
+  collectAgent: (id: string) => request<{ result: Collect }>(`/api/agents/${id}/collect`, { method: "POST" }),
   sync: () => request<SyncReport>("/api/sync", { method: "POST" }),
   keys: () => request<{ keys: KeyRow[] }>("/api/keys"),
   createKey: (name: string) =>
@@ -104,6 +111,22 @@ export interface SyncReport {
   pushed: number;
   skipped: boolean;
   error?: string;
+}
+
+export interface AgentRow {
+  id: string;
+  name: string;
+  kind: string;
+  builtin: boolean;
+  enabled: boolean;
+  rootPath: string;
+  pathExists: boolean;
+  lastScannedAt: string | null;
+  lastScannedFiles: number;
+  lastIngested: number;
+  lastQueued: number;
+  lastRedacted: number;
+  lastError: string;
 }
 
 export interface KeyRow {

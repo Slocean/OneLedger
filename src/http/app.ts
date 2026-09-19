@@ -7,10 +7,11 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { APP_VERSION, DATA_SCHEMA_VERSION, PROTOCOL_VERSION, type AppConfig, type MemoryRecord } from "../types.js";
 import { loadConfig, publicConfig, saveConfig } from "../config.js";
 import { homeDir } from "../paths.js";
-import { hashToken, safeEqual } from "../util.js";
+import { hashToken, newId, nowIso, safeEqual } from "../util.js";
 import type { MemoryService } from "../memory/service.js";
 import type { Store } from "../memory/store.js";
-import { runCollectors } from "../collect/runner.js";
+import { collectAgent, ensureAgents, runCollectors } from "../collect/runner.js";
+import { pathExists } from "../collect/catalog.js";
 import { applyRemoteMemories } from "../sync/apply.js";
 import { authorizeNode, syncWithRemote } from "../sync/engine.js";
 import { allowedTools, createMcpServer } from "../mcp/create.js";
@@ -158,9 +159,77 @@ export function createApp(ctx: AppContext): Hono {
     return c.json({ audit: await ctx.store.listAudit(), redactions: await ctx.store.listRedactions() });
   });
 
+  app.get("/api/agents", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    await ensureAgents(ctx.store, ctx.config);
+    const agents = (await ctx.store.listAgents()).map((agent) => ({
+      ...agent,
+      pathExists: pathExists(agent.rootPath),
+    }));
+    return c.json({ agents });
+  });
+
+  app.post("/api/agents", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json()) as { name?: string; rootPath?: string };
+    if (!body.name?.trim() || !body.rootPath?.trim()) {
+      return c.json({ error: "name and rootPath required" }, 400);
+    }
+    const record = {
+      id: newId("ag"),
+      name: body.name.trim(),
+      kind: "custom" as const,
+      builtin: false,
+      enabled: true,
+      rootPath: body.rootPath.trim(),
+      lastScannedAt: null,
+      lastScannedFiles: 0,
+      lastIngested: 0,
+      lastQueued: 0,
+      lastRedacted: 0,
+      lastError: "",
+      createdAt: nowIso(),
+    };
+    await ctx.store.upsertAgent(record);
+    await ctx.store.audit("admin", "agent.create", record.id);
+    return c.json({ agent: { ...record, pathExists: pathExists(record.rootPath) } });
+  });
+
+  app.put("/api/agents/:id", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const current = await ctx.store.getAgent(c.req.param("id"));
+    if (!current) return c.json({ error: "not found" }, 404);
+    const body = (await c.req.json()) as { enabled?: boolean; rootPath?: string; name?: string };
+    const next = {
+      ...current,
+      enabled: typeof body.enabled === "boolean" ? body.enabled : current.enabled,
+      rootPath: body.rootPath?.trim() || current.rootPath,
+      name: body.name?.trim() || current.name,
+    };
+    await ctx.store.upsertAgent(next);
+    return c.json({ agent: { ...next, pathExists: pathExists(next.rootPath) } });
+  });
+
+  app.delete("/api/agents/:id", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const current = await ctx.store.getAgent(c.req.param("id"));
+    if (!current) return c.json({ error: "not found" }, 404);
+    if (current.builtin) return c.json({ error: "builtin agents cannot be deleted" }, 400);
+    await ctx.store.deleteAgent(current.id);
+    return c.json({ ok: true });
+  });
+
+  app.post("/api/agents/:id/collect", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const current = await ctx.store.getAgent(c.req.param("id"));
+    if (!current) return c.json({ error: "not found" }, 404);
+    const result = await collectAgent(ctx.service, ctx.store, current);
+    return c.json({ result, agent: await ctx.store.getAgent(current.id) });
+  });
+
   app.post("/api/collect", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
-    const results = await runCollectors(ctx.service, ctx.config);
+    const results = await runCollectors(ctx.service, ctx.store, ctx.config);
     return c.json({ results });
   });
 

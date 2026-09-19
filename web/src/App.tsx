@@ -3,15 +3,14 @@ import {
   api,
   getToken,
   setToken,
-  type Collect,
+  type AgentRow,
   type Inbox,
   type KeyRow,
   type Memory,
-  type Redaction,
   type SyncReport,
 } from "./api";
 
-type Tab = "overview" | "memories" | "queue" | "collect" | "sync" | "keys" | "settings";
+type Tab = "overview" | "memories" | "queue" | "agents" | "sync" | "keys" | "settings";
 
 export function App() {
   const [token, setTokenState] = useState(getToken());
@@ -67,7 +66,7 @@ export function App() {
             ["overview", "总览"],
             ["memories", "记忆"],
             ["queue", "蒸馏队列"],
-            ["collect", "收集"],
+            ["agents", "Agent"],
             ["sync", "同步"],
             ["keys", "MCP 密钥"],
             ["settings", "服务器与存储"],
@@ -81,7 +80,7 @@ export function App() {
       {tab === "overview" ? <Overview /> : null}
       {tab === "memories" ? <Memories /> : null}
       {tab === "queue" ? <QueuePanel /> : null}
-      {tab === "collect" ? <CollectPanel /> : null}
+      {tab === "agents" ? <AgentsPanel /> : null}
       {tab === "sync" ? <SyncPanel /> : null}
       {tab === "keys" ? <KeysPanel /> : null}
       {tab === "settings" ? <SettingsPanel /> : null}
@@ -156,7 +155,7 @@ function Memories() {
           手写一条记忆
           <textarea rows={4} value={draft} onChange={(event) => setDraft(event.target.value)} />
         </label>
-        <label>
+        <label className="check">
           <input type="checkbox" checked={promote} onChange={(event) => setPromote(event.target.checked)} />
           管理员直接晋升（跳过队列）
         </label>
@@ -221,57 +220,129 @@ function QueuePanel() {
   );
 }
 
-function CollectPanel() {
-  const [inbox, setInbox] = useState<Inbox[]>([]);
-  const [redactions, setRedactions] = useState<Redaction[]>([]);
-  const [results, setResults] = useState<Collect[]>([]);
-  const [busy, setBusy] = useState(false);
-  const refresh = () => {
-    void api.inbox().then((data) => setInbox(data.inbox));
-    void api.audit().then((data) => setRedactions(data.redactions));
-  };
-  useEffect(refresh, []);
+function AgentsPanel() {
+  const [agents, setAgents] = useState<AgentRow[]>([]);
+  const [name, setName] = useState("");
+  const [rootPath, setRootPath] = useState("");
+  const [busy, setBusy] = useState<string>("");
+  const [note, setNote] = useState("");
+  const refresh = () => void api.agents().then((data) => setAgents(data.agents));
+  useEffect(() => {
+    void refresh();
+  }, []);
+
   return (
     <div className="list">
+      <p className="muted">内置 Agent 只能开关和改路径，不能删除。自定义目录可以增删。定时收集只跑已启用的。</p>
       <div className="row">
         <button
           className="primary"
-          disabled={busy}
+          disabled={Boolean(busy)}
           onClick={async () => {
-            setBusy(true);
+            setBusy("all");
             try {
-              const data = await api.collect();
-              setResults(data.results);
+              await api.collect();
+              setNote("已收集全部已启用 Agent。");
               refresh();
             } finally {
-              setBusy(false);
+              setBusy("");
             }
           }}
         >
-          立即收集本机 Agent 记忆
+          收集全部已启用
         </button>
       </div>
-      {results.map((item) => (
-        <p key={item.source}>
-          {item.source}：扫描 {item.scannedFiles}，入库 {item.ingested}，排队 {item.queued}，跳过 {item.skipped}
-          ，脱敏 {item.redacted}
-        </p>
-      ))}
-      <h3>隔离区（只记类型，不记原文）</h3>
-      {redactions.map((item) => (
-        <p key={`${item.at}-${item.hit_type}`}>
-          {item.at} · {item.source} · {item.hit_type}
-        </p>
-      ))}
-      <h3>收件箱</h3>
-      {inbox.map((item) => (
-        <div className="item" key={item.id}>
-          <h4>{item.title}</h4>
-          <p>
-            {item.sensitivity} · {item.source}
+      {note ? <p className="ok">{note}</p> : null}
+      {agents.map((agent) => (
+        <article className="item" key={agent.id}>
+          <h3>
+            {agent.name}{" "}
+            <span className="muted">
+              {agent.kind}
+              {agent.builtin ? " · 内置" : " · 自定义"}
+            </span>
+          </h3>
+          <p className={agent.pathExists ? "ok" : "error"}>
+            {agent.pathExists ? "路径存在" : "路径不存在"} · {agent.rootPath || "（未设置）"}
           </p>
-        </div>
+          <p>
+            上次扫描 {agent.lastScannedAt ?? "尚未"} · 文件 {agent.lastScannedFiles} · 入库 {agent.lastIngested} · 排队{" "}
+            {agent.lastQueued} · 脱敏 {agent.lastRedacted}
+          </p>
+          {agent.lastError ? <p className="error">{agent.lastError}</p> : null}
+          <label>
+            扫描路径
+            <input
+              value={agent.rootPath}
+              onChange={(event) =>
+                setAgents((current) =>
+                  current.map((item) => (item.id === agent.id ? { ...item, rootPath: event.target.value } : item)),
+                )
+              }
+              onBlur={() => void api.updateAgent(agent.id, { rootPath: agent.rootPath }).then(refresh)}
+            />
+          </label>
+          <div className="row">
+            <button
+              onClick={async () => {
+                await api.updateAgent(agent.id, { enabled: !agent.enabled });
+                refresh();
+              }}
+            >
+              {agent.enabled ? "已启用" : "已停用"}
+            </button>
+            <button
+              className="primary"
+              disabled={busy === agent.id}
+              onClick={async () => {
+                setBusy(agent.id);
+                try {
+                  await api.collectAgent(agent.id);
+                  refresh();
+                } finally {
+                  setBusy("");
+                }
+              }}
+            >
+              只收这个
+            </button>
+            {agent.builtin ? null : (
+              <button
+                onClick={async () => {
+                  await api.deleteAgent(agent.id);
+                  refresh();
+                }}
+              >
+                删除
+              </button>
+            )}
+          </div>
+        </article>
       ))}
+      <form
+        className="form"
+        onSubmit={async (event) => {
+          event.preventDefault();
+          if (!name.trim() || !rootPath.trim()) return;
+          await api.createAgent(name.trim(), rootPath.trim());
+          setName("");
+          setRootPath("");
+          refresh();
+        }}
+      >
+        <h3>添加自定义 Agent 目录</h3>
+        <label>
+          名称
+          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 Windsurf 规则" />
+        </label>
+        <label>
+          路径
+          <input value={rootPath} onChange={(event) => setRootPath(event.target.value)} placeholder="E:\Project" />
+        </label>
+        <button className="primary" type="submit">
+          添加
+        </button>
+      </form>
     </div>
   );
 }
@@ -472,7 +543,7 @@ function SettingsPanel() {
         节点密钥
         <input value={form.nodeKey} onChange={(event) => setForm({ ...form, nodeKey: event.target.value })} />
       </label>
-      <label>
+      <label className="check">
         <input
           type="checkbox"
           checked={form.cursor}
@@ -480,7 +551,7 @@ function SettingsPanel() {
         />
         收集 Cursor Agent Store
       </label>
-      <label>
+      <label className="check">
         <input
           type="checkbox"
           checked={form.claude}
@@ -488,7 +559,7 @@ function SettingsPanel() {
         />
         收集 Claude Code memory
       </label>
-      <label>
+      <label className="check">
         <input
           type="checkbox"
           checked={form.codex}
@@ -496,7 +567,7 @@ function SettingsPanel() {
         />
         收集 Codex ~/.codex
       </label>
-      <label>
+      <label className="check">
         <input
           type="checkbox"
           checked={form.continue}
@@ -504,7 +575,7 @@ function SettingsPanel() {
         />
         收集 Continue ~/.continue
       </label>
-      <label>
+      <label className="check">
         <input
           type="checkbox"
           checked={form.projects}

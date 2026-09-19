@@ -67,7 +67,7 @@ async function serveCmd(): Promise<void> {
   const syncMs = Math.max(ctx.config.sync.intervalMin, 5) * 60_000;
   timers.push(
     setInterval(() => {
-      void runCollectors(ctx.service, ctx.config).catch((error) => console.error("collect failed", error));
+      void runCollectors(ctx.service, ctx.store, ctx.config).catch((error) => console.error("collect failed", error));
     }, collectMs),
   );
   timers.push(
@@ -75,7 +75,7 @@ async function serveCmd(): Promise<void> {
       void syncWithRemote(ctx.store, ctx.config).catch((error) => console.error("sync failed", error));
     }, syncMs),
   );
-  void runCollectors(ctx.service, ctx.config);
+  void runCollectors(ctx.service, ctx.store, ctx.config);
 
   serve(
     {
@@ -111,8 +111,8 @@ async function main(): Promise<void> {
     return;
   }
   if (cmd === "collect") {
-    const { service, config, db } = await boot();
-    console.log(JSON.stringify(await runCollectors(service, config), null, 2));
+    const { service, store, config, db } = await boot();
+    console.log(JSON.stringify(await runCollectors(service, store, config), null, 2));
     await db.close();
     return;
   }

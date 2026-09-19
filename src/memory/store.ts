@@ -1,5 +1,5 @@
 import type { Db } from "../db/driver.js";
-import type { ApiKeyRecord, InboxRecord, MemoryRecord, QueueStatus } from "../types.js";
+import type { AgentRecord, ApiKeyRecord, InboxRecord, MemoryRecord, QueueStatus } from "../types.js";
 import { newId, nowIso } from "../util.js";
 
 interface MemoryRow {
@@ -29,6 +29,22 @@ interface KeyRow {
   tools: string;
   created_at: string;
   last_used_at: string | null;
+}
+
+interface AgentRow {
+  id: string;
+  name: string;
+  kind: AgentRecord["kind"];
+  builtin: number;
+  enabled: number;
+  root_path: string;
+  last_scanned_at: string | null;
+  last_scanned_files: number;
+  last_ingested: number;
+  last_queued: number;
+  last_redacted: number;
+  last_error: string;
+  created_at: string;
 }
 
 interface InboxRow {
@@ -75,6 +91,24 @@ function mapKey(row: KeyRow): ApiKeyRecord {
     tools: row.tools,
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at,
+  };
+}
+
+function mapAgent(row: AgentRow): AgentRecord {
+  return {
+    id: row.id,
+    name: row.name,
+    kind: row.kind,
+    builtin: Number(row.builtin) === 1,
+    enabled: Number(row.enabled) === 1,
+    rootPath: row.root_path,
+    lastScannedAt: row.last_scanned_at,
+    lastScannedFiles: Number(row.last_scanned_files ?? 0),
+    lastIngested: Number(row.last_ingested ?? 0),
+    lastQueued: Number(row.last_queued ?? 0),
+    lastRedacted: Number(row.last_redacted ?? 0),
+    lastError: row.last_error ?? "",
+    createdAt: row.created_at,
   };
 }
 
@@ -311,6 +345,56 @@ export class Store {
       "SELECT value FROM sync_meta WHERE key = 'cursor'",
     );
     return row?.value ?? "1970-01-01T00:00:00.000Z";
+  }
+
+  async getAgent(id: string): Promise<AgentRecord | undefined> {
+    const row = await this.db.get<AgentRow>("SELECT * FROM agents WHERE id = ?", [id]);
+    return row ? mapAgent(row) : undefined;
+  }
+
+  async listAgents(): Promise<AgentRecord[]> {
+    const rows = await this.db.all<AgentRow>("SELECT * FROM agents ORDER BY builtin DESC, name ASC");
+    return rows.map(mapAgent);
+  }
+
+  async upsertAgent(record: AgentRecord): Promise<void> {
+    await this.db.run(
+      `INSERT INTO agents (
+         id, name, kind, builtin, enabled, root_path, last_scanned_at, last_scanned_files,
+         last_ingested, last_queued, last_redacted, last_error, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         name = excluded.name,
+         kind = excluded.kind,
+         builtin = excluded.builtin,
+         enabled = excluded.enabled,
+         root_path = excluded.root_path,
+         last_scanned_at = excluded.last_scanned_at,
+         last_scanned_files = excluded.last_scanned_files,
+         last_ingested = excluded.last_ingested,
+         last_queued = excluded.last_queued,
+         last_redacted = excluded.last_redacted,
+         last_error = excluded.last_error`,
+      [
+        record.id,
+        record.name,
+        record.kind,
+        record.builtin ? 1 : 0,
+        record.enabled ? 1 : 0,
+        record.rootPath,
+        record.lastScannedAt,
+        record.lastScannedFiles,
+        record.lastIngested,
+        record.lastQueued,
+        record.lastRedacted,
+        record.lastError,
+        record.createdAt,
+      ],
+    );
+  }
+
+  async deleteAgent(id: string): Promise<void> {
+    await this.db.run("DELETE FROM agents WHERE id = ? AND builtin = 0", [id]);
   }
 
   async setSyncCursor(value: string): Promise<void> {
