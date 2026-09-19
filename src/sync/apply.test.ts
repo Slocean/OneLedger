@@ -33,7 +33,7 @@ describe("sync apply", () => {
     const b = await node("b");
     const saved = await a.service.remember({
       body: "Hub and leaf share the same check command.",
-      source: "project:demo",
+      source: "mcp:test",
       actor: "test",
     });
     const memory = await a.store.getMemory(saved.memoryId!);
@@ -60,7 +60,7 @@ describe("sync apply", () => {
     const app = createApp(ctx);
     const saved = await hub.service.remember({
       body: "Sync protocol version stays at 1 until we bump it.",
-      source: "project:demo",
+      source: "mcp:test",
       actor: "test",
     });
     const memory = await hub.store.getMemory(saved.memoryId!);

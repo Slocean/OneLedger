@@ -1,12 +1,22 @@
 import type { CollectResult, MemoryRecord, MemoryScopeKind, Sensitivity } from "../types.js";
 import type { AppConfig } from "../types.js";
 import { findConflicts, shouldAutoPromote } from "../distill/conflict.js";
-import { distillText } from "../distill/pipeline.js";
 import { scanAndRedact } from "../security/scan.js";
 import { clipTitle, hashToken, newId, nowIso, sha256 } from "../util.js";
 import { Store } from "./store.js";
 
 const SAFE_LEVELS = new Set<Sensitivity>(["public", "internal"]);
+
+export function isOfficialDistillSource(source: string): boolean {
+  return source === "ui" || source.startsWith("ui:") || source.startsWith("mcp:");
+}
+
+function officialTitle(scopeKind: MemoryScopeKind, scopeId: string, text: string): string {
+  if (scopeKind === "project" && scopeId) return `项目 ${scopeId}`;
+  if (scopeKind === "personal") return "个人记忆";
+  if (text.includes("\n") || text.length > 80) return "蒸馏记忆";
+  return clipTitle(text, "蒸馏记忆");
+}
 
 export interface RememberInput {
   title?: string;
@@ -58,22 +68,24 @@ export class MemoryService {
       return { inboxId: inbox.id, redacted: true, queued: false, conflicts: [] };
     }
 
-    const distilled = await distillText(this.config, scanned.cleanText);
-    const title = input.title?.trim() || clipTitle(distilled || scanned.cleanText);
-    const hash = sha256(`${title}\n${distilled}`);
+    const text = scanned.cleanText.trim();
+    const scopeKind = input.scopeKind ?? "global";
+    const scopeId = input.scopeId ?? "";
+    const title = input.title?.trim() || officialTitle(scopeKind, scopeId, text);
+    const hash = sha256(`${title}\n${text}`);
     const existing = await this.store.findActiveByHash(hash);
     if (existing) {
       await this.store.audit(input.actor, "remember.dedup", existing.id);
       return { inboxId: "", memoryId: existing.id, redacted: false, queued: false, conflicts: [] };
     }
 
-    const conflicts = findConflicts(distilled, title, await this.store.listActive());
+    const conflicts = findConflicts(text, title, await this.store.listActive());
     const inbox = await this.store.insertInbox({
       title,
-      body: distilled,
+      body: text,
       source: input.source,
-      scopeKind: input.scopeKind ?? "global",
-      scopeId: input.scopeId ?? "",
+      scopeKind,
+      scopeId,
       sensitivity: scanned.highest,
       redacted: scanned.hits.length > 0 ? 1 : 0,
       queueStatus: "proposed",
@@ -88,7 +100,7 @@ export class MemoryService {
         promote: input.promote,
       })
     ) {
-      const memory = await this.promoteInbox(inbox.id, input.actor, conflicts.map((item) => item.id));
+      const memory = await this.promoteInbox(inbox.id, input.actor);
       return {
         inboxId: inbox.id,
         memoryId: memory?.id,
@@ -107,38 +119,54 @@ export class MemoryService {
     };
   }
 
-  async promoteInbox(inboxId: string, actor: string, supersedeIds: string[] = []): Promise<MemoryRecord | undefined> {
+  async promoteInbox(inboxId: string, actor: string, _supersedeIds: string[] = []): Promise<MemoryRecord | undefined> {
     const inbox = await this.store.getInbox(inboxId);
     if (!inbox || inbox.sensitivity === "secret" || inbox.queueStatus === "rejected") return undefined;
 
-    const memory: MemoryRecord = {
-      id: newId("mem"),
-      rev: 1,
-      title: inbox.title,
-      body: inbox.body,
-      scopeKind: inbox.scopeKind,
-      scopeId: inbox.scopeId,
-      sensitivity: inbox.sensitivity,
-      status: "active",
-      source: inbox.source,
-      originNode: this.nodeId(),
-      contentHash: sha256(`${inbox.title}\n${inbox.body}`),
-      supersededBy: null,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-      forgottenAt: null,
-    };
+    const sameScope = await this.store.listActiveByScope(inbox.scopeKind, inbox.scopeId);
+    const keep = sameScope[0];
+    const now = nowIso();
+    const memory: MemoryRecord = keep
+      ? {
+          ...keep,
+          rev: keep.rev + 1,
+          title: inbox.title,
+          body: inbox.body,
+          sensitivity: inbox.sensitivity,
+          status: "active",
+          source: inbox.source,
+          contentHash: sha256(`${inbox.title}\n${inbox.body}`),
+          supersededBy: null,
+          updatedAt: now,
+          forgottenAt: null,
+        }
+      : {
+          id: newId("mem"),
+          rev: 1,
+          title: inbox.title,
+          body: inbox.body,
+          scopeKind: inbox.scopeKind,
+          scopeId: inbox.scopeId,
+          sensitivity: inbox.sensitivity,
+          status: "active",
+          source: inbox.source,
+          originNode: this.nodeId(),
+          contentHash: sha256(`${inbox.title}\n${inbox.body}`),
+          supersededBy: null,
+          createdAt: now,
+          updatedAt: now,
+          forgottenAt: null,
+        };
     await this.store.upsertMemory(memory);
-    for (const oldId of supersedeIds.length ? supersedeIds : inbox.conflictIds) {
-      const current = await this.store.getMemory(oldId);
-      if (!current || current.status !== "active") continue;
+    for (const extra of sameScope) {
+      if (extra.id === memory.id) continue;
       await this.store.upsertMemory({
-        ...current,
-        rev: current.rev + 1,
+        ...extra,
+        rev: extra.rev + 1,
         status: "forgotten",
         supersededBy: memory.id,
-        updatedAt: nowIso(),
-        forgottenAt: nowIso(),
+        updatedAt: now,
+        forgottenAt: now,
       });
     }
     await this.store.deleteInbox(inbox.id);
@@ -154,7 +182,18 @@ export class MemoryService {
     return true;
   }
 
+  async retireNonDistilled(): Promise<number> {
+    let removed = 0;
+    for (const item of await this.store.listActive()) {
+      if (isOfficialDistillSource(item.source)) continue;
+      await this.forget(item.id, "system:retire-fragments");
+      removed += 1;
+    }
+    return removed;
+  }
+
   async search(query: string, actor: string, limit = 8): Promise<MemoryRecord[]> {
+    await this.retireNonDistilled();
     const raw = await this.store.searchMemories(query, limit);
     const filtered = raw.filter((item) => {
       if (item.sensitivity === "secret") return false;
@@ -181,6 +220,7 @@ export class MemoryService {
   }
 
   async list(limit = 100): Promise<MemoryRecord[]> {
+    await this.retireNonDistilled();
     return (await this.store.listMemories(limit)).map((item) => this.forUi(item));
   }
 

@@ -32,6 +32,9 @@ export function defaultConfig(): AppConfig {
       extraRoots: [],
       codex: true,
       continue: true,
+      zcode: true,
+      workbuddy: true,
+      qoder: true,
     },
     distill: {
       provider: "none",

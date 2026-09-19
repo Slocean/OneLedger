@@ -8,15 +8,102 @@ import {
   type KeyRow,
   type Memory,
   type SyncReport,
+  type UpdateInfo,
 } from "./api";
 
-type Tab = "overview" | "memories" | "queue" | "agents" | "sync" | "keys" | "settings";
+type Tab = "memories" | "queue" | "agents" | "sync" | "keys" | "settings";
+
+const NOTICE_KEY = "oneledger.noticeAck";
+
+function flavorLabel(flavor?: string) {
+  if (flavor === "setup") return "安装版";
+  if (flavor === "portable") return "便携版";
+  return "服务模式";
+}
+
+function UpdateBox({ info, onRefresh }: { info: UpdateInfo | null; onRefresh: () => Promise<void> }) {
+  const [busy, setBusy] = useState("");
+  const [note, setNote] = useState("");
+  const [openHistory, setOpenHistory] = useState(false);
+  const apply = async (kind: "download" | "apply") => {
+    setBusy(kind);
+    setNote("");
+    try {
+      const result = kind === "download" ? await api.downloadUpdate() : await api.applyUpdate();
+      setNote(result.error || result.message || (result.ok ? "完成" : "失败"));
+      if (kind === "download") await onRefresh();
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy("");
+    }
+  };
+  return (
+    <div className="panel">
+      <h3>关于与更新</h3>
+      <p className="muted">
+        当前 {info?.current ?? "…"}
+        {info?.latest ? ` · 通道 ${info.latest}` : ""} · {flavorLabel(info?.flavor)}
+      </p>
+      <p>{info?.message || info?.error || "尚未检查"}</p>
+      {info?.can_hot_update ? (
+        <p className="muted">
+          {info.flavor === "setup"
+            ? "安装版：下载 Setup 校验后退出，再打开安装程序覆盖安装。数据目录不动。"
+            : "便携版：下载 Portable 校验后替换正在运行的 exe 并重启。数据目录不动。"}
+        </p>
+      ) : (
+        <p className="muted">服务模式不能热替换。有新版本请到 Releases 下载安装包或便携包。</p>
+      )}
+      {info?.release_notes ? <pre className="notes">{info.release_notes}</pre> : null}
+      <div className="row">
+        <button type="button" onClick={() => void onRefresh()}>
+          检查更新
+        </button>
+        {info?.html_url ? (
+          <a className="link-btn" href={info.html_url} target="_blank" rel="noreferrer">
+            打开 Release
+          </a>
+        ) : null}
+        {info?.can_hot_update && info.update ? (
+          <>
+            <button type="button" disabled={Boolean(busy)} onClick={() => void apply("download")}>
+              {busy === "download" ? "下载中…" : "下载更新"}
+            </button>
+            <button className="primary" type="button" disabled={Boolean(busy)} onClick={() => void apply("apply")}>
+              {busy === "apply" ? "正在应用…" : info.flavor === "setup" ? "退出并安装" : "立即替换并重启"}
+            </button>
+          </>
+        ) : null}
+        <button type="button" onClick={() => setOpenHistory((open) => !open)}>
+          更新公告
+        </button>
+      </div>
+      {note ? <p className={note.includes("失败") || note.includes("error") ? "error" : "ok"}>{note}</p> : null}
+      {openHistory
+        ? (info?.history ?? []).map((item) => (
+            <article className="item" key={`${item.version}-${item.title}`}>
+              <h3>{item.title}</h3>
+              <pre className="notes">{item.body || item.notice}</pre>
+            </article>
+          ))
+        : null}
+    </div>
+  );
+}
 
 export function App() {
   const [token, setTokenState] = useState(getToken());
   const [ready, setReady] = useState(false);
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTab] = useState<Tab>("memories");
   const [error, setError] = useState("");
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [notice, setNotice] = useState("");
+  const loadUpdates = async () => {
+    const data = await api.updates();
+    setUpdateInfo(data);
+    if (data.notice && localStorage.getItem(NOTICE_KEY) !== data.notice) setNotice(data.notice);
+  };
 
   useEffect(() => {
     if (!token) return;
@@ -25,6 +112,10 @@ export function App() {
       .then(() => setReady(true))
       .catch(() => setReady(false));
   }, [token]);
+  useEffect(() => {
+    if (!ready) return;
+    void loadUpdates().catch(() => undefined);
+  }, [ready]);
 
   if (!ready) {
     return (
@@ -56,122 +147,166 @@ export function App() {
 
   return (
     <div className="app">
-      <header className="masthead">
-        <h1>ONELEDGER</h1>
-        <p>共享记忆总账 · MCP · 本地与远端</p>
-      </header>
-      <nav className="tabs">
-        {(
-          [
-            ["overview", "总览"],
-            ["memories", "记忆"],
-            ["queue", "蒸馏队列"],
-            ["agents", "Agent"],
-            ["sync", "同步"],
-            ["keys", "MCP 密钥"],
-            ["settings", "服务器与存储"],
-          ] as const
-        ).map(([id, label]) => (
-          <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}>
-            {label}
+      <div className="chrome">
+        <header className="masthead">
+          <div>
+            <h1>ONELEDGER</h1>
+            <p>共享记忆总账 · MCP · 本地与远端</p>
+          </div>
+          <button type="button" onClick={() => void loadUpdates()}>
+            {updateInfo?.update ? `更新 ${updateInfo.latest}` : "检查更新"}
           </button>
-        ))}
-      </nav>
-      {tab === "overview" ? <Overview /> : null}
-      {tab === "memories" ? <Memories /> : null}
-      {tab === "queue" ? <QueuePanel /> : null}
-      {tab === "agents" ? <AgentsPanel /> : null}
-      {tab === "sync" ? <SyncPanel /> : null}
-      {tab === "keys" ? <KeysPanel /> : null}
-      {tab === "settings" ? <SettingsPanel /> : null}
+        </header>
+        <nav className="tabs">
+          {(
+            [
+              ["memories", "记忆"],
+              ["queue", "蒸馏队列"],
+              ["agents", "Agent"],
+              ["sync", "同步"],
+              ["keys", "MCP 密钥"],
+              ["settings", "服务器与存储"],
+            ] as const
+          ).map(([id, label]) => (
+            <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}>
+              {label}
+            </button>
+          ))}
+        </nav>
+      </div>
+      <main className="stage">
+        {tab === "memories" ? <Memories /> : null}
+        {tab === "queue" ? <QueuePanel /> : null}
+        {tab === "agents" ? <AgentsPanel /> : null}
+        {tab === "sync" ? <SyncPanel /> : null}
+        {tab === "keys" ? <KeysPanel /> : null}
+        {tab === "settings" ? <SettingsPanel updateInfo={updateInfo} onRefreshUpdates={loadUpdates} /> : null}
+      </main>
+      {notice ? (
+        <div className="modal">
+          <div className="panel">
+            <h3>更新通知</h3>
+            <p>{notice}</p>
+            <button
+              className="primary"
+              type="button"
+              onClick={() => {
+                localStorage.setItem(NOTICE_KEY, notice);
+                setNotice("");
+              }}
+            >
+              我知道了
+            </button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
 
-function Overview() {
-  const [status, setStatus] = useState<Awaited<ReturnType<typeof api.status>> | null>(null);
-  const [update, setUpdate] = useState("");
-  useEffect(() => {
-    void api.status().then(setStatus);
-    void api.updates().then((data) => {
-      setUpdate(data.update ? `有新版本 ${data.latest}` : `当前 ${data.current}`);
-    });
-  }, []);
-  if (!status) return <p className="muted">读取中…</p>;
-  return (
-    <div className="grid">
-      <div className="card">
-        <span>正式记忆</span>
-        <strong>{status.counts.active}</strong>
-      </div>
-      <div className="card">
-        <span>收件箱</span>
-        <strong>{status.counts.inbox}</strong>
-      </div>
-      <div className="card">
-        <span>已作废</span>
-        <strong>{status.counts.forgotten}</strong>
-      </div>
-      <div className="panel">
-        <p>版本 {status.version}</p>
-        <p>角色 {status.role}</p>
-        <p>存储 {status.storage}</p>
-        <p>监听 {status.bind}</p>
-        <p>{update}</p>
-      </div>
-    </div>
-  );
+function downloadText(filename: string, text: string, type: string) {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function memoriesToMarkdown(items: Memory[]): string {
+  return items
+    .map((item) => [`# ${item.title}`, "", `来源 ${item.source} · ${item.scopeKind} · ${item.sensitivity}`, "", item.body, ""].join("\n"))
+    .join("\n---\n\n");
 }
 
 function Memories() {
   const [items, setItems] = useState<Memory[]>([]);
   const [draft, setDraft] = useState("");
-  const [promote, setPromote] = useState(false);
   const [note, setNote] = useState("");
-  const refresh = () => void api.memories().then((data) => setItems(data.memories));
+  const [busy, setBusy] = useState(false);
+  const refresh = () =>
+    void api.memories().then((data) => {
+      setItems(data.memories);
+      setDraft((current) => {
+        if (current.trim()) return current;
+        const doc = data.memories.find((item) => item.scopeKind === "global") ?? data.memories[0];
+        return doc?.body ?? "";
+      });
+    });
   useEffect(() => {
     void refresh();
   }, []);
+  const exportFile = async (format: "json" | "md") => {
+    setBusy(true);
+    try {
+      const pack = await api.exportMemories();
+      const stamp = pack.exportedAt.slice(0, 10);
+      if (format === "json") {
+        downloadText(`oneledger-memories-${stamp}.json`, `${JSON.stringify(pack, null, 2)}\n`, "application/json");
+      } else {
+        const markdown = `# OneLedger 记忆导出\n\n导出时间 ${pack.exportedAt} · ${pack.count} 条\n\n---\n\n${memoriesToMarkdown(pack.memories)}`;
+        downloadText(`oneledger-memories-${stamp}.md`, markdown, "text/markdown");
+      }
+      setNote(`已导出 ${pack.count} 条记忆。`);
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <div className="list">
+      <div className="row row-split">
+        <div className="row">
+          <button disabled={busy} onClick={() => void exportFile("json")}>
+            导出 JSON
+          </button>
+          <button disabled={busy} onClick={() => void exportFile("md")}>
+            导出 Markdown
+          </button>
+        </div>
+        <p className="muted">共 {items.length} 份</p>
+      </div>
       <form
         className="form"
         onSubmit={async (event) => {
           event.preventDefault();
           if (!draft.trim()) return;
-          const result = await api.remember(draft.trim(), undefined, promote);
+          const result = await api.remember(draft.trim());
           setDraft("");
           setNote(
             result.redacted
               ? "已拦截敏感内容，原文没有进检索库。"
               : result.queued
-                ? "已进蒸馏队列，等待复核。"
-                : "已写入总账。",
+                ? "未写入正式记忆。"
+                : "已保存。",
           );
           refresh();
         }}
       >
         <label>
-          手写一条记忆
-          <textarea rows={4} value={draft} onChange={(event) => setDraft(event.target.value)} />
-        </label>
-        <label className="check">
-          <input type="checkbox" checked={promote} onChange={(event) => setPromote(event.target.checked)} />
-          管理员直接晋升（跳过队列）
+          记忆（同一作用域覆盖，不新增条目）
+          <textarea rows={10} value={draft} onChange={(event) => setDraft(event.target.value)} />
         </label>
         <button className="primary" type="submit">
-          入账
+          保存
         </button>
         {note ? <p className="ok">{note}</p> : null}
       </form>
-      {items.length === 0 ? <p className="muted">还没有正式记忆。</p> : null}
+      {items.length === 0 ? (
+        <p className="muted">
+          还没有记忆。Agent 读完队列里的原料后，用 memory.remember 交一整段文字；同一作用域再写会覆盖，不会一条条堆上去。
+        </p>
+      ) : null}
       {items.map((item) => (
-        <article className="item" key={item.id}>
+        <article className="item memory-doc" key={item.id}>
           <h3>{item.title}</h3>
           <p>
-            {item.scopeKind} · {item.source} · {item.sensitivity}
+            {item.scopeKind}
+            {item.scopeId ? ` · ${item.scopeId}` : ""} · rev {item.rev} · {item.source}
           </p>
-          <p>{item.body}</p>
+          <p className="memory-body">{item.body}</p>
         </article>
       ))}
     </div>
@@ -180,42 +315,90 @@ function Memories() {
 
 function QueuePanel() {
   const [inbox, setInbox] = useState<Inbox[]>([]);
+  const [openId, setOpenId] = useState<string>("");
+  const [adding, setAdding] = useState(false);
+  const [customTitle, setCustomTitle] = useState("");
+  const [customBody, setCustomBody] = useState("");
+  const [note, setNote] = useState("");
   const refresh = () => void api.inbox().then((data) => setInbox(data.inbox));
   useEffect(() => {
     void refresh();
   }, []);
   return (
     <div className="list">
-      <p className="muted">项目约定可自动晋升。MCP / 全局笔记默认进队列。有冲突时晋升会作废旧条。</p>
-      {inbox.length === 0 ? <p className="muted">队列是空的。</p> : null}
-      {inbox.map((item) => (
-        <article className="item" key={item.id}>
-          <h3>{item.title}</h3>
-          <p>
-            {item.source} · 冲突 {item.conflictIds.length}
-          </p>
-          <p>{item.body}</p>
-          <div className="row">
-            <button
-              className="primary"
-              onClick={async () => {
-                await api.promote(item.id, item.conflictIds);
-                refresh();
-              }}
-            >
-              晋升{item.conflictIds.length ? "并取代冲突" : ""}
-            </button>
-            <button
-              onClick={async () => {
-                await api.reject(item.id);
-                refresh();
-              }}
-            >
-              驳回
-            </button>
-          </div>
-        </article>
-      ))}
+      <p className="muted">
+        这里只放待蒸馏的原文。Agent 读完后用 memory.remember 写入「记忆」。本程序不摘要。
+      </p>
+      <div className="row">
+        <button type="button" onClick={() => setAdding((open) => !open)}>
+          添加自定义
+        </button>
+      </div>
+      {adding ? (
+        <form
+          className="form"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            if (!customBody.trim()) return;
+            await api.queueCustom(customBody.trim(), customTitle.trim() || undefined);
+            setCustomTitle("");
+            setCustomBody("");
+            setAdding(false);
+            setNote("已加入队列。");
+            refresh();
+          }}
+        >
+          <label>
+            标题（可留空）
+            <input value={customTitle} onChange={(event) => setCustomTitle(event.target.value)} />
+          </label>
+          <label>
+            自定义原文
+            <textarea rows={6} value={customBody} onChange={(event) => setCustomBody(event.target.value)} />
+          </label>
+          <button className="primary" type="submit">
+            加入队列
+          </button>
+        </form>
+      ) : null}
+      {note ? <p className="ok">{note}</p> : null}
+      {inbox.length === 0 && !adding ? <p className="muted">队列是空的。</p> : null}
+      {inbox.map((item) => {
+        const open = openId === item.id;
+        const preview = item.body.replace(/\s+/g, " ").trim();
+        return (
+          <article
+            className={`item queue-item${open ? " is-open" : ""}`}
+            key={item.id}
+            onClick={() => setOpenId(open ? "" : item.id)}
+          >
+            <h3>{item.title}</h3>
+            <p>
+              {item.source}
+              {item.sensitivity && item.sensitivity !== "public" ? ` · ${item.sensitivity}` : ""}
+            </p>
+            {open ? (
+              <>
+                <p>{item.body}</p>
+                <p className="muted">{item.createdAt}</p>
+                <div className="row" onClick={(event) => event.stopPropagation()}>
+                  <button
+                    onClick={async () => {
+                      await api.reject(item.id);
+                      setOpenId("");
+                      refresh();
+                    }}
+                  >
+                    丢弃
+                  </button>
+                </div>
+              </>
+            ) : (
+              <p className="preview">{preview.length > 72 ? `${preview.slice(0, 72)}…` : preview || "（无正文）"}</p>
+            )}
+          </article>
+        );
+      })}
     </div>
   );
 }
@@ -253,6 +436,7 @@ function AgentsPanel() {
         </button>
       </div>
       {note ? <p className="ok">{note}</p> : null}
+      <div className="agent-grid">
       {agents.map((agent) => (
         <article className="item" key={agent.id}>
           <h3>
@@ -319,6 +503,7 @@ function AgentsPanel() {
           </div>
         </article>
       ))}
+      </div>
       <form
         className="form"
         onSubmit={async (event) => {
@@ -351,7 +536,7 @@ function SyncPanel() {
   const [report, setReport] = useState<SyncReport | null>(null);
   return (
     <div className="panel">
-      <p className="muted">叶子节点会把正式记忆推到远端中心，并拉回更新。secret 级条目不会上同步线。</p>
+      <p className="muted">叶子节点会把记忆推到远端中心，并拉回更新。secret 级条目不会上同步线。</p>
       <button
         className="primary"
         onClick={async () => setReport(await api.sync())}
@@ -411,7 +596,13 @@ function KeysPanel() {
   );
 }
 
-function SettingsPanel() {
+function SettingsPanel({
+  updateInfo,
+  onRefreshUpdates,
+}: {
+  updateInfo: UpdateInfo | null;
+  onRefreshUpdates: () => Promise<void>;
+}) {
   const [form, setForm] = useState({
     bind: "127.0.0.1",
     port: 7443,
@@ -427,6 +618,9 @@ function SettingsPanel() {
     extraRoots: "",
     codex: true,
     continue: true,
+    zcode: true,
+    workbuddy: true,
+    qoder: true,
     updateUrl: "",
   });
   const [saved, setSaved] = useState("");
@@ -441,6 +635,9 @@ function SettingsPanel() {
         extraRoots: string[];
         codex: boolean;
         continue: boolean;
+        zcode?: boolean;
+        workbuddy?: boolean;
+        qoder?: boolean;
       };
       setForm({
         bind: String(config.bind),
@@ -457,6 +654,9 @@ function SettingsPanel() {
         extraRoots: (collect.extraRoots ?? []).join("\n"),
         codex: collect.codex,
         continue: collect.continue,
+        zcode: collect.zcode ?? true,
+        workbuddy: collect.workbuddy ?? true,
+        qoder: collect.qoder ?? true,
         updateUrl: String(config.updateUrl ?? ""),
       });
     });
@@ -490,12 +690,16 @@ function SettingsPanel() {
               .filter(Boolean),
             codex: form.codex,
             continue: form.continue,
+            zcode: form.zcode,
+            workbuddy: form.workbuddy,
+            qoder: form.qoder,
           },
           updateUrl: form.updateUrl,
         });
         setSaved("已写入本机配置。改了监听地址或存储驱动时，请重启 oneledger serve。");
       }}
     >
+      <UpdateBox info={updateInfo} onRefresh={onRefreshUpdates} />
       <label>
         监听地址
         <input value={form.bind} onChange={(event) => setForm({ ...form, bind: event.target.value })} />
@@ -527,22 +731,7 @@ function SettingsPanel() {
           placeholder="postgres://user:pass@host:5432/oneledger"
         />
       </label>
-      <label>
-        同步角色
-        <select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}>
-          <option value="local">仅本地</option>
-          <option value="leaf">叶子（连远端）</option>
-          <option value="hub">中心</option>
-        </select>
-      </label>
-      <label>
-        远端中心 URL
-        <input value={form.remoteUrl} onChange={(event) => setForm({ ...form, remoteUrl: event.target.value })} />
-      </label>
-      <label>
-        节点密钥
-        <input value={form.nodeKey} onChange={(event) => setForm({ ...form, nodeKey: event.target.value })} />
-      </label>
+      <div className="check-grid">
       <label className="check">
         <input
           type="checkbox"
@@ -578,24 +767,68 @@ function SettingsPanel() {
       <label className="check">
         <input
           type="checkbox"
+          checked={form.zcode}
+          onChange={(event) => setForm({ ...form, zcode: event.target.checked })}
+        />
+        收集 ZCode ~/.zcode
+      </label>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={form.workbuddy}
+          onChange={(event) => setForm({ ...form, workbuddy: event.target.checked })}
+        />
+        收集 WorkBuddy ~/.workbuddy
+      </label>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={form.qoder}
+          onChange={(event) => setForm({ ...form, qoder: event.target.checked })}
+        />
+        收集 Qoder ~/.qoder
+      </label>
+      <label className="check">
+        <input
+          type="checkbox"
           checked={form.projects}
           onChange={(event) => setForm({ ...form, projects: event.target.checked })}
         />
         收集项目约定（AGENTS.md / CLAUDE.md / .cursor/rules）
       </label>
-      <label>
-        扫描根目录（每行一个；留空则扫当前工作目录）
-        <textarea
-          rows={3}
-          value={form.extraRoots}
-          onChange={(event) => setForm({ ...form, extraRoots: event.target.value })}
-          placeholder="E:\Project"
-        />
-      </label>
-      <label>
-        版本检查 URL（latest.json，可留空）
-        <input value={form.updateUrl} onChange={(event) => setForm({ ...form, updateUrl: event.target.value })} />
-      </label>
+      </div>
+      <details className="advanced">
+        <summary>高级：同步、扫描根目录、版本检查</summary>
+        <label>
+          同步角色
+          <select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}>
+            <option value="local">仅本地</option>
+            <option value="leaf">叶子（连远端）</option>
+            <option value="hub">中心</option>
+          </select>
+        </label>
+        <label>
+          远端中心 URL
+          <input value={form.remoteUrl} onChange={(event) => setForm({ ...form, remoteUrl: event.target.value })} />
+        </label>
+        <label>
+          节点密钥
+          <input value={form.nodeKey} onChange={(event) => setForm({ ...form, nodeKey: event.target.value })} />
+        </label>
+        <label>
+          扫描根目录（每行一个；留空则扫当前工作目录）
+          <textarea
+            rows={3}
+            value={form.extraRoots}
+            onChange={(event) => setForm({ ...form, extraRoots: event.target.value })}
+            placeholder="E:\Project"
+          />
+        </label>
+        <label>
+          版本检查 URL（latest.json，可留空）
+          <input value={form.updateUrl} onChange={(event) => setForm({ ...form, updateUrl: event.target.value })} />
+        </label>
+      </details>
       <button className="primary" type="submit">
         保存
       </button>

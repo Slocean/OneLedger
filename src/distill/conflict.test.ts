@@ -7,13 +7,11 @@ describe("conflict distill", () => {
     expect(score).toBeGreaterThan(0.45);
   });
 
-  it("auto-promotes only clean project sources", () => {
-    expect(
-      shouldAutoPromote({ source: "project:E:/x", sensitivity: "public", conflicts: [] }),
-    ).toBe(true);
-    expect(
-      shouldAutoPromote({ source: "mcp:agent", sensitivity: "public", conflicts: [] }),
-    ).toBe(false);
+  it("auto-promotes agent MCP and admin UI, not collector dumps", () => {
+    expect(shouldAutoPromote({ source: "mcp:agent", sensitivity: "public", conflicts: [] })).toBe(true);
+    expect(shouldAutoPromote({ source: "ui", sensitivity: "public", conflicts: [] })).toBe(true);
+    expect(shouldAutoPromote({ source: "project:E:/x", sensitivity: "public", conflicts: [] })).toBe(false);
+    expect(shouldAutoPromote({ source: "cursor", sensitivity: "public", conflicts: [] })).toBe(false);
   });
 
   it("finds conflicting active memories", () => {

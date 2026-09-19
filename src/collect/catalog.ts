@@ -44,6 +44,27 @@ export function builtinBlueprints(config: AppConfig): AgentBlueprint[] {
       enabled: config.collect.continue,
     },
     {
+      id: "zcode",
+      name: "ZCode",
+      kind: "zcode",
+      rootPath: toolHome(".zcode", "ZCODE_HOME"),
+      enabled: config.collect.zcode,
+    },
+    {
+      id: "workbuddy",
+      name: "WorkBuddy",
+      kind: "workbuddy",
+      rootPath: toolHome(".workbuddy", "WORKBUDDY_HOME"),
+      enabled: config.collect.workbuddy,
+    },
+    {
+      id: "qoder",
+      name: "Qoder",
+      kind: "qoder",
+      rootPath: toolHome(".qoder", "QODER_HOME"),
+      enabled: config.collect.qoder,
+    },
+    {
       id: "projects",
       name: "项目约定文件",
       kind: "project",

@@ -33,7 +33,7 @@ export function shouldAutoPromote(input: {
   promote?: boolean;
 }): boolean {
   if (input.promote) return true;
-  if (input.sensitivity !== "public") return false;
-  if (input.conflicts.length > 0) return false;
-  return input.source.startsWith("project:");
+  if (input.source.startsWith("mcp:")) return true;
+  if (input.source === "ui" || input.source.startsWith("ui:")) return true;
+  return false;
 }

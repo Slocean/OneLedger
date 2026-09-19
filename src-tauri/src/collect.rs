@@ -31,6 +31,9 @@ pub fn builtin_blueprints(config: &Config) -> Vec<AgentRecord> {
         agent("claude", "Claude Code", "claude", claude_home().join("projects"), config.collect.claude),
         agent("codex", "Codex", "codex", tool_home(".codex", "CODEX_HOME"), config.collect.codex),
         agent("continue", "Continue", "continue", tool_home(".continue", "CONTINUE_HOME"), config.collect.continue_tool),
+        agent("zcode", "ZCode", "zcode", tool_home(".zcode", "ZCODE_HOME"), config.collect.zcode),
+        agent("workbuddy", "WorkBuddy", "workbuddy", tool_home(".workbuddy", "WORKBUDDY_HOME"), config.collect.workbuddy),
+        agent("qoder", "Qoder", "qoder", tool_home(".qoder", "QODER_HOME"), config.collect.qoder),
         agent("projects", "项目约定文件", "project", PathBuf::from(extra), config.collect.projects),
     ]
 }

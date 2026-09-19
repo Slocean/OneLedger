@@ -18,7 +18,8 @@ export const toolSchemas = {
     },
   },
   "memory.remember": {
-    description: "Store a candidate memory. Secrets are redacted before persistence and never recalled.",
+    description:
+      "Replace the distilled write-up for this scope. Send the full refined text after you distilled the source material, not one fact per call. Same scope overwrites the previous document. OneLedger does not summarize. Secrets are redacted and never recalled.",
     input: z.object({
       body: z.string().min(1),
       title: z.string().optional(),
@@ -37,7 +38,7 @@ export const toolSchemas = {
     },
   },
   "memory.forget": {
-    description: "Tombstone a memory so it stops being recalled and will sync as forgotten.",
+    description: "Remove an official distilled memory so it is no longer recalled.",
     input: z.object({ id: z.string().min(1) }),
     jsonSchema: {
       type: "object",

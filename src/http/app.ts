@@ -15,6 +15,7 @@ import { pathExists } from "../collect/catalog.js";
 import { applyRemoteMemories } from "../sync/apply.js";
 import { authorizeNode, syncWithRemote } from "../sync/engine.js";
 import { allowedTools, createMcpServer } from "../mcp/create.js";
+import { checkForUpdate } from "../update.js";
 
 export interface AppContext {
   config: AppConfig;
@@ -98,26 +99,29 @@ export function createApp(ctx: AppContext): Hono {
     return c.json({ memories: await ctx.service.list() });
   });
 
+  app.get("/api/memories/export", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const memories = await ctx.service.list(10_000);
+    return c.json({
+      name: "oneledger",
+      version: APP_VERSION,
+      exportedAt: nowIso(),
+      count: memories.length,
+      memories,
+    });
+  });
+
   app.post("/api/remember", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
-    const body = (await c.req.json()) as { body?: string; title?: string; promote?: boolean };
+    const body = (await c.req.json()) as { body?: string; title?: string };
     if (!body.body?.trim()) return c.json({ error: "body required" }, 400);
     const result = await ctx.service.remember({
       body: body.body,
       title: body.title,
       source: "ui",
       actor: "admin",
-      promote: body.promote,
     });
     return c.json(result);
-  });
-
-  app.post("/api/inbox/:id/promote", async (c) => {
-    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
-    const body = (await c.req.json().catch(() => ({}))) as { supersedeIds?: string[] };
-    const memory = await ctx.service.promoteInbox(c.req.param("id"), "admin", body.supersedeIds ?? []);
-    if (!memory) return c.json({ error: "not found" }, 404);
-    return c.json({ memory });
   });
 
   app.post("/api/inbox/:id/reject", async (c) => {
@@ -136,22 +140,42 @@ export function createApp(ctx: AppContext): Hono {
 
   app.get("/api/updates", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
-    if (!ctx.config.updateUrl.trim()) {
-      return c.json({ current: APP_VERSION, latest: APP_VERSION, update: false });
-    }
-    try {
-      const response = await fetch(ctx.config.updateUrl);
-      const json = (await response.json()) as { version?: string };
-      const latest = json.version ?? APP_VERSION;
-      return c.json({ current: APP_VERSION, latest, update: latest !== APP_VERSION });
-    } catch (error) {
-      return c.json({ current: APP_VERSION, error: error instanceof Error ? error.message : String(error) }, 502);
-    }
+    return c.json(await checkForUpdate(ctx.config.updateUrl));
+  });
+
+  app.post("/api/updates/download", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    return c.json(
+      {
+        ok: false,
+        error: "热更新只用于打包后的桌面版。当前是服务模式，请到 Releases 下载安装包或便携包。",
+        html_url: "https://github.com/Slocean/OneLedger/releases",
+      },
+      400,
+    );
+  });
+
+  app.post("/api/updates/apply", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    return c.json({ ok: false, error: "热更新只用于打包后的桌面版。" }, 400);
   });
 
   app.get("/api/inbox", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
     return c.json({ inbox: await ctx.store.listInbox() });
+  });
+
+  app.post("/api/inbox", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json()) as { body?: string; title?: string };
+    if (!body.body?.trim()) return c.json({ error: "body required" }, 400);
+    const result = await ctx.service.remember({
+      body: body.body,
+      title: body.title,
+      source: "custom",
+      actor: "admin",
+    });
+    return c.json(result);
   });
 
   app.get("/api/audit", async (c) => {

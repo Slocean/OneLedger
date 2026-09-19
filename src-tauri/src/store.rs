@@ -55,6 +55,18 @@ pub fn find_active_by_hash(conn: &Connection, hash: &str) -> rusqlite::Result<Op
     .optional()
 }
 
+pub fn list_active_by_scope(
+    conn: &Connection,
+    scope_kind: &str,
+    scope_id: &str,
+) -> rusqlite::Result<Vec<MemoryRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories WHERE status = 'active' AND scope_kind = ?1 AND scope_id = ?2 ORDER BY updated_at DESC",
+    )?;
+    let rows = stmt.query_map(params![scope_kind, scope_id], map_memory)?;
+    rows.collect()
+}
+
 pub fn upsert_memory(conn: &Connection, record: &MemoryRecord) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO memories (

@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::distill::{distill_text, find_conflicts, should_auto_promote};
+use crate::distill::{find_conflicts, should_auto_promote};
 use crate::models::{CollectResult, InboxRecord, MemoryRecord};
 use crate::scan::scan_and_redact;
 use crate::store;
@@ -60,27 +60,29 @@ impl MemoryService {
             let _ = store::audit(conn, actor, "remember.redacted", &inbox.id);
             return serde_json::json!({ "inboxId": inbox.id, "redacted": true, "queued": false, "conflicts": [] });
         }
-        let distilled = distill_text(config, &scanned.clean_text);
+        let text = scanned.clean_text.trim().to_string();
+        let scope_kind = scope_kind.unwrap_or("global");
+        let scope_id = scope_id.unwrap_or("");
         let title = title
             .map(str::trim)
             .filter(|item| !item.is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| clip_title(&distilled, "Untitled"));
-        let hash = sha256_hex(&format!("{title}\n{distilled}"));
+            .unwrap_or_else(|| official_title(scope_kind, scope_id, &text));
+        let hash = sha256_hex(&format!("{title}\n{text}"));
         if let Ok(Some(existing)) = store::find_active_by_hash(conn, &hash) {
             let _ = store::audit(conn, actor, "remember.dedup", &existing.id);
             return serde_json::json!({ "inboxId": "", "memoryId": existing.id, "redacted": false, "queued": false, "conflicts": [] });
         }
         let actives = store::list_active(conn).unwrap_or_default();
-        let conflicts = find_conflicts(&distilled, &title, &actives);
+        let conflicts = find_conflicts(&text, &title, &actives);
         let conflict_ids: Vec<String> = conflicts.iter().map(|item| item.id.clone()).collect();
         let inbox = InboxRecord {
             id: new_id("in"),
             title,
-            body: distilled,
+            body: text,
             source: source.into(),
-            scope_kind: scope_kind.unwrap_or("global").into(),
-            scope_id: scope_id.unwrap_or("").into(),
+            scope_kind: scope_kind.into(),
+            scope_id: scope_id.into(),
             sensitivity: scanned.highest.clone(),
             redacted: if scanned.hits.is_empty() { 0 } else { 1 },
             queue_status: "proposed".into(),
@@ -89,7 +91,7 @@ impl MemoryService {
         };
         let inbox = store::insert_inbox(conn, inbox).expect("inbox");
         if should_auto_promote(source, &scanned.highest, conflicts.len(), promote) {
-            let memory = Self::promote_inbox(conn, config, &inbox.id, actor, &conflict_ids);
+            let memory = Self::promote_inbox(conn, config, &inbox.id, actor, &[]);
             return serde_json::json!({
                 "inboxId": inbox.id,
                 "memoryId": memory.as_ref().map(|item| item.id.clone()),
@@ -118,42 +120,55 @@ impl MemoryService {
         if inbox.sensitivity == "secret" || inbox.queue_status == "rejected" {
             return None;
         }
-        let memory = MemoryRecord {
-            id: new_id("mem"),
-            rev: 1,
-            title: inbox.title.clone(),
-            body: inbox.body.clone(),
-            scope_kind: inbox.scope_kind,
-            scope_id: inbox.scope_id,
-            sensitivity: inbox.sensitivity,
-            status: "active".into(),
-            source: inbox.source,
-            origin_node: Self::node_id(config),
-            content_hash: sha256_hex(&format!("{}\n{}", inbox.title, inbox.body)),
-            superseded_by: None,
-            created_at: now_iso(),
-            updated_at: now_iso(),
-            forgotten_at: None,
+        let same_scope = store::list_active_by_scope(conn, &inbox.scope_kind, &inbox.scope_id).unwrap_or_default();
+        let now = now_iso();
+        let hash = sha256_hex(&format!("{}\n{}", inbox.title, inbox.body));
+        let memory = if let Some(keep) = same_scope.first() {
+            let mut keep = keep.clone();
+            keep.rev += 1;
+            keep.title = inbox.title.clone();
+            keep.body = inbox.body.clone();
+            keep.sensitivity = inbox.sensitivity.clone();
+            keep.status = "active".into();
+            keep.source = inbox.source.clone();
+            keep.content_hash = hash;
+            keep.superseded_by = None;
+            keep.updated_at = now.clone();
+            keep.forgotten_at = None;
+            keep
+        } else {
+            MemoryRecord {
+                id: new_id("mem"),
+                rev: 1,
+                title: inbox.title.clone(),
+                body: inbox.body.clone(),
+                scope_kind: inbox.scope_kind.clone(),
+                scope_id: inbox.scope_id.clone(),
+                sensitivity: inbox.sensitivity.clone(),
+                status: "active".into(),
+                source: inbox.source.clone(),
+                origin_node: Self::node_id(config),
+                content_hash: hash,
+                superseded_by: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                forgotten_at: None,
+            }
         };
         let _ = store::upsert_memory(conn, &memory);
-        let ids = if supersede_ids.is_empty() {
-            inbox.conflict_ids
-        } else {
-            supersede_ids.to_vec()
-        };
-        for old_id in ids {
-            if let Ok(Some(mut current)) = store::get_memory(conn, &old_id) {
-                if current.status != "active" {
-                    continue;
-                }
-                current.rev += 1;
-                current.status = "forgotten".into();
-                current.superseded_by = Some(memory.id.clone());
-                current.updated_at = now_iso();
-                current.forgotten_at = Some(now_iso());
-                let _ = store::upsert_memory(conn, &current);
+        for extra in same_scope {
+            if extra.id == memory.id {
+                continue;
             }
+            let mut extra = extra;
+            extra.rev += 1;
+            extra.status = "forgotten".into();
+            extra.superseded_by = Some(memory.id.clone());
+            extra.updated_at = now.clone();
+            extra.forgotten_at = Some(now.clone());
+            let _ = store::upsert_memory(conn, &extra);
         }
+        let _ = supersede_ids;
         let _ = store::delete_inbox(conn, &inbox.id);
         let _ = store::audit(conn, actor, "memory.promote", &memory.id);
         Some(memory)
@@ -168,7 +183,22 @@ impl MemoryService {
         true
     }
 
+    pub fn retire_non_distilled(conn: &Connection) -> i64 {
+        let actives = store::list_active(conn).unwrap_or_default();
+        let mut removed = 0;
+        for item in actives {
+            if is_official_distill_source(&item.source) {
+                continue;
+            }
+            if Self::forget(conn, &item.id, "system:retire-fragments") {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     pub fn search(conn: &Connection, config: &Config, query: &str, actor: &str, limit: i64) -> Vec<MemoryRecord> {
+        let _ = Self::retire_non_distilled(conn);
         let raw = store::search_memories(conn, query, limit).unwrap_or_default();
         let allow_internal = config.security.allow_internal_in_search;
         let filtered = raw
@@ -199,6 +229,7 @@ impl MemoryService {
     }
 
     pub fn list(conn: &Connection, limit: i64) -> Vec<MemoryRecord> {
+        let _ = Self::retire_non_distilled(conn);
         store::list_memories(conn, limit)
             .unwrap_or_default()
             .into_iter()
@@ -279,4 +310,21 @@ impl MemoryService {
         }
         memory
     }
+}
+
+fn is_official_distill_source(source: &str) -> bool {
+    source == "ui" || source.starts_with("ui:") || source.starts_with("mcp:")
+}
+
+fn official_title(scope_kind: &str, scope_id: &str, text: &str) -> String {
+    if scope_kind == "project" && !scope_id.is_empty() {
+        return format!("项目 {scope_id}");
+    }
+    if scope_kind == "personal" {
+        return "个人记忆".into();
+    }
+    if text.contains('\n') || text.chars().count() > 80 {
+        return "蒸馏记忆".into();
+    }
+    clip_title(text, "蒸馏记忆")
 }

@@ -186,6 +186,14 @@ export class Store {
     return row ? mapMemory(row) : undefined;
   }
 
+  async listActiveByScope(scopeKind: MemoryRecord["scopeKind"], scopeId: string): Promise<MemoryRecord[]> {
+    const rows = await this.db.all<MemoryRow>(
+      "SELECT * FROM memories WHERE status = 'active' AND scope_kind = ? AND scope_id = ? ORDER BY updated_at DESC",
+      [scopeKind, scopeId],
+    );
+    return rows.map(mapMemory);
+  }
+
   async upsertMemory(record: MemoryRecord): Promise<void> {
     await this.db.run(
       `INSERT INTO memories (

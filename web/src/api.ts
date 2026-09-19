@@ -30,23 +30,29 @@ export const api = {
       role: string;
       storage: string;
       bind: string;
-      counts: { active: number; inbox: number; forgotten: number };
+      counts: { active: number; inbox: number };
     }>("/api/status"),
   config: () => request<Record<string, unknown>>("/api/config"),
   saveConfig: (body: unknown) => request<{ ok: boolean }>("/api/config", { method: "PUT", body: JSON.stringify(body) }),
   memories: () => request<{ memories: Memory[] }>("/api/memories"),
-  remember: (body: string, title?: string, promote = false) =>
+  exportMemories: () =>
+    request<{ name: string; version: string; exportedAt: string; count: number; memories: Memory[] }>(
+      "/api/memories/export",
+    ),
+  remember: (body: string, title?: string) =>
     request<{ inboxId: string; memoryId?: string; redacted: boolean; queued: boolean }>("/api/remember", {
       method: "POST",
-      body: JSON.stringify({ body, title, promote }),
+      body: JSON.stringify({ body, title }),
     }),
-  promote: (id: string, supersedeIds: string[] = []) =>
-    request<{ memory: Memory }>(`/api/inbox/${id}/promote`, {
+  queueCustom: (body: string, title?: string) =>
+    request<{ inboxId: string; queued: boolean }>("/api/inbox", {
       method: "POST",
-      body: JSON.stringify({ supersedeIds }),
+      body: JSON.stringify({ body, title }),
     }),
   reject: (id: string) => request<{ ok: boolean }>(`/api/inbox/${id}/reject`, { method: "POST" }),
-  updates: () => request<{ current: string; latest?: string; update?: boolean }>("/api/updates"),
+  updates: () => request<UpdateInfo>("/api/updates"),
+  downloadUpdate: () => request<{ ok: boolean; message?: string; error?: string; html_url?: string }>("/api/updates/download", { method: "POST" }),
+  applyUpdate: () => request<{ ok: boolean; message?: string; error?: string }>("/api/updates/apply", { method: "POST" }),
   inbox: () => request<{ inbox: Inbox[] }>("/api/inbox"),
   audit: () => request<{ audit: Audit[]; redactions: Redaction[] }>("/api/audit"),
   collect: () => request<{ results: Collect[] }>("/api/collect", { method: "POST" }),
@@ -65,9 +71,11 @@ export const api = {
 
 export interface Memory {
   id: string;
+  rev?: number;
   title: string;
   body: string;
   scopeKind: string;
+  scopeId?: string;
   source: string;
   updatedAt: string;
   sensitivity: string;
@@ -104,6 +112,21 @@ export interface Collect {
   queued: number;
   skipped: number;
   redacted: number;
+}
+
+export interface UpdateInfo {
+  ok?: boolean;
+  update?: boolean;
+  current?: string;
+  latest?: string;
+  message?: string;
+  release_notes?: string;
+  notice?: string;
+  history?: Array<{ version: string; title: string; body: string; notice: string }>;
+  html_url?: string;
+  can_hot_update?: boolean;
+  flavor?: string;
+  error?: string;
 }
 
 export interface SyncReport {

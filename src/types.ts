@@ -10,7 +10,7 @@ export type Sensitivity = "public" | "internal" | "pii" | "secret";
 export type MemoryStatus = "inbox" | "proposed" | "active" | "forgotten";
 export type QueueStatus = "proposed" | "rejected";
 export type MemoryScopeKind = "global" | "project" | "personal";
-export type AgentKind = "cursor" | "claude" | "codex" | "continue" | "project" | "custom";
+export type AgentKind = "cursor" | "claude" | "codex" | "continue" | "zcode" | "workbuddy" | "qoder" | "project" | "custom";
 
 export interface AgentRecord {
   id: string;
@@ -48,6 +48,9 @@ export interface AppConfig {
     claude: boolean;
     codex: boolean;
     continue: boolean;
+    zcode: boolean;
+    workbuddy: boolean;
+    qoder: boolean;
     projects: boolean;
     intervalMin: number;
     extraRoots: string[];

@@ -35,6 +35,10 @@ pub struct SyncConfig {
     pub interval_min: u64,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CollectConfig {
@@ -43,6 +47,12 @@ pub struct CollectConfig {
     pub codex: bool,
     #[serde(rename = "continue")]
     pub continue_tool: bool,
+    #[serde(default = "default_true")]
+    pub zcode: bool,
+    #[serde(default = "default_true")]
+    pub workbuddy: bool,
+    #[serde(default = "default_true")]
+    pub qoder: bool,
     pub projects: bool,
     pub interval_min: u64,
     pub extra_roots: Vec<String>,
@@ -110,6 +120,9 @@ pub fn default_config() -> Config {
             claude: true,
             codex: true,
             continue_tool: true,
+            zcode: true,
+            workbuddy: true,
+            qoder: true,
             projects: true,
             interval_min: 30,
             extra_roots: vec![],

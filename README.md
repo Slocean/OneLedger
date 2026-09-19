@@ -67,12 +67,17 @@ npm run pack
 
 命令：`oneledger serve` · `oneledger mcp` · `oneledger collect` · `oneledger version`
 
-## 版本
+## 版本与热更新
 
 - 程序版本：`package.json` / `APP_VERSION`
-- 配置 schema：`config.schemaVersion`
-- 数据 schema：启动时迁移
-- 同步协议：`X-OneLedger-Protocol`
+- 通道文件：[`app_update.json`](app_update.json)（累计 `history`）
+- 检查更新：顶栏或「服务器与存储 → 关于与更新」
+- **便携版**：下载 `OneLedger-Portable.exe`，校验固定仓库域名与 `.sha256` 后替换正在运行的 exe 并重启
+- **安装版**：下载 `OneLedger-Setup.exe`，同样校验后退出并打开安装程序覆盖安装
+- 两套互不混用。数据在 `~/.oneledger`，热更新不碰用户数据。不要求代码签名证书
+- 配置 schema：`config.schemaVersion`；数据 schema 启动时迁移；同步协议：`X-OneLedger-Protocol`
+
+发版前把新说明插到 `app_update.json` 的 `history` 最前面，再打 `v*` tag。Release 正文用当前这条的 `title` / `body`。
 
 ## 安全边界
 

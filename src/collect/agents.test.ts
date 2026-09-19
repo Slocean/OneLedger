@@ -24,7 +24,9 @@ describe("agent registry", () => {
     const service = new MemoryService(store, config);
     await ensureAgents(store, config);
     const names = (await store.listAgents()).map((item) => item.id);
-    expect(names).toEqual(expect.arrayContaining(["cursor", "claude", "codex", "continue", "projects"]));
+    expect(names).toEqual(
+      expect.arrayContaining(["cursor", "claude", "codex", "continue", "zcode", "workbuddy", "qoder", "projects"]),
+    );
 
     const root = join(dir, "notes");
     mkdirSync(root);

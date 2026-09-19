@@ -56,12 +56,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/status", get(status))
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/memories", get(memories))
+        .route("/api/memories/export", get(export_memories))
         .route("/api/remember", post(remember))
-        .route("/api/inbox/:id/promote", post(promote))
         .route("/api/inbox/:id/reject", post(reject))
         .route("/api/version", get(version))
         .route("/api/updates", get(updates))
-        .route("/api/inbox", get(inbox))
+        .route("/api/updates/download", post(download_update))
+        .route("/api/updates/apply", post(apply_update))
+        .route("/api/inbox", get(inbox).post(create_inbox))
         .route("/api/audit", get(audit))
         .route("/api/agents", get(agents).post(create_agent))
         .route("/api/agents/:id", put(update_agent).delete(delete_agent))
@@ -212,6 +214,22 @@ async fn memories(State(state): State<AppState>, headers: HeaderMap) -> Response
     Json(serde_json::json!({ "memories": list })).into_response()
 }
 
+async fn export_memories(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let memories = MemoryService::list(&state.conn.lock().unwrap(), 10_000);
+    Json(serde_json::json!({
+        "name": "oneledger",
+        "version": APP_VERSION,
+        "exportedAt": crate::util::now_iso(),
+        "count": memories.len(),
+        "memories": memories
+    }))
+    .into_response()
+}
+
 #[derive(Deserialize)]
 struct RememberBody {
     body: Option<String>,
@@ -241,23 +259,6 @@ async fn remember(State(state): State<AppState>, headers: HeaderMap, Json(body):
     Json(result).into_response()
 }
 
-#[derive(Deserialize)]
-struct PromoteBody {
-    #[serde(rename = "supersedeIds")]
-    supersede_ids: Option<Vec<String>>,
-}
-
-async fn promote(State(state): State<AppState>, headers: HeaderMap, Path(id): Path<String>, Json(body): Json<PromoteBody>) -> Response {
-    let config = state.config.lock().unwrap().clone();
-    if !admin_ok(&headers, &config) {
-        return unauthorized();
-    }
-    match MemoryService::promote_inbox(&state.conn.lock().unwrap(), &config, &id, "admin", &body.supersede_ids.unwrap_or_default()) {
-        Some(memory) => Json(serde_json::json!({ "memory": memory })).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not found" }))).into_response(),
-    }
-}
-
 async fn reject(State(state): State<AppState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
     let config = state.config.lock().unwrap().clone();
     if !admin_ok(&headers, &config) {
@@ -280,21 +281,45 @@ async fn updates(State(state): State<AppState>, headers: HeaderMap) -> Response 
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
-    if config.update_url.trim().is_empty() {
-        return Json(serde_json::json!({ "current": APP_VERSION, "latest": APP_VERSION, "update": false })).into_response();
+    Json(crate::update::check(&config.update_url)).into_response()
+}
+
+async fn download_update(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
     }
-    match ureq::get(&config.update_url).call() {
-        Ok(res) => {
-            let json: serde_json::Value = res.into_json().unwrap_or_default();
-            let latest = json.get("version").and_then(|v| v.as_str()).unwrap_or(APP_VERSION);
-            Json(serde_json::json!({ "current": APP_VERSION, "latest": latest, "update": latest != APP_VERSION })).into_response()
-        }
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "current": APP_VERSION, "error": error.to_string() })),
-        )
-            .into_response(),
+    Json(crate::update::download(&config.update_url)).into_response()
+}
+
+async fn apply_update(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
     }
+    Json(crate::update::apply()).into_response()
+}
+
+async fn create_inbox(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<RememberBody>) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let Some(text) = body.body.filter(|item| !item.trim().is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "body required" }))).into_response();
+    };
+    let result = MemoryService::remember(
+        &state.conn.lock().unwrap(),
+        &config,
+        &text,
+        body.title.as_deref(),
+        "custom",
+        None,
+        None,
+        "admin",
+        false,
+    );
+    Json(result).into_response()
 }
 
 async fn inbox(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -557,8 +582,8 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
         "tools/list" => {
             let all = [
                 ("memory.search", "Search durable shared memories. Results never include secret-classified text.", serde_json::json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"number"}},"required":["query"]})),
-                ("memory.remember", "Store a candidate memory. Secrets are redacted before persistence and never recalled.", serde_json::json!({"type":"object","properties":{"body":{"type":"string"},"title":{"type":"string"},"scopeKind":{"type":"string"},"scopeId":{"type":"string"}},"required":["body"]})),
-                ("memory.forget", "Tombstone a memory so it stops being recalled and will sync as forgotten.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})),
+                ("memory.remember", "Replace the distilled write-up for this scope. Send the full refined text after you distilled the source material, not one fact per call. Same scope overwrites the previous document. OneLedger does not summarize. Secrets are redacted and never recalled.", serde_json::json!({"type":"object","properties":{"body":{"type":"string"},"title":{"type":"string"},"scopeKind":{"type":"string"},"scopeId":{"type":"string"}},"required":["body"]})),
+                ("memory.forget", "Remove an official distilled memory so it is no longer recalled.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})),
                 ("memory.list", "List memory titles only, without bodies.", serde_json::json!({"type":"object","properties":{"limit":{"type":"number"}}})),
             ];
             let tools: Vec<serde_json::Value> = all

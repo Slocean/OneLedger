@@ -1,0 +1,520 @@
+use crate::util::APP_VERSION;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const OWNER: &str = "Slocean";
+const REPO: &str = "OneLedger";
+const DEFAULT_CHANNEL: &str = "https://raw.githubusercontent.com/Slocean/OneLedger/main/app_update.json";
+const RELEASES_PAGE: &str = "https://github.com/Slocean/OneLedger/releases";
+const PORTABLE_ASSET: &str = "OneLedger-Portable.exe";
+const SETUP_ASSET: &str = "OneLedger-Setup.exe";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flavor {
+    Portable,
+    Setup,
+}
+
+impl Flavor {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Portable => "portable",
+            Self::Setup => "setup",
+        }
+    }
+
+    fn asset(self) -> &'static str {
+        match self {
+            Self::Portable => PORTABLE_ASSET,
+            Self::Setup => SETUP_ASSET,
+        }
+    }
+
+    fn checksum(self) -> String {
+        format!("{}.sha256", self.asset())
+    }
+}
+
+fn user_agent() -> String {
+    format!("OneLedger/{APP_VERSION} (+https://github.com/{OWNER}/{REPO})")
+}
+
+fn parse_version(text: &str) -> Vec<u32> {
+    let trimmed = text.trim().trim_start_matches(['v', 'V']);
+    let take = trimmed
+        .split(|ch: char| !ch.is_ascii_digit() && ch != '.')
+        .next()
+        .unwrap_or("0");
+    take.split('.').filter_map(|part| part.parse().ok()).collect()
+}
+
+fn version_gt(remote: &str, local: &str) -> bool {
+    let a = parse_version(remote);
+    let b = parse_version(local);
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let left = *a.get(i).unwrap_or(&0);
+        let right = *b.get(i).unwrap_or(&0);
+        if left != right {
+            return left > right;
+        }
+    }
+    false
+}
+
+fn get_json(url: &str) -> Result<Value, String> {
+    ureq::get(url)
+        .set("User-Agent", &user_agent())
+        .set("Accept", "application/json")
+        .call()
+        .map_err(|err| err.to_string())?
+        .into_json()
+        .map_err(|err| err.to_string())
+}
+
+fn get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let res = ureq::get(url)
+        .set("User-Agent", &user_agent())
+        .call()
+        .map_err(|err| err.to_string())?;
+    let mut out = Vec::new();
+    res.into_reader().read_to_end(&mut out).map_err(|err| err.to_string())?;
+    Ok(out)
+}
+
+fn host_of(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("https://")?;
+    let (auth_host, path) = rest.split_once('/')?;
+    let host = auth_host.rsplit('@').next()?.split(':').next()?.to_ascii_lowercase();
+    Some((host, format!("/{path}")))
+}
+
+fn validate_github_url(url: &str, initial: bool) -> Result<String, String> {
+    let url = url.trim();
+    let Some((host, path)) = host_of(url) else {
+        return Err("更新地址必须是受信任的 GitHub HTTPS Release 资源".into());
+    };
+    let allowed = [
+        "github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+    ];
+    if !allowed.contains(&host.as_str()) {
+        return Err("更新地址必须是受信任的 GitHub HTTPS Release 资源".into());
+    }
+    if initial && (host != "github.com" || !path.starts_with(&format!("/{OWNER}/{REPO}/releases/download/"))) {
+        return Err("更新地址不属于 OneLedger 的 GitHub Release".into());
+    }
+    Ok(url.to_string())
+}
+
+fn normalize_channel(raw: &Value) -> Vec<Value> {
+    let entries = if let Some(list) = raw.get("history").and_then(|v| v.as_array()) {
+        list.clone()
+    } else if let Some(list) = raw.as_array() {
+        list.clone()
+    } else if raw.is_object() {
+        vec![raw.clone()]
+    } else {
+        vec![]
+    };
+    entries
+        .into_iter()
+        .filter_map(|item| {
+            let version = item
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim_start_matches(['v', 'V'])
+                .trim()
+                .to_string();
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let body = item.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let notice = item.get("notice").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            if version.is_empty() && title.is_empty() && body.is_empty() && notice.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "version": version,
+                "title": if title.is_empty() { format!("{version} 更新") } else { title },
+                "body": body,
+                "notice": notice
+            }))
+        })
+        .collect()
+}
+
+fn fetch_channel(update_url: &str) -> Result<(Vec<Value>, String), String> {
+    let url = if update_url.trim().is_empty() {
+        DEFAULT_CHANNEL
+    } else {
+        update_url.trim()
+    };
+    match get_json(url).map(|raw| normalize_channel(&raw)) {
+        Ok(history) => Ok((history, "remote".into())),
+        Err(err) => {
+            let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("app_update.json");
+            if let Ok(text) = fs::read_to_string(local) {
+                if let Ok(raw) = serde_json::from_str::<Value>(&text) {
+                    return Ok((normalize_channel(&raw), "local".into()));
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+fn detect_flavor() -> Flavor {
+    let Ok(exe) = std::env::current_exe() else {
+        return Flavor::Portable;
+    };
+    let name = exe
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name.contains("portable") {
+        return Flavor::Portable;
+    }
+    let dir = exe.parent();
+    if let Some(dir) = dir {
+        let uninstall = ["uninstall.exe", "Uninstall.exe", "uninst.exe"]
+            .iter()
+            .any(|item| dir.join(item).is_file());
+        if uninstall {
+            return Flavor::Setup;
+        }
+    }
+    let path = exe.to_string_lossy().to_ascii_lowercase();
+    if path.contains("program files") || path.contains("\\program files (x86)\\") {
+        return Flavor::Setup;
+    }
+    Flavor::Portable
+}
+
+fn can_hot_update() -> bool {
+    if cfg!(debug_assertions) {
+        return false;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_ascii_lowercase()))
+        .is_some_and(|name| name.contains("oneledger") && name.ends_with(".exe"))
+}
+
+fn resolve_download(version: &str, flavor: Flavor) -> Value {
+    let tag = format!("v{}", version.trim_start_matches(['v', 'V']));
+    let api = format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/tags/{tag}");
+    let html = format!("https://github.com/{OWNER}/{REPO}/releases/tag/{tag}");
+    match ureq::get(&api)
+        .set("User-Agent", &user_agent())
+        .set("Accept", "application/vnd.github+json")
+        .call()
+    {
+        Ok(res) => {
+            let data: Value = res.into_json().unwrap_or_default();
+            let assets = data.get("assets").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let want = flavor.asset();
+            let sum_name = flavor.checksum();
+            let exe = assets.iter().find(|item| item.get("name").and_then(|v| v.as_str()) == Some(want));
+            let sum = assets.iter().find(|item| item.get("name").and_then(|v| v.as_str()) == Some(sum_name.as_str()));
+            let exe_url = exe.and_then(|item| item.get("browser_download_url").and_then(|v| v.as_str()));
+            let sum_url = sum.and_then(|item| item.get("browser_download_url").and_then(|v| v.as_str()));
+            if let (Some(download_url), Some(checksum_url)) = (exe_url, sum_url) {
+                json!({
+                    "ok": true,
+                    "download_url": download_url,
+                    "checksum_url": checksum_url,
+                    "asset_name": want,
+                    "html_url": data.get("html_url").and_then(|v| v.as_str()).unwrap_or(&html)
+                })
+            } else {
+                json!({"ok": false, "pending": true, "html_url": html, "error": format!("{tag} 还没有完整的 {} 与校验文件", want)})
+            }
+        }
+        Err(ureq::Error::Status(404, _)) => {
+            json!({"ok": false, "pending": true, "html_url": html, "error": format!("{tag} 尚未发布或还在打包")})
+        }
+        Err(err) => json!({"ok": false, "html_url": html, "error": err.to_string()}),
+    }
+}
+
+pub fn check(update_url: &str) -> Value {
+    let local = APP_VERSION;
+    let flavor = detect_flavor();
+    let (history, source) = match fetch_channel(update_url) {
+        Ok(hit) => hit,
+        Err(error) => return json!({"ok": false, "current": local, "current_version": local, "error": error}),
+    };
+    let latest = history
+        .first()
+        .and_then(|item| item.get("version").and_then(|v| v.as_str()))
+        .unwrap_or(local)
+        .to_string();
+    let notes = history
+        .first()
+        .and_then(|item| item.get("body").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let notice = history
+        .iter()
+        .find_map(|item| item.get("notice").and_then(|v| v.as_str()).filter(|text| !text.is_empty()))
+        .unwrap_or("")
+        .to_string();
+    let resolved = if latest.is_empty() {
+        json!({"ok": false})
+    } else {
+        resolve_download(&latest, flavor)
+    };
+    let available = version_gt(&latest, local);
+    let asset_ready = resolved.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    json!({
+        "ok": true,
+        "update": available,
+        "update_available": available,
+        "current": local,
+        "current_version": local,
+        "latest": latest,
+        "latest_version": latest,
+        "release_notes": notes,
+        "notice": notice,
+        "history": history,
+        "flavor": flavor.as_str(),
+        "asset_name": flavor.asset(),
+        "html_url": resolved.get("html_url").cloned().unwrap_or(json!(RELEASES_PAGE)),
+        "download_url": if asset_ready { resolved.get("download_url").cloned() } else { Some(Value::Null) },
+        "checksum_url": if asset_ready { resolved.get("checksum_url").cloned() } else { Some(Value::Null) },
+        "asset_ready": asset_ready,
+        "asset_pending": resolved.get("pending").and_then(|v| v.as_bool()).unwrap_or(false),
+        "asset_error": resolved.get("error").cloned().unwrap_or(Value::Null),
+        "can_hot_update": can_hot_update(),
+        "source": source,
+        "message": if available {
+            if asset_ready { format!("发现新版本 {latest}") } else { format!("发现新版本 {latest}，安装包尚未就绪") }
+        } else {
+            "已是最新版本".into()
+        }
+    })
+}
+
+fn parse_checksum(raw: &[u8], asset: &str) -> Result<String, String> {
+    let text = String::from_utf8_lossy(raw);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let digest = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("").trim_start_matches('*');
+        if digest.len() == 64 && Path::new(name).file_name().and_then(|v| v.to_str()) == Some(asset) {
+            return Ok(digest.to_ascii_lowercase());
+        }
+    }
+    Err(format!("校验清单里没有 {asset} 的 SHA-256"))
+}
+
+fn staging_paths(flavor: Flavor) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    let base = match flavor {
+        Flavor::Portable => std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .ok_or_else(|| "无法定位程序目录".to_string())?,
+        Flavor::Setup => std::env::temp_dir(),
+    };
+    Ok((
+        base.join(match flavor {
+            Flavor::Portable => "OneLedger_update.exe",
+            Flavor::Setup => "OneLedger-Setup.update.exe",
+        }),
+        base.join(match flavor {
+            Flavor::Portable => "OneLedger_update.exe.partial",
+            Flavor::Setup => "OneLedger-Setup.update.exe.partial",
+        }),
+        base.join("OneLedger_update.verify.json"),
+    ))
+}
+
+pub fn download(update_url: &str) -> Value {
+    if !can_hot_update() {
+        return json!({"ok": false, "error": "热更新只用于打包后的桌面版。服务模式请到 Releases 手动下载。", "html_url": RELEASES_PAGE});
+    }
+    let flavor = detect_flavor();
+    let info = check(update_url);
+    if !info.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return info;
+    }
+    if !info.get("update_available").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return json!({"ok": false, "error": "当前已是最新版本，无需下载"});
+    }
+    let Some(download_url) = info.get("download_url").and_then(|v| v.as_str()) else {
+        return json!({"ok": false, "error": info.get("asset_error").and_then(|v| v.as_str()).unwrap_or("安装包未就绪"), "html_url": info.get("html_url")});
+    };
+    let Some(checksum_url) = info.get("checksum_url").and_then(|v| v.as_str()) else {
+        return json!({"ok": false, "error": "缺少校验文件"});
+    };
+    let download_url = match validate_github_url(download_url, true) {
+        Ok(url) => url,
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
+    let checksum_url = match validate_github_url(checksum_url, true) {
+        Ok(url) => url,
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
+    let expected = match get_bytes(&checksum_url).and_then(|raw| parse_checksum(&raw, flavor.asset())) {
+        Ok(hash) => hash,
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
+    let blob = match get_bytes(&download_url) {
+        Ok(bytes) => bytes,
+        Err(error) => return json!({"ok": false, "error": format!("下载失败: {error}")}),
+    };
+    if blob.len() < 100 * 1024 {
+        return json!({"ok": false, "error": "下载文件过小，可能不是有效安装包"});
+    }
+    let actual = hex::encode(Sha256::digest(&blob));
+    if actual != expected {
+        return json!({"ok": false, "error": format!("SHA-256 校验失败，已拒绝更新。期望 {expected}，实际 {actual}")});
+    }
+    let (dest, partial, meta) = match staging_paths(flavor) {
+        Ok(paths) => paths,
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
+    if let Err(error) = fs::write(&partial, &blob) {
+        return json!({"ok": false, "error": error.to_string()});
+    }
+    let _ = fs::remove_file(&dest);
+    if let Err(error) = fs::rename(&partial, &dest) {
+        return json!({"ok": false, "error": error.to_string()});
+    }
+    let _ = fs::write(
+        meta,
+        serde_json::to_vec_pretty(&json!({
+            "version": info.get("latest_version"),
+            "sha256": expected,
+            "flavor": flavor.as_str(),
+            "asset": flavor.asset()
+        }))
+        .unwrap_or_default(),
+    );
+    json!({
+        "ok": true,
+        "path": dest,
+        "flavor": flavor.as_str(),
+        "size": blob.len(),
+        "sha256": expected,
+        "latest_version": info.get("latest_version"),
+        "message": match flavor {
+            Flavor::Portable => format!("已下载便携包 {}，可立即替换并重启", info.get("latest_version").and_then(|v| v.as_str()).unwrap_or("")),
+            Flavor::Setup => format!("已下载安装包 {}，可立即退出并运行安装程序", info.get("latest_version").and_then(|v| v.as_str()).unwrap_or("")),
+        }
+    })
+}
+
+pub fn apply() -> Value {
+    if !can_hot_update() {
+        return json!({"ok": false, "error": "热更新只用于打包后的桌面版。"});
+    }
+    let flavor = detect_flavor();
+    let Ok((update_path, _, meta_path)) = staging_paths(flavor) else {
+        return json!({"ok": false, "error": "无法定位更新包"});
+    };
+    if !update_path.is_file() {
+        return json!({"ok": false, "error": "未找到已下载的更新包，请先下载更新"});
+    }
+    let Ok(meta) = fs::read_to_string(&meta_path) else {
+        return json!({"ok": false, "error": "更新包缺少校验记录，请重新下载"});
+    };
+    let parsed: Value = serde_json::from_str(&meta).unwrap_or_default();
+    if parsed.get("flavor").and_then(|v| v.as_str()) != Some(flavor.as_str()) {
+        return json!({"ok": false, "error": "已下载的包和当前安装形态不一致，请重新检查更新"});
+    }
+    let expected = parsed.get("sha256").and_then(|s| s.as_str()).unwrap_or("");
+    let Ok(bytes) = fs::read(&update_path) else {
+        return json!({"ok": false, "error": "无法读取更新包"});
+    };
+    if hex::encode(Sha256::digest(&bytes)) != expected {
+        return json!({"ok": false, "error": "更新包在下载后发生变化，已拒绝应用"});
+    }
+    let Ok(target) = std::env::current_exe() else {
+        return json!({"ok": false, "error": "无法定位当前程序"});
+    };
+    let pid = std::process::id();
+    let work = target.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let log = work.join("oneledger_update.log");
+    let ps = std::env::temp_dir().join(format!("oneledger_apply_update_{pid}.ps1"));
+    let upd = update_path.display().to_string().replace('\'', "''");
+    let tgt = target.display().to_string().replace('\'', "''");
+    let work_s = work.display().to_string().replace('\'', "''");
+    let log_s = log.display().to_string().replace('\'', "''");
+    let script = match flavor {
+        Flavor::Portable => format!(
+            r#"
+$ErrorActionPreference = 'Continue'
+$pidToWait = {pid}
+$upd = '{upd}'
+$tgt = '{tgt}'
+$work = '{work_s}'
+$log = '{log_s}'
+function Write-Log($msg) {{
+  $line = "[{{0}}] {{1}}" -f (Get-Date -Format o), $msg
+  try {{ Add-Content -LiteralPath $log -Value $line -Encoding UTF8 }} catch {{}}
+}}
+Write-Log 'portable waiting'
+try {{ Wait-Process -Id $pidToWait -Timeout 60 -ErrorAction SilentlyContinue }} catch {{}}
+Start-Sleep -Seconds 1
+if (Test-Path -LiteralPath $tgt) {{
+  $old = "$tgt.old"
+  try {{ if (Test-Path $old) {{ Remove-Item -LiteralPath $old -Force }} }} catch {{}}
+  try {{ Rename-Item -LiteralPath $tgt -NewName (Split-Path $old -Leaf) }} catch {{ Write-Log $_ }}
+}}
+try {{
+  Move-Item -LiteralPath $upd -Destination $tgt -Force
+  Write-Log 'portable replaced'
+  Start-Process -FilePath $tgt -WorkingDirectory $work
+}} catch {{ Write-Log $_ }}
+"#
+        ),
+        Flavor::Setup => format!(
+            r#"
+$ErrorActionPreference = 'Continue'
+$pidToWait = {pid}
+$upd = '{upd}'
+$log = '{log_s}'
+function Write-Log($msg) {{
+  $line = "[{{0}}] {{1}}" -f (Get-Date -Format o), $msg
+  try {{ Add-Content -LiteralPath $log -Value $line -Encoding UTF8 }} catch {{}}
+}}
+Write-Log 'setup waiting'
+try {{ Wait-Process -Id $pidToWait -Timeout 60 -ErrorAction SilentlyContinue }} catch {{}}
+Start-Sleep -Seconds 1
+try {{
+  Write-Log 'setup launching installer'
+  Start-Process -FilePath $upd
+}} catch {{ Write-Log $_ }}
+"#
+        ),
+    };
+    if fs::write(&ps, script).is_err() {
+        return json!({"ok": false, "error": "无法写出更新助手脚本"});
+    }
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &ps.display().to_string()])
+        .spawn();
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        std::process::exit(0);
+    });
+    json!({
+        "ok": true,
+        "flavor": flavor.as_str(),
+        "message": match flavor {
+            Flavor::Portable => "正在替换便携版并重启…",
+            Flavor::Setup => "正在退出并打开安装程序…",
+        }
+    })
+}

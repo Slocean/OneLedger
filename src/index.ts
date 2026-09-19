@@ -56,6 +56,7 @@ async function serveCmd(): Promise<void> {
     ctx.store = bootstrapped.store;
     ctx.service = bootstrapped.service;
     await ensureDefaultKey(ctx.service, ctx.store);
+    await ctx.service.retireNonDistilled();
   };
 
   ctx.reload = start;
