@@ -34,11 +34,10 @@ writeFileSync(
   `${JSON.stringify({ name: "oneledger", version: pkg.version, main: "main.mjs", author: "OneLedger" }, null, 2)}\n`,
 );
 
-cpSync(join(root, "dist"), join(out, "resources", "app-server", "dist"), { recursive: true });
-cpSync(join(root, "package.json"), join(out, "resources", "app-server", "package.json"));
-cpSync(join(root, "build-assets", "prod", "node_modules"), join(out, "resources", "app-server", "node_modules"), {
-  recursive: true,
-});
+cpSync(join(root, "dist", "index.js"), join(out, "resources", "app-server", "dist", "index.js"));
+if (existsSync(join(root, "dist", "web"))) {
+  cpSync(join(root, "dist", "web"), join(out, "resources", "app-server", "dist", "web"), { recursive: true });
+}
 cpSync(join(root, "build-assets", "runtime"), join(out, "resources", "runtime"), { recursive: true });
 
 renameSync(join(out, "electron.exe"), join(out, "OneLedger.exe"));

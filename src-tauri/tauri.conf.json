@@ -17,10 +17,15 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
     "resources": {
-      "../build-assets/runtime/": "runtime/",
-      "../build-assets/prod/node_modules/": "app-server/node_modules/",
-      "../dist/": "app-server/dist/",
-      "../package.json": "app-server/package.json"
+      "../build-assets/runtime/node.exe": "runtime/node.exe",
+      "../dist/index.js": "app-server/dist/index.js",
+      "../dist/web": "app-server/dist/web"
+    },
+    "windows": {
+      "nsis": {
+        "compression": "lzma",
+        "installMode": "currentUser"
+      }
     }
   }
 }
