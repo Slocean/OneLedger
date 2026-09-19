@@ -19,7 +19,7 @@
     "tauri:build": "npm run build && node scripts/prepare-runtime.mjs && tauri build --bundles nsis",
     "check": "tsc --noEmit -p tsconfig.json && vitest run",
     "test": "vitest run",
-    "pack": "npm run desktop:pack && node scripts/pack-exe.mjs",
+    "pack": "npm run tauri:build && node scripts/stage-tauri-release.mjs",
     "release": "node scripts/trigger-release.mjs"
   },
   "build": {

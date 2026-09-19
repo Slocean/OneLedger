@@ -4,6 +4,8 @@ name: Release
 #   release.bat            → 打 vX.Y.Z tag 并推送
 #   npm run release
 #   Actions → Run workflow
+#
+# 成品：Tauri NSIS 安装包 OneLedger.exe（不是 Electron）
 
 on:
   workflow_dispatch:
@@ -32,7 +34,7 @@ jobs:
   build-and-release:
     needs: quality
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -76,7 +78,6 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "release_name=OneLedger ${RAW}" >> "$GITHUB_OUTPUT"
-          echo "exe_name=OneLedger.exe" >> "$GITHUB_OUTPUT"
           echo "Resolved version=$RAW tag=$TAG"
 
       - name: Setup Node.js
@@ -85,17 +86,32 @@ jobs:
           node-version: "22"
           cache: npm
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Use crates.io on CI
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath "src-tauri\.cargo\config.toml") {
+            Remove-Item -LiteralPath "src-tauri\.cargo\config.toml" -Force
+          }
+
       - name: Install dependencies
         run: npm ci
 
-      - name: Ensure Electron binary
+      - name: Ensure app icon
         shell: pwsh
         run: |
-          if (-not (Test-Path -LiteralPath "node_modules\electron\dist\electron.exe")) {
-            node node_modules/electron/install.js
-          }
+          powershell -File scripts/make-icon.ps1
+          New-Item -ItemType Directory -Force -Path src-tauri\icons | Out-Null
+          Copy-Item -LiteralPath desktop\icons\icon.ico -Destination src-tauri\icons\icon.ico -Force
 
-      - name: Pack desktop app
+      - name: Pack Tauri installer
         run: npm run pack
 
       - name: Hash exe
@@ -104,7 +120,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $exe = "release\OneLedger.exe"
           if (-not (Test-Path -LiteralPath $exe)) {
-            throw "OneLedger.exe missing after pack"
+            throw "OneLedger.exe missing after Tauri pack"
           }
           $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash *OneLedger.exe" | Set-Content -LiteralPath "release\OneLedger.exe.sha256" -Encoding ascii
