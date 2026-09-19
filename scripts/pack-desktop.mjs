@@ -1,10 +1,11 @@
-import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const electronDir = dirname(require.resolve("electron/package.json"));
 const electronDist = join(electronDir, "dist");
 const out = join(root, "release", "desktop", "OneLedger");
@@ -30,7 +31,7 @@ mkdirSync(appDir, { recursive: true });
 cpSync(join(root, "desktop", "main.mjs"), join(appDir, "main.mjs"));
 writeFileSync(
   join(appDir, "package.json"),
-  `${JSON.stringify({ name: "oneledger", version: "0.2.0", main: "main.mjs", author: "OneLedger" }, null, 2)}\n`,
+  `${JSON.stringify({ name: "oneledger", version: pkg.version, main: "main.mjs", author: "OneLedger" }, null, 2)}\n`,
 );
 
 cpSync(join(root, "dist"), join(out, "resources", "app-server", "dist"), { recursive: true });

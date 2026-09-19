@@ -19,7 +19,8 @@
     "tauri:build": "npm run build && node scripts/prepare-runtime.mjs && tauri build --bundles nsis",
     "check": "tsc --noEmit -p tsconfig.json && vitest run",
     "test": "vitest run",
-    "pack": "npm run desktop:pack"
+    "pack": "npm run desktop:pack",
+    "release": "node scripts/trigger-release.mjs"
   },
   "build": {
     "appId": "ai.oneledger.app",
