@@ -57,9 +57,17 @@ export const api = {
       body: JSON.stringify({ body, title }),
     }),
   reject: (id: string) => request<{ ok: boolean }>(`/api/inbox/${id}/reject`, { method: "POST" }),
-  updates: () => request<UpdateInfo>("/api/updates"),
-  downloadUpdate: () => request<{ ok: boolean; message?: string; error?: string; html_url?: string }>("/api/updates/download", { method: "POST" }),
-  applyUpdate: () => request<{ ok: boolean; message?: string; error?: string }>("/api/updates/apply", { method: "POST" }),
+  updates: () => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 20000);
+    return request<UpdateInfo>("/api/updates", { signal: controller.signal }).finally(() =>
+      window.clearTimeout(timer),
+    );
+  },
+  installUpdate: () =>
+    request<{ ok: boolean; message?: string; error?: string; html_url?: string }>("/api/updates/install", {
+      method: "POST",
+    }),
   inbox: () => request<{ inbox: Inbox[] }>("/api/inbox"),
   audit: () => request<{ audit: Audit[]; redactions: Redaction[] }>("/api/audit"),
   collect: () => request<{ results: Collect[] }>("/api/collect", { method: "POST" }),
@@ -142,6 +150,7 @@ export interface UpdateInfo {
   html_url?: string;
   can_hot_update?: boolean;
   flavor?: string;
+  source?: string;
   error?: string;
 }
 

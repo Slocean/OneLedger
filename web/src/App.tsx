@@ -39,36 +39,39 @@ const NOTICE_KEY = "oneledger.noticeAck";
 function flavorLabel(flavor?: string) {
   if (flavor === "setup") return "安装版";
   if (flavor === "portable") return "便携版";
-  return "服务模式";
+  if (flavor === "service") return "服务模式";
+  return "检测中";
+}
+
+function sourceLabel(source?: string) {
+  if (!source) return "";
+  if (source.includes("raw.githubusercontent.com")) return "GitHub";
+  if (source.includes("github.com/") && source.includes("/raw/")) return "GitHub";
+  if (source.includes("jsdelivr")) return "jsDelivr";
+  if (source.includes("gitmirror")) return "gitmirror";
+  if (source === "unreachable" || source === "none") return "未拉到通道";
+  if (source === "embedded" || source === "local") return "程序内置";
+  return source;
 }
 
 function UpdateBox({
   info,
   open,
+  checking,
+  installing,
   onOpenChange,
   onRefresh,
+  onInstall,
 }: {
   info: UpdateInfo | null;
   open?: boolean;
+  checking?: boolean;
+  installing?: boolean;
   onOpenChange?: (open: boolean) => void;
   onRefresh: () => Promise<void>;
+  onInstall: () => Promise<void>;
 }) {
-  const [busy, setBusy] = useState("");
-  const [note, setNote] = useState("");
   const [openHistory, setOpenHistory] = useState(false);
-  const apply = async (kind: "download" | "apply") => {
-    setBusy(kind);
-    setNote("");
-    try {
-      const result = kind === "download" ? await api.downloadUpdate() : await api.applyUpdate();
-      setNote(result.error || result.message || (result.ok ? "完成" : "失败"));
-      if (kind === "download") await onRefresh();
-    } catch (error) {
-      setNote(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy("");
-    }
-  };
   return (
     <details
       className="advanced"
@@ -79,21 +82,26 @@ function UpdateBox({
       <p className="muted">
         当前 {info?.current ?? "…"}
         {info?.latest ? ` · 通道 ${info.latest}` : ""} · {flavorLabel(info?.flavor)}
+        {info?.source ? ` · 来源 ${sourceLabel(info.source)}` : ""}
       </p>
       <p>{info?.message || info?.error || "尚未检查"}</p>
       {info?.can_hot_update ? (
         <p className="muted">
           {info.flavor === "setup"
-            ? "安装版：下载 Setup 校验后退出，再打开安装程序覆盖安装。数据目录不动。"
-            : "便携版：下载 Portable 校验后替换正在运行的 exe 并重启。数据目录不动。"}
+            ? "安装版：一点即下载、校验，退出后打开安装程序覆盖安装。数据目录不动。"
+            : "便携版：一点即下载、校验、替换 exe 并重启。数据目录不动。"}
         </p>
-      ) : (
+      ) : info?.flavor === "service" ? (
         <p className="muted">服务模式不能热替换。有新版本请到 Releases 下载安装包或便携包。</p>
+      ) : info?.flavor ? (
+        <p className="muted">当前这个 exe 不能热替换（调试构建或文件名不含 OneLedger）。</p>
+      ) : (
+        <p className="muted">尚未完成检查。</p>
       )}
       {info?.release_notes ? <pre className="notes">{info.release_notes}</pre> : null}
       <div className="row">
-        <button type="button" onClick={() => void onRefresh()}>
-          检查更新
+        <button type="button" disabled={checking || installing} onClick={() => void onRefresh()}>
+          {checking ? "检查中…" : "检查更新"}
         </button>
         {info?.html_url ? (
           <a className="link-btn" href={info.html_url} target="_blank" rel="noreferrer">
@@ -101,20 +109,18 @@ function UpdateBox({
           </a>
         ) : null}
         {info?.can_hot_update && info.update ? (
-          <>
-            <button type="button" disabled={Boolean(busy)} onClick={() => void apply("download")}>
-              {busy === "download" ? "下载中…" : "下载更新"}
-            </button>
-            <button className="primary" type="button" disabled={Boolean(busy)} onClick={() => void apply("apply")}>
-              {busy === "apply" ? "正在应用…" : info.flavor === "setup" ? "退出并安装" : "立即替换并重启"}
-            </button>
-          </>
+          <button className="primary" type="button" disabled={Boolean(installing)} onClick={() => void onInstall()}>
+            {installing
+              ? "正在更新…"
+              : info.flavor === "setup"
+                ? `一键安装 ${info.latest}`
+                : `一键更新 ${info.latest}`}
+          </button>
         ) : null}
         <button type="button" onClick={() => setOpenHistory((open) => !open)}>
           更新公告
         </button>
       </div>
-      {note ? <p className={note.includes("失败") || note.includes("error") ? "error" : "ok"}>{note}</p> : null}
       {openHistory
         ? (info?.history ?? []).map((item) => (
             <article className="item" key={`${item.version}-${item.title}`}>
@@ -134,6 +140,7 @@ export function App() {
   const [error, setError] = useState("");
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
+  const [installBusy, setInstallBusy] = useState(false);
   const [updateError, setUpdateError] = useState("");
   const [aboutOpen, setAboutOpen] = useState(false);
   const [notice, setNotice] = useState("");
@@ -151,14 +158,31 @@ export function App() {
       if (data.update && data.notice && localStorage.getItem(NOTICE_KEY) !== data.notice) {
         setNotice(data.notice);
       }
-      if (opts?.reveal && data.update) {
+      if (opts?.reveal) {
         setTab("settings");
         setAboutOpen(true);
       }
     } catch (error) {
-      setUpdateError(error instanceof Error ? error.message : String(error));
+      const text = error instanceof Error ? error.message : String(error);
+      setUpdateError(/abort/i.test(text) ? "检查更新超时" : text);
     } finally {
       setUpdateBusy(false);
+    }
+  };
+  const installUpdate = async () => {
+    setInstallBusy(true);
+    setUpdateError("");
+    try {
+      const result = await api.installUpdate();
+      if (result.ok === false || result.error) {
+        setUpdateError(result.error || result.message || "更新失败");
+        return;
+      }
+      setUpdateError("");
+    } catch (error) {
+      setUpdateError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setInstallBusy(false);
     }
   };
 
@@ -256,14 +280,31 @@ export function App() {
             <h1>ONELEDGER</h1>
             <p>共享记忆总账 · MCP · 本地与远端</p>
           </div>
-          <button type="button" disabled={updateBusy} onClick={() => void loadUpdates({ reveal: true })}>
-            {updateBusy
-              ? "检查中…"
-              : updateInfo?.update
-                ? `更新 ${updateInfo.latest}`
-                : updateError
-                  ? "检查失败"
-                  : "检查更新"}
+          <button
+            type="button"
+            className={updateInfo?.can_hot_update && updateInfo.update ? "primary" : undefined}
+            disabled={updateBusy || installBusy}
+            onClick={() => {
+              if (updateInfo?.can_hot_update && updateInfo.update) {
+                void installUpdate();
+                return;
+              }
+              void loadUpdates({ reveal: true });
+            }}
+          >
+            {installBusy
+              ? "正在更新…"
+              : updateBusy
+                ? "检查中…"
+                : updateInfo?.can_hot_update && updateInfo.update
+                  ? `一键更新 ${updateInfo.latest}`
+                  : updateInfo?.update
+                    ? `更新 ${updateInfo.latest}`
+                    : updateError
+                      ? "检查失败"
+                      : updateInfo
+                        ? "已是最新"
+                        : "检查更新"}
           </button>
         </header>
         <nav className="tabs">
@@ -284,7 +325,10 @@ export function App() {
         </nav>
         {updateError ? <p className="error">{updateError}</p> : null}
         {updateInfo?.update && !updateError ? (
-          <p className="banner">发现 {updateInfo.latest}。点顶栏或打开「服务器与存储 → 关于与更新」下载。</p>
+          <p className="banner">
+            发现 {updateInfo.latest}。
+            {updateInfo.can_hot_update ? "点顶栏「一键更新」即可。" : "打开「服务器与存储 → 关于与更新」查看。"}
+          </p>
         ) : null}
         {collect?.running ? <CollectBanner collect={collect} /> : null}
       </div>
@@ -297,9 +341,12 @@ export function App() {
         {tab === "settings" ? (
           <SettingsPanel
             updateInfo={updateInfo}
+            updateBusy={updateBusy}
+            installBusy={installBusy}
             aboutOpen={aboutOpen}
             onAboutOpenChange={setAboutOpen}
             onRefreshUpdates={() => loadUpdates({ reveal: true })}
+            onInstallUpdate={installUpdate}
           />
         ) : null}
       </main>
@@ -824,14 +871,20 @@ function KeysPanel() {
 
 function SettingsPanel({
   updateInfo,
+  updateBusy,
+  installBusy,
   aboutOpen,
   onAboutOpenChange,
   onRefreshUpdates,
+  onInstallUpdate,
 }: {
   updateInfo: UpdateInfo | null;
+  updateBusy: boolean;
+  installBusy: boolean;
   aboutOpen: boolean;
   onAboutOpenChange: (open: boolean) => void;
   onRefreshUpdates: () => Promise<void>;
+  onInstallUpdate: () => Promise<void>;
 }) {
   const [form, setForm] = useState({
     bind: "127.0.0.1",
@@ -1060,9 +1113,12 @@ function SettingsPanel({
       </details>
       <UpdateBox
         info={updateInfo}
+        checking={updateBusy}
+        installing={installBusy}
         open={aboutOpen}
         onOpenChange={onAboutOpenChange}
         onRefresh={onRefreshUpdates}
+        onInstall={onInstallUpdate}
       />
       <button className="primary" type="submit">
         保存

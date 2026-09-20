@@ -1,6 +1,12 @@
 {
   "history": [
     {
+      "version": "0.4.4",
+      "title": "0.4.4 一键更新 · 自动关掉占端口的旧进程",
+      "body": "【更新】\n· 发现新版本后，顶栏和「关于与更新」改成一键更新：下载、校验、替换（便携版重启 / 安装版打开安装程序）\n· 检查更新不再堵界面；通道优先走 GitHub，过期镜像丢掉\n\n【修复】\n· 启动不再无条件刷新网页，避免黑屏闪个不停\n· 端口被旧 OneLedger 占用时（包括残留的 0.3.0 服务），自动结束旧进程再启动；别人的程序不会动\n\n【兼容说明】\n· 从 0.4.3 升级即可；数据仍在 ~/.oneledger；安装版与便携版热更新两套路径不变",
+      "notice": "0.4.4：一键更新；启动不再闪黑屏；占着端口的旧 OneLedger 会自动关掉。"
+    },
+    {
       "version": "0.4.3",
       "title": "0.4.3 按项目记账 · 只走 Tauri · Agent 直读全文",
       "body": "【记忆】\n· 采集把 scopeId 收成仓库名，不再用文件相对路径当项目 id\n· 只收约定文件、会话摘要、.workbuddy/memory；跳过 vendor_imports、虚拟环境、插件缓存等噪音\n· 蒸馏队列按项目分组；记忆面板用全局 / 项目 / 个人分类，默认全局，子标题用 Agent 蒸馏时的 title\n· 导出 JSON / Markdown 放在分类行右侧\n\n【MCP】\n· list / search 带上 scopeId，可按项目过滤\n· 新增 memory.get：按 id 或 scopeKind + 仓库名直接取全文，不必编搜索词\n· 已有 list/search 权限的旧密钥自动拥有 get；inbox 与 secret 仍不给 Agent\n\n【桌面】\n· 去掉 Electron；本地 dev 与发版都只走 Tauri 窗口\n\n【兼容说明】\n· 账本仍是 global / project / personal + 同作用域覆盖；数据仍在 ~/.oneledger\n· 已在队列里的旧原文 scopeId 不会自动改写，丢弃后重新采集才会变成仓库名",

@@ -12,7 +12,6 @@ use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use rusqlite::Connection;
 use serde::Deserialize;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
@@ -89,6 +88,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/updates", get(updates))
         .route("/api/updates/download", post(download_update))
         .route("/api/updates/apply", post(apply_update))
+        .route("/api/updates/install", post(install_update))
         .route("/api/inbox", get(inbox).post(create_inbox))
         .route("/api/audit", get(audit))
         .route("/api/agents", get(agents).post(create_agent))
@@ -314,7 +314,15 @@ async fn updates(State(state): State<AppState>, headers: HeaderMap) -> Response 
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
-    Json(crate::update::check(&config.update_url)).into_response()
+    let url = config.update_url.clone();
+    match tokio::task::spawn_blocking(move || crate::update::check(&url)).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn download_update(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -322,7 +330,15 @@ async fn download_update(State(state): State<AppState>, headers: HeaderMap) -> R
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
-    Json(crate::update::download(&config.update_url)).into_response()
+    let url = config.update_url.clone();
+    match tokio::task::spawn_blocking(move || crate::update::download(&url)).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn apply_update(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -330,7 +346,30 @@ async fn apply_update(State(state): State<AppState>, headers: HeaderMap) -> Resp
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
-    Json(crate::update::apply()).into_response()
+    match tokio::task::spawn_blocking(crate::update::apply).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn install_update(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let url = config.update_url.clone();
+    match tokio::task::spawn_blocking(move || crate::update::install(&url)).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn create_inbox(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<RememberBody>) -> Response {
@@ -712,14 +751,28 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
     }
 }
 
-pub async fn serve(state: AppState) -> anyhow_like::Result<()> {
+pub fn spawn(state: AppState) -> Result<(), String> {
     let config = state.config.lock().unwrap().clone();
-    let addr: SocketAddr = format!("{}:{}", config.bind, config.port).parse().unwrap();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router(state)).await?;
-    Ok(())
+    crate::instance::reclaim_oneledger_port(&config.bind, config.port)?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    tauri::async_runtime::spawn(async move {
+        let config = state.config.lock().unwrap().clone();
+        let addr = format!("{}:{}", config.bind, config.port);
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                let _ = tx.send(Ok(()));
+                if let Err(err) = axum::serve(listener, router(state)).await {
+                    eprintln!("oneledger http stopped: {err}");
+                }
+            }
+            Err(err) => {
+                let _ = tx.send(Err(format!(
+                    "端口 {addr} 已被占用，不会去挂旧进程。先关掉旧的 OneLedger 再开：{err}"
+                )));
+            }
+        }
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(8))
+        .map_err(|_| "HTTP 服务启动超时".to_string())?
 }
 
-mod anyhow_like {
-    pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-}

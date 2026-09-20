@@ -5,21 +5,25 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 const OWNER: &str = "Slocean";
 const REPO: &str = "OneLedger";
 const DEFAULT_CHANNEL: &str = "https://raw.githubusercontent.com/Slocean/OneLedger/main/app_update.json";
 const CHANNEL_MIRRORS: &[&str] = &[
+    DEFAULT_CHANNEL,
+    "https://github.com/Slocean/OneLedger/raw/main/app_update.json",
     "https://cdn.jsdelivr.net/gh/Slocean/OneLedger@main/app_update.json",
     "https://raw.gitmirror.com/Slocean/OneLedger/main/app_update.json",
-    "https://github.com/Slocean/OneLedger/raw/main/app_update.json",
-    DEFAULT_CHANNEL,
 ];
 const EMBEDDED_CHANNEL: &str = include_str!("../../app_update.json");
 const RELEASES_PAGE: &str = "https://github.com/Slocean/OneLedger/releases";
 const PORTABLE_ASSET: &str = "OneLedger-Portable.exe";
 const SETUP_ASSET: &str = "OneLedger-Setup.exe";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const CHANNEL_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Flavor {
@@ -74,33 +78,71 @@ fn version_gt(remote: &str, local: &str) -> bool {
     false
 }
 
-fn http_agent() -> ureq::Agent {
+fn github_token() -> Option<String> {
+    std::env::var("ONELEDGER_GITHUB_TOKEN")
+        .ok()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+}
+
+fn http_agent(use_proxy: bool, timeout: Duration) -> ureq::Agent {
     ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(8))
-        .try_proxy_from_env(true)
+        .timeout(timeout)
+        .timeout_connect(Duration::from_secs(3))
+        .try_proxy_from_env(use_proxy)
         .build()
 }
 
-fn get_json(url: &str) -> Result<Value, String> {
-    http_agent()
-        .get(url)
+fn cache_bust(url: &str) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|item| item.as_millis())
+        .unwrap_or(0);
+    if url.contains('?') {
+        format!("{url}&ol={ts}")
+    } else {
+        format!("{url}?ol={ts}")
+    }
+}
+
+fn apply_headers(req: ureq::Request, accept: &str) -> ureq::Request {
+    let req = req
         .set("User-Agent", &user_agent())
-        .set("Accept", "application/json,text/plain,*/*")
+        .set("Accept", accept)
+        .set("Cache-Control", "no-cache");
+    match github_token() {
+        Some(token) => req.set("Authorization", &format!("Bearer {token}")),
+        None => req,
+    }
+}
+
+fn request(url: &str, accept: &str, use_proxy: bool, timeout: Duration) -> Result<ureq::Response, String> {
+    apply_headers(http_agent(use_proxy, timeout).get(url), accept)
         .call()
-        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())
+}
+
+fn get_json_once(url: &str, use_proxy: bool) -> Result<Value, String> {
+    request(&cache_bust(url), "application/json,text/plain,*/*", use_proxy, REQUEST_TIMEOUT)?
         .into_json()
         .map_err(|err| err.to_string())
 }
 
-fn get_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let res = http_agent()
-        .get(url)
-        .set("User-Agent", &user_agent())
-        .call()
-        .map_err(|err| err.to_string())?;
+fn get_bytes_once(url: &str, use_proxy: bool) -> Result<Vec<u8>, String> {
+    let res = request(url, "*/*", use_proxy, DOWNLOAD_TIMEOUT)?;
     let mut out = Vec::new();
     res.into_reader().read_to_end(&mut out).map_err(|err| err.to_string())?;
     Ok(out)
+}
+
+fn get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    match get_bytes_once(url, false) {
+        Ok(bytes) => Ok(bytes),
+        Err(err) => match get_bytes_once(url, true) {
+            Ok(bytes) => Ok(bytes),
+            Err(proxy_err) => Err(format!("{err}；代理重试：{proxy_err}")),
+        },
+    }
 }
 
 fn host_of(url: &str) -> Option<(String, String)> {
@@ -165,7 +207,30 @@ fn normalize_channel(raw: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn fetch_channel(update_url: &str) -> Result<(Vec<Value>, String), String> {
+fn embedded_channel() -> Vec<Value> {
+    serde_json::from_str::<Value>(EMBEDDED_CHANNEL)
+        .map(|raw| normalize_channel(&raw))
+        .unwrap_or_default()
+}
+
+fn latest_of(history: &[Value]) -> String {
+    history
+        .first()
+        .and_then(|item| item.get("version").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn is_canonical_source(url: &str, custom: &str) -> bool {
+    let custom = custom.trim();
+    if !custom.is_empty() && url == custom {
+        return true;
+    }
+    let lower = url.to_ascii_lowercase();
+    lower.contains("raw.githubusercontent.com") || (lower.contains("github.com/") && lower.contains("/raw/"))
+}
+
+fn channel_urls(update_url: &str) -> Vec<String> {
     let mut urls = Vec::new();
     if !update_url.trim().is_empty() {
         urls.push(update_url.trim().to_string());
@@ -175,26 +240,102 @@ fn fetch_channel(update_url: &str) -> Result<(Vec<Value>, String), String> {
             urls.push((*mirror).to_string());
         }
     }
-    let mut last_err = "检查更新失败".to_string();
+    urls
+}
+
+struct ChannelHit {
+    history: Vec<Value>,
+    source: String,
+}
+
+fn fetch_one(url: &str, use_proxy: bool) -> Result<ChannelHit, String> {
+    let history = normalize_channel(&get_json_once(url, use_proxy)?);
+    if history.is_empty() {
+        return Err(format!("{url} 通道为空"));
+    }
+    Ok(ChannelHit {
+        history,
+        source: url.to_string(),
+    })
+}
+
+fn usable(hit: &ChannelHit, floor: &str) -> bool {
+    !version_gt(floor, &latest_of(&hit.history))
+}
+
+fn better(a: &ChannelHit, b: &ChannelHit, custom: &str) -> bool {
+    let av = latest_of(&a.history);
+    let bv = latest_of(&b.history);
+    if version_gt(&av, &bv) {
+        return true;
+    }
+    if version_gt(&bv, &av) {
+        return false;
+    }
+    is_canonical_source(&a.source, custom) && !is_canonical_source(&b.source, custom)
+}
+
+fn explain_channel_error(err: &str) -> String {
+    if err.to_ascii_lowercase().contains("404") && github_token().is_none() {
+        format!("{err}。GitHub 仓库若是私有的，未登录的检查会得到 404，这不是梯子问题。把仓库设为 Public，或设置环境变量 ONELEDGER_GITHUB_TOKEN。")
+    } else {
+        err.to_string()
+    }
+}
+
+fn fetch_wave(urls: &[String], use_proxy: bool, floor: &str, custom: &str) -> Result<ChannelHit, String> {
+    let (tx, rx) = mpsc::channel();
     for url in urls {
-        match get_json(&url) {
-            Ok(raw) => {
-                let history = normalize_channel(&raw);
-                if !history.is_empty() {
-                    return Ok((history, url));
+        let url = url.clone();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch_one(&url, use_proxy));
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + CHANNEL_BUDGET;
+    let mut best: Option<ChannelHit> = None;
+    let mut last_err = "检查更新失败".to_string();
+    loop {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remain) {
+            Ok(Ok(hit)) => {
+                if !usable(&hit, floor) {
+                    last_err = format!("{} 通道过期（{}）", hit.source, latest_of(&hit.history));
+                    continue;
                 }
-                last_err = format!("{url} 通道为空");
+                let canonical = is_canonical_source(&hit.source, custom);
+                if best.as_ref().map(|cur| better(&hit, cur, custom)).unwrap_or(true) {
+                    best = Some(hit);
+                }
+                if canonical {
+                    break;
+                }
             }
-            Err(err) => last_err = format!("{url}: {err}"),
+            Ok(Err(err)) => last_err = err,
+            Err(_) => break,
         }
     }
-    if let Ok(raw) = serde_json::from_str::<Value>(EMBEDDED_CHANNEL) {
-        let history = normalize_channel(&raw);
-        if !history.is_empty() {
-            return Ok((history, "embedded".into()));
-        }
+    best.ok_or(last_err)
+}
+
+fn fetch_channel(update_url: &str) -> Result<(Vec<Value>, String), String> {
+    let floor = latest_of(&embedded_channel());
+    let urls = channel_urls(update_url);
+    let custom = update_url.trim();
+    match fetch_wave(&urls, false, &floor, custom) {
+        Ok(hit) => Ok((hit.history, hit.source)),
+        Err(err) if err.to_ascii_lowercase().contains("404") => Err(explain_channel_error(&err)),
+        Err(direct_err) => match fetch_wave(&urls, true, &floor, custom) {
+            Ok(hit) => Ok((hit.history, hit.source)),
+            Err(proxy_err) => Err(explain_channel_error(&format!(
+                "{direct_err}；系统代理重试：{proxy_err}"
+            ))),
+        },
     }
-    Err(last_err)
 }
 
 fn detect_flavor() -> Flavor {
@@ -251,40 +392,8 @@ fn constructed_download(tag: &str, html: &str, flavor: Flavor) -> Value {
 
 fn resolve_download(version: &str, flavor: Flavor) -> Value {
     let tag = format!("v{}", version.trim_start_matches(['v', 'V']));
-    let api = format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/tags/{tag}");
     let html = format!("https://github.com/{OWNER}/{REPO}/releases/tag/{tag}");
-    match http_agent()
-        .get(&api)
-        .set("User-Agent", &user_agent())
-        .set("Accept", "application/vnd.github+json")
-        .call()
-    {
-        Ok(res) => {
-            let data: Value = res.into_json().unwrap_or_default();
-            let assets = data.get("assets").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let want = flavor.asset();
-            let sum_name = flavor.checksum();
-            let exe = assets.iter().find(|item| item.get("name").and_then(|v| v.as_str()) == Some(want));
-            let sum = assets.iter().find(|item| item.get("name").and_then(|v| v.as_str()) == Some(sum_name.as_str()));
-            let exe_url = exe.and_then(|item| item.get("browser_download_url").and_then(|v| v.as_str()));
-            let sum_url = sum.and_then(|item| item.get("browser_download_url").and_then(|v| v.as_str()));
-            if let (Some(download_url), Some(checksum_url)) = (exe_url, sum_url) {
-                json!({
-                    "ok": true,
-                    "download_url": download_url,
-                    "checksum_url": checksum_url,
-                    "asset_name": want,
-                    "html_url": data.get("html_url").and_then(|v| v.as_str()).unwrap_or(&html)
-                })
-            } else {
-                constructed_download(&tag, &html, flavor)
-            }
-        }
-        Err(ureq::Error::Status(404, _)) => {
-            json!({"ok": false, "pending": true, "html_url": html, "error": format!("{tag} 尚未发布或还在打包")})
-        }
-        Err(_) => constructed_download(&tag, &html, flavor),
-    }
+    constructed_download(&tag, &html, flavor)
 }
 
 pub fn check(update_url: &str) -> Value {
@@ -292,7 +401,20 @@ pub fn check(update_url: &str) -> Value {
     let flavor = detect_flavor();
     let (history, source) = match fetch_channel(update_url) {
         Ok(hit) => hit,
-        Err(error) => return json!({"ok": false, "current": local, "current_version": local, "error": error}),
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "current": local,
+                "current_version": local,
+                "flavor": flavor.as_str(),
+                "asset_name": flavor.asset(),
+                "can_hot_update": can_hot_update(),
+                "html_url": RELEASES_PAGE,
+                "source": "unreachable",
+                "error": error,
+                "message": format!("检查更新失败：{error}")
+            })
+        }
     };
     let latest = history
         .first()
@@ -561,4 +683,68 @@ try {{
             Flavor::Setup => "正在退出并打开安装程序…",
         }
     })
+}
+
+pub fn install(update_url: &str) -> Value {
+    let downloaded = download(update_url);
+    if !downloaded.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return downloaded;
+    }
+    let applied = apply();
+    if !applied.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return applied;
+    }
+    json!({
+        "ok": true,
+        "flavor": applied.get("flavor"),
+        "latest_version": downloaded.get("latest_version"),
+        "message": match applied.get("flavor").and_then(|v| v.as_str()) {
+            Some("setup") => "下载完成，即将退出并打开安装程序…",
+            _ => "下载完成，即将替换并重启…",
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_compare() {
+        assert!(version_gt("0.4.2", "0.4.1"));
+        assert!(!version_gt("0.4.2", "0.4.2"));
+        assert!(!version_gt("0.4.1", "0.4.2"));
+    }
+
+    #[test]
+    fn github_raw_is_canonical() {
+        assert!(is_canonical_source(DEFAULT_CHANNEL, ""));
+        assert!(is_canonical_source(
+            "https://github.com/Slocean/OneLedger/raw/main/app_update.json",
+            ""
+        ));
+        assert!(!is_canonical_source(
+            "https://cdn.jsdelivr.net/gh/Slocean/OneLedger@main/app_update.json",
+            ""
+        ));
+        assert!(is_canonical_source(
+            "https://example.com/latest.json",
+            "https://example.com/latest.json"
+        ));
+    }
+
+    #[test]
+    fn stale_channel_is_not_usable() {
+        let stale = ChannelHit {
+            history: vec![json!({"version": "0.4.0", "title": "old", "body": "", "notice": ""})],
+            source: "jsdelivr".into(),
+        };
+        assert!(!usable(&stale, "0.4.2"));
+        let current = ChannelHit {
+            history: vec![json!({"version": "0.4.2", "title": "now", "body": "", "notice": ""})],
+            source: DEFAULT_CHANNEL.into(),
+        };
+        assert!(usable(&current, "0.4.2"));
+        assert!(better(&current, &stale, ""));
+    }
 }

@@ -195,6 +195,18 @@ export function createApp(ctx: AppContext): Hono {
     return c.json({ ok: false, error: "热更新只用于打包后的桌面版。" }, 400);
   });
 
+  app.post("/api/updates/install", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    return c.json(
+      {
+        ok: false,
+        error: "热更新只用于打包后的桌面版。当前是服务模式，请到 Releases 下载安装包或便携包。",
+        html_url: "https://github.com/Slocean/OneLedger/releases",
+      },
+      400,
+    );
+  });
+
   app.get("/api/inbox", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
     return c.json({ inbox: await ctx.store.listInbox() });

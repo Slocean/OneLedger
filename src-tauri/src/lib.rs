@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod distill;
 mod http;
+mod instance;
 mod models;
 mod scan;
 mod service;
@@ -14,10 +15,50 @@ mod util;
 use crate::config::{home_dir, load_config, save_config};
 use crate::http::AppState;
 use crate::service::MemoryService;
+use crate::util::APP_VERSION;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+
+fn wait_for_our_http(url: &str) -> Result<(), String> {
+    let health = format!("{url}api/health");
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(400))
+        .timeout_connect(Duration::from_millis(400))
+        .try_proxy_from_env(false)
+        .build();
+    for _ in 0..80 {
+        if let Ok(res) = agent.get(&health).call() {
+            if let Ok(json) = res.into_json::<serde_json::Value>() {
+                let version = json.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                if json.get("name").and_then(|v| v.as_str()) == Some("oneledger") && version == APP_VERSION {
+                    return Ok(());
+                }
+                if !version.is_empty() && version != APP_VERSION {
+                    return Err(format!(
+                        "端口上跑的是旧进程 {version}，不是当前 {APP_VERSION}。先关掉旧的 OneLedger。"
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err("HTTP 服务没有就绪".into())
+}
+
+fn admin_token_script(token: &str) -> String {
+    format!(
+        r#"(function () {{
+  try {{
+    var host = location.hostname;
+    if (host !== "127.0.0.1" && host !== "localhost") return;
+    localStorage.setItem("oneledger.adminToken", {token});
+  }} catch (e) {{}}
+}})();"#,
+        token = serde_json::to_string(token).unwrap()
+    )
+}
 
 #[tauri::command]
 fn admin_token() -> String {
@@ -88,30 +129,17 @@ pub fn run() {
                 let _ = crate::collect::ensure_agents(&db, &cfg);
             }
             ensure_default_key(&state);
-            let serve_state = state.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = crate::http::serve(serve_state).await;
-            });
-            let port = config.port;
-            for _ in 0..40 {
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            crate::http::spawn(state.clone())?;
             config = load_config();
             let url = format!("http://127.0.0.1:{}/", config.port);
-            let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse().unwrap()))
+            wait_for_our_http(&url)?;
+            let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse().unwrap()))
                 .title("OneLedger")
-                .inner_size(1180.0, 820.0)
-                .build()?;
+                .inner_size(1180.0, 820.0);
             if !config.admin_token.is_empty() {
-                let script = format!(
-                    r#"localStorage.setItem("oneledger.adminToken", {}); location.reload();"#,
-                    serde_json::to_string(&config.admin_token).unwrap()
-                );
-                let _ = window.eval(&script);
+                builder = builder.initialization_script(admin_token_script(&config.admin_token));
             }
+            builder.build()?;
             start_background(state);
             Ok(())
         })

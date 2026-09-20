@@ -6,10 +6,10 @@ export const GITHUB_OWNER = "Slocean";
 export const GITHUB_REPO = "OneLedger";
 export const DEFAULT_UPDATE_URL = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/main/app_update.json`;
 export const CHANNEL_MIRRORS = [
+  DEFAULT_UPDATE_URL,
+  `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/raw/main/app_update.json`,
   `https://cdn.jsdelivr.net/gh/${GITHUB_OWNER}/${GITHUB_REPO}@main/app_update.json`,
   `https://raw.gitmirror.com/${GITHUB_OWNER}/${GITHUB_REPO}/main/app_update.json`,
-  `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/raw/main/app_update.json`,
-  DEFAULT_UPDATE_URL,
 ];
 export const RELEASES_PAGE_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases`;
 export const PORTABLE_ASSET = "OneLedger-Portable.exe";
@@ -85,13 +85,50 @@ function effectiveNotice(history: ChannelEntry[]): string {
   return history.find((item) => item.notice)?.notice ?? "";
 }
 
+function cacheBust(url: string): string {
+  const ts = Date.now();
+  return url.includes("?") ? `${url}&ol=${ts}` : `${url}?ol=${ts}`;
+}
+
+export function isCanonicalSource(url: string, custom = ""): boolean {
+  const trimmed = custom.trim();
+  if (trimmed && url === trimmed) return true;
+  const lower = url.toLowerCase();
+  return lower.includes("raw.githubusercontent.com") || (lower.includes("github.com/") && lower.includes("/raw/"));
+}
+
+export function pickBestChannel(
+  hits: Array<{ history: ChannelEntry[]; source: string }>,
+  floor = "",
+): { history: ChannelEntry[]; source: string } | undefined {
+  let best: { history: ChannelEntry[]; source: string } | undefined;
+  for (const hit of hits) {
+    const latest = hit.history[0]?.version || "";
+    if (!hit.history.length) continue;
+    if (floor && versionGt(floor, latest)) continue;
+    if (!best) {
+      best = hit;
+      continue;
+    }
+    const bestVer = best.history[0]?.version || "";
+    if (
+      versionGt(latest, bestVer) ||
+      (!versionGt(bestVer, latest) && isCanonicalSource(hit.source) && !isCanonicalSource(best.source))
+    ) {
+      best = hit;
+    }
+  }
+  return best;
+}
+
 async function httpJson(url: string): Promise<unknown> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
+  const timer = setTimeout(() => controller.abort(), 4000);
   try {
-    const response = await fetch(url, {
+    const response = await fetch(cacheBust(url), {
       signal: controller.signal,
-      headers: { "user-agent": USER_AGENT, accept: "application/json,text/plain,*/*" },
+      cache: "no-store",
+      headers: { "user-agent": USER_AGENT, accept: "application/json,text/plain,*/*", "cache-control": "no-cache" },
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return response.json();
@@ -111,19 +148,26 @@ export async function fetchChannel(updateUrl: string): Promise<{
   for (const mirror of CHANNEL_MIRRORS) {
     if (!urls.includes(mirror)) urls.push(mirror);
   }
-  let lastError = "检查更新失败";
-  for (const url of urls) {
-    try {
-      const channel = normalizeChannel(await httpJson(url));
-      if (channel.history.length > 0) return { ok: true, source: url, channel };
-      lastError = `${url} 通道为空`;
-    } catch (error) {
-      lastError = `${url}: ${error instanceof Error ? error.message : String(error)}`;
-    }
-  }
-  const local = loadLocalChannel();
-  if (local?.history.length) return { ok: true, source: "local", channel: local };
-  return { ok: false, source: "none", channel: { history: [] }, error: lastError };
+  const floor = loadLocalChannel()?.history[0]?.version || "";
+  const results = await Promise.all(
+    urls.map(async (url) => {
+      try {
+        const channel = normalizeChannel(await httpJson(url));
+        if (!channel.history.length) throw new Error("通道为空");
+        return { ok: true as const, history: channel.history, source: url };
+      } catch (error) {
+        return { ok: false as const, error: `${url}: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    }),
+  );
+  const hits = results.flatMap((item) => (item.ok ? [{ history: item.history, source: item.source }] : []));
+  const best = pickBestChannel(hits, floor);
+  if (best) return { ok: true, source: best.source, channel: { history: best.history } };
+  const lastError = results.find((item) => !item.ok)?.error || "检查更新失败";
+  const privateHint = /404/i.test(lastError)
+    ? `${lastError}。GitHub 仓库若是私有的，未登录的检查会得到 404，这不是梯子问题。`
+    : lastError;
+  return { ok: false, source: "none", channel: { history: [] }, error: privateHint };
 }
 
 function releaseDownloadUrl(tag: string, asset: string) {
@@ -184,16 +228,15 @@ export async function checkForUpdate(updateUrl: string) {
   const local = APP_VERSION;
   const ch = await fetchChannel(updateUrl);
   if (!ch.ok) {
-    return { ok: false, current: local, current_version: local, error: ch.error || "检查更新失败" };
+    return { ok: false, current: local, current_version: local, flavor: "service", can_hot_update: false, error: ch.error || "检查更新失败" };
   }
   const history = ch.channel.history;
   const latest = history[0]?.version || local;
   const notes = history[0]?.body || "";
   const notice = effectiveNotice(history);
-  const portable = latest ? await resolveDownload(latest, PORTABLE_ASSET) : { ok: false as const };
-  const setup = latest ? await resolveDownload(latest, SETUP_ASSET) : { ok: false as const };
+  const tag = `v${latest.replace(/^v/i, "")}`;
+  const html = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/tag/${tag}`;
   const available = versionGt(latest, local);
-  const assetReady = Boolean(portable.ok && setup.ok);
   return {
     ok: true,
     update: available,
@@ -207,20 +250,18 @@ export async function checkForUpdate(updateUrl: string) {
     history,
     flavor: "service",
     asset_name: "",
-    html_url: portable.html_url || setup.html_url || RELEASES_PAGE_URL,
+    html_url: html,
     download_url: null,
     checksum_url: null,
-    portable_ready: Boolean(portable.ok),
-    setup_ready: Boolean(setup.ok),
-    asset_ready: assetReady,
-    asset_pending: Boolean(portable.pending || setup.pending),
-    asset_error: portable.ok && setup.ok ? null : portable.error || setup.error || null,
+    portable_ready: Boolean(latest),
+    setup_ready: Boolean(latest),
+    asset_ready: Boolean(latest),
+    asset_pending: false,
+    asset_error: null,
     can_hot_update: false,
     source: ch.source,
     message: available
-      ? assetReady
-        ? `发现新版本 ${latest}（服务模式请到 Releases 下载对应安装包或便携包）`
-        : `发现新版本 ${latest}，安装包尚未就绪`
+      ? `发现新版本 ${latest}（服务模式请到 Releases 下载对应安装包或便携包）`
       : "已是最新版本",
   };
 }
