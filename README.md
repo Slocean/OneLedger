@@ -1,26 +1,27 @@
 # OneLedger
 
-自托管的 Agent 记忆总账：本机收集、安全扫描、蒸馏队列、MCP 供给其他 Code Agent 调用，并可与远端节点同步。版本 `0.4.2`。
+自托管的 Agent 记忆总账：本机收集、安全扫描、蒸馏队列、MCP 供给其他 Code Agent 调用，并可与远端节点同步。版本 `0.4.3`。桌面壳 **只使用 Tauri**，禁止 Electron。
 
 服务器地址和存储后端不写死，在管理界面里配置。默认本机 SQLite；中心节点可改接 Postgres。
 
 ## 要求
 
 - Node.js 22+
+- Rust（Tauri）
 
-默认只在本机跑，不依赖任何远程代码托管。数据在 `~/.oneledger`（可用 `ONELEDGER_HOME` 改）。
+默认只在本机跑。数据在 `~/.oneledger`（可用 `ONELEDGER_HOME` 改）。
 
 ## 启动
 
 ```bash
 npm install
 npm run check
-npm run build
-npm run desktop
-npm run pack
+npm run dev
 ```
 
-浏览器打开 `http://127.0.0.1:7443/`，用 `~/.oneledger/config.json` 里的 `adminToken` 登录管理台（Windows 上通常是 `C:\Users\<you>\.oneledger\config.json`）。数据目录可用 `ONELEDGER_HOME` 覆盖。
+`npm run dev` 打开 **Tauri 窗口**。发版：`npm run pack`（`OneLedger-Setup.exe` / `OneLedger-Portable.exe`）。
+
+无窗口 API（仅服务，不是管理台入口）：`npm run start` 或 `npm run dev:server`。
 
 ## 给其他 Agent 用的 MCP
 
@@ -40,22 +41,9 @@ npm run pack
 }
 ```
 
-远端 / 本机 HTTP：管理台签发一把 Agent 密钥后：
+HTTP：管理台签发 Agent 密钥后，`url` 为 `http://127.0.0.1:7443/mcp`，`Authorization: Bearer ol_...`。
 
-```json
-{
-  "mcpServers": {
-    "oneledger": {
-      "url": "http://127.0.0.1:7443/mcp",
-      "headers": {
-        "Authorization": "Bearer ol_..."
-      }
-    }
-  }
-}
-```
-
-工具：`memory.search` / `memory.remember` / `memory.forget` / `memory.list`。secret 级内容不会进入可检索记忆，也不会同步到远端。
+工具：`memory.search` / `memory.remember` / `memory.forget` / `memory.list` / `memory.get`。secret 级内容不会进入可检索记忆，也不会同步到远端。
 
 ## 运行模式
 

@@ -41,10 +41,15 @@ export const api = {
     request<{ name: string; version: string; exportedAt: string; count: number; memories: Memory[] }>(
       "/api/memories/export",
     ),
-  remember: (body: string, title?: string) =>
+  remember: (body: string, opts?: { title?: string; scopeKind?: string; scopeId?: string }) =>
     request<{ inboxId: string; memoryId?: string; redacted: boolean; queued: boolean }>("/api/remember", {
       method: "POST",
-      body: JSON.stringify({ body, title }),
+      body: JSON.stringify({
+        body,
+        title: opts?.title,
+        scopeKind: opts?.scopeKind,
+        scopeId: opts?.scopeId,
+      }),
     }),
   queueCustom: (body: string, title?: string) =>
     request<{ inboxId: string; queued: boolean }>("/api/inbox", {
@@ -95,6 +100,8 @@ export interface Inbox {
   title: string;
   body: string;
   source: string;
+  scopeKind?: string;
+  scopeId?: string;
   sensitivity: string;
   createdAt: string;
   queueStatus: string;

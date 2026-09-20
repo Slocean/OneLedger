@@ -119,4 +119,34 @@ describe("MemoryService", () => {
     expect(inbox[0]?.body).not.toContain("sk-abcdefghijklmnopqrstuvwxyz123456");
     await db.close();
   });
+
+  it("lists and searches memories by project scopeId", async () => {
+    const { db, service } = await setup();
+    await service.remember({
+      body: "CofoeAirLink uses port 3001 for the Vite app.",
+      source: "mcp:test",
+      actor: "test",
+      scopeKind: "project",
+      scopeId: "CofoeAirLink_Web",
+    });
+    await service.remember({
+      body: "RollTheWarTable keeps domain worktrees under RWT-ai.",
+      source: "mcp:test",
+      actor: "test",
+      scopeKind: "project",
+      scopeId: "RollTheWarTable",
+    });
+    const listed = await service.list(20, { scopeKind: "project", scopeId: "CofoeAirLink_Web" });
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.scopeId).toBe("CofoeAirLink_Web");
+    const hits = await service.search("worktrees", "test", 8, { scopeId: "RollTheWarTable" });
+    expect(hits).toHaveLength(1);
+    expect(hits[0]?.scopeId).toBe("RollTheWarTable");
+    const got = await service.get("test", { scopeKind: "project", scopeId: "CofoeAirLink_Web" });
+    expect(got).toHaveLength(1);
+    expect(got[0]?.body).toContain("port 3001");
+    const byId = await service.get("test", { id: hits[0]?.id });
+    expect(byId[0]?.scopeId).toBe("RollTheWarTable");
+    await db.close();
+  });
 });

@@ -1,37 +1,8 @@
-import { basename, dirname, join, relative } from "node:path";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { isOversized, isProjectMemoryFile, isSkipDirName, resolveProjectScopeId } from "./scope.js";
 
-const SKIP_DIRS = new Set([
-  "node_modules",
-  ".git",
-  "dist",
-  "build",
-  ".sync",
-  ".next",
-  "coverage",
-  "extensions",
-]);
-
-const EXACT_NAMES = new Set([
-  "agents.md",
-  "claude.md",
-  "claude.local.md",
-  ".cursorrules",
-  ".windsurfrules",
-  ".clinerules",
-  "gemini.md",
-]);
-
-export function isProjectMemoryFile(filePath: string): boolean {
-  const name = basename(filePath).toLowerCase();
-  if (EXACT_NAMES.has(name)) return true;
-  const parent = basename(dirname(filePath)).toLowerCase();
-  const grand = basename(dirname(dirname(filePath))).toLowerCase();
-  if ((name.endsWith(".md") || name.endsWith(".mdc")) && parent === "rules" && grand === ".cursor") {
-    return true;
-  }
-  return false;
-}
+export { isProjectMemoryFile };
 
 export function walkProjectMemoryFiles(root: string, maxFiles = 200): string[] {
   if (!existsSync(root)) return [];
@@ -49,15 +20,11 @@ export function walkProjectMemoryFiles(root: string, maxFiles = 200): string[] {
     for (const entry of entries) {
       const full = join(current, entry.name);
       if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name)) stack.push(full);
+        if (!isSkipDirName(entry.name)) stack.push(full);
         continue;
       }
       if (!isProjectMemoryFile(full)) continue;
-      try {
-        if (statSync(full).size > 256_000) continue;
-      } catch {
-        continue;
-      }
+      if (isOversized(full)) continue;
       out.push(full);
     }
   }
@@ -67,7 +34,7 @@ export function walkProjectMemoryFiles(root: string, maxFiles = 200): string[] {
 export function readProjectMemories(root: string): Array<{ path: string; text: string; scopeId?: string }> {
   return walkProjectMemoryFiles(root).flatMap((file) => {
     try {
-      return [{ path: file, text: readFileSync(file, "utf8"), scopeId: relative(root, file) }];
+      return [{ path: file, text: readFileSync(file, "utf8"), scopeId: resolveProjectScopeId(file, root) }];
     } catch {
       return [];
     }

@@ -11,18 +11,19 @@ describe("project memory files", () => {
     expect(isProjectMemoryFile("/repo/README.md")).toBe(false);
   });
 
-  it("reads only convention files from a tree", () => {
+  it("reads only convention files and scopes them to the repository name", () => {
     const root = mkdtempSync(join(tmpdir(), "ol-proj-"));
-    mkdirSync(join(root, ".cursor", "rules"), { recursive: true });
+    const repo = join(root, "CofoeAirLink_Web");
+    mkdirSync(join(repo, ".cursor", "rules"), { recursive: true });
     mkdirSync(join(root, "node_modules", "pkg"), { recursive: true });
-    writeFileSync(join(root, "AGENTS.md"), "Use pnpm.");
-    writeFileSync(join(root, "README.md"), "ignore me");
-    writeFileSync(join(root, ".cursor", "rules", "style.mdc"), "No aspect-ratio hacks.");
+    mkdirSync(join(root, "vendor_imports", "pkg"), { recursive: true });
+    writeFileSync(join(repo, "AGENTS.md"), "Use pnpm.");
+    writeFileSync(join(repo, "README.md"), "ignore me");
+    writeFileSync(join(repo, ".cursor", "rules", "style.mdc"), "No aspect-ratio hacks.");
     writeFileSync(join(root, "node_modules", "pkg", "AGENTS.md"), "vendor");
+    writeFileSync(join(root, "vendor_imports", "pkg", "AGENTS.md"), "mirror");
     const files = readProjectMemories(root);
-    expect(files.map((item) => item.scopeId?.replaceAll("\\", "/")).sort()).toEqual([
-      ".cursor/rules/style.mdc",
-      "AGENTS.md",
-    ]);
+    expect(files.map((item) => item.scopeId).sort()).toEqual(["CofoeAirLink_Web", "CofoeAirLink_Web"]);
+    expect(files.every((item) => !item.scopeId?.includes("AGENTS.md"))).toBe(true);
   });
 });

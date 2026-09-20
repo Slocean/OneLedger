@@ -1,5 +1,6 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { isOversized, isSkipDirName, isToolMemoryFile, resolveProjectScopeId } from "./scope.js";
 
 const TEXT_EXT = new Set([".md", ".txt", ".json", ".yml", ".yaml", ".mdc"]);
 
@@ -18,18 +19,14 @@ export function walkTextFiles(root: string, maxFiles = 400): string[] {
     }
     for (const entry of entries) {
       const full = join(current, entry.name);
-      if (entry.name === "node_modules" || entry.name === ".git" || entry.name === ".sync") continue;
       if (entry.isDirectory()) {
-        stack.push(full);
+        if (!isSkipDirName(entry.name)) stack.push(full);
         continue;
       }
       const lower = entry.name.toLowerCase();
       if (![...TEXT_EXT].some((ext) => lower.endsWith(ext))) continue;
-      try {
-        if (statSync(full).size > 256_000) continue;
-      } catch {
-        continue;
-      }
+      if (!isToolMemoryFile(full)) continue;
+      if (isOversized(full)) continue;
       out.push(full);
     }
   }
@@ -40,7 +37,7 @@ export function readCollected(root: string): Array<{ path: string; text: string;
   return walkTextFiles(root).flatMap((file) => {
     try {
       const text = readFileSync(file, "utf8");
-      return [{ path: file, text, scopeId: relative(root, file) }];
+      return [{ path: file, text, scopeId: resolveProjectScopeId(file, root) }];
     } catch {
       return [];
     }

@@ -189,8 +189,39 @@ fn read_project_memories(root: &str) -> Vec<(String, String, String)> {
 
 fn read_one(root: &str, file: &Path) -> Option<(String, String, String)> {
     let text = fs::read_to_string(file).ok()?;
-    let rel = file.strip_prefix(root).unwrap_or(file).to_string_lossy().into_owned();
-    Some((file.to_string_lossy().into_owned(), text, rel))
+    let scope = resolve_project_scope_id(file, Path::new(root));
+    Some((file.to_string_lossy().into_owned(), text, scope))
+}
+
+fn is_skip_dir(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "node_modules"
+            | ".git"
+            | ".sync"
+            | "dist"
+            | "build"
+            | ".next"
+            | "coverage"
+            | "extensions"
+            | "site-packages"
+            | "vendor_imports"
+            | "modify_backup"
+            | ".venv"
+            | "venv"
+            | "virtualenv"
+            | "__pycache__"
+            | ".tox"
+            | ".mypy_cache"
+            | ".pytest_cache"
+            | ".cache"
+            | "plugin-cache"
+            | "plugin_cache"
+            | "cacheddata"
+            | "cached_extensions"
+            | "blender"
+            | "blender_assets"
+    )
 }
 
 fn is_project_memory_file(path: &Path) -> bool {
@@ -217,6 +248,176 @@ fn is_project_memory_file(path: &Path) -> bool {
     (name.ends_with(".md") || name.ends_with(".mdc")) && parent.eq_ignore_ascii_case("rules") && grand.eq_ignore_ascii_case(".cursor")
 }
 
+fn is_tool_memory_file(path: &Path) -> bool {
+    if is_project_memory_file(path) {
+        return true;
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+    if matches!(name.as_str(), "pages.json" | "license.txt" | "license.md") {
+        return false;
+    }
+    if !(name.ends_with(".md") || name.ends_with(".txt")) {
+        return false;
+    }
+    if name == "memory.md" || name == "memory.txt" || name.contains("summary") {
+        return true;
+    }
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_lowercase()))
+        .collect();
+    parts.iter().any(|part| matches!(part.as_str(), "memory" | "sessions" | "summaries" | "session_summaries"))
+}
+
+fn looks_like_file(name: &str) -> bool {
+    Path::new(name).extension().is_some()
+}
+
+fn path_parts(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
+        .collect()
+}
+
+fn encoded_project_name(path: &Path) -> Option<String> {
+    for part in path_parts(path) {
+        let lower = part.to_lowercase();
+        if let Some(idx) = lower.find("-project-").or_else(|| lower.find("_project_")) {
+            let rest = &part[idx + 9..];
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn workspace_child_name(path: &Path) -> Option<String> {
+    let parts = path_parts(path);
+    for i in 0..parts.len().saturating_sub(1) {
+        if !parts[i].eq_ignore_ascii_case("workspace") {
+            continue;
+        }
+        let next = &parts[i + 1];
+        let lower = next.to_lowercase();
+        if is_skip_dir(next) || looks_like_file(next) {
+            continue;
+        }
+        if matches!(lower.as_str(), "sessions" | "session" | "backup" | "backups") {
+            continue;
+        }
+        return Some(next.clone());
+    }
+    None
+}
+
+fn known_projects_child(path: &Path) -> Option<String> {
+    let parts = path_parts(path);
+    for i in 0..parts.len().saturating_sub(1) {
+        if !matches!(parts[i].to_lowercase().as_str(), "project" | "projects" | "repos" | "repo") {
+            continue;
+        }
+        let next = &parts[i + 1];
+        if is_skip_dir(next) || looks_like_file(next) || next.starts_with('.') {
+            continue;
+        }
+        return Some(next.clone());
+    }
+    None
+}
+
+fn workspace_folder_name(path: &Path) -> Option<String> {
+    let mut dir = path.parent()?.to_path_buf();
+    for _ in 0..12 {
+        let candidate = dir.join("workspace.json");
+        if candidate.exists() {
+            if let Ok(text) = fs::read_to_string(&candidate) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let raw = value
+                        .get("folder")
+                        .or_else(|| value.get("workspace"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let cleaned = raw
+                        .trim_start_matches("file://")
+                        .trim_start_matches("file:///")
+                        .to_string();
+                    let cleaned = cleaned.replacen('/', "", 0);
+                    let as_path = PathBuf::from(cleaned.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    if let Some(name) = as_path.file_name().and_then(|n| n.to_str()) {
+                        if !name.is_empty() {
+                            return Some(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    for _ in 0..32 {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    let output = std::process::Command::new("git")
+        .args(["-C", &start.to_string_lossy(), "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(text))
+    }
+}
+
+fn resolve_project_scope_id(file: &Path, collect_root: &Path) -> String {
+    if let Some(git) = find_git_root(file.parent().unwrap_or(file)) {
+        if let Some(name) = git.file_name().and_then(|n| n.to_str()) {
+            return name.to_string();
+        }
+    }
+    if let Some(name) = workspace_folder_name(file) {
+        return name;
+    }
+    if let Some(name) = encoded_project_name(file) {
+        return name;
+    }
+    if let Some(name) = workspace_child_name(file) {
+        return name;
+    }
+    if let Some(name) = known_projects_child(file) {
+        return name;
+    }
+    if let Ok(rel) = file.strip_prefix(collect_root) {
+        for part in rel.components() {
+            let name = part.as_os_str().to_string_lossy();
+            if name.starts_with('.') || looks_like_file(&name) || is_skip_dir(&name) {
+                continue;
+            }
+            return name.into_owned();
+        }
+    }
+    collect_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_string()
+}
+
 fn walk_text(root: &Path, max_files: usize, project_only: bool) -> Vec<PathBuf> {
     if !root.exists() {
         return vec![];
@@ -232,7 +433,7 @@ fn walk_text(root: &Path, max_files: usize, project_only: bool) -> Vec<PathBuf> 
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if path.is_dir() {
-                if matches!(name.as_str(), "node_modules" | ".git" | ".sync" | "dist" | "build" | ".next" | "coverage" | "extensions") {
+                if is_skip_dir(&name) {
                     continue;
                 }
                 stack.push(path);
@@ -245,6 +446,9 @@ fn walk_text(root: &Path, max_files: usize, project_only: bool) -> Vec<PathBuf> 
             } else {
                 let lower = name.to_lowercase();
                 if ![".md", ".txt", ".json", ".yml", ".yaml", ".mdc"].iter().any(|ext| lower.ends_with(ext)) {
+                    continue;
+                }
+                if !is_tool_memory_file(&path) {
                     continue;
                 }
             }

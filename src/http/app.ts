@@ -141,11 +141,18 @@ export function createApp(ctx: AppContext): Hono {
 
   app.post("/api/remember", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
-    const body = (await c.req.json()) as { body?: string; title?: string };
+    const body = (await c.req.json()) as {
+      body?: string;
+      title?: string;
+      scopeKind?: "global" | "project" | "personal";
+      scopeId?: string;
+    };
     if (!body.body?.trim()) return c.json({ error: "body required" }, 400);
     const result = await ctx.service.remember({
       body: body.body,
       title: body.title,
+      scopeKind: body.scopeKind,
+      scopeId: body.scopeId,
       source: "ui",
       actor: "admin",
     });

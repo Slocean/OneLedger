@@ -244,6 +244,24 @@ pre {
   margin-bottom: 12px;
 }
 
+.memory-kind-bar {
+  align-items: center;
+}
+
+.memory-kind-bar .tabs {
+  margin-bottom: 0;
+}
+
+.subtabs {
+  margin-top: -4px;
+  margin-bottom: 4px;
+}
+
+.subtabs button {
+  font-size: 14px;
+  padding: 6px 10px;
+}
+
 .list,
 .form {
   display: grid;
@@ -345,6 +363,38 @@ label.check {
 
 .queue-item {
   cursor: pointer;
+}
+
+.queue-group {
+  display: grid;
+  gap: 8px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  padding: 10px 12px 12px;
+}
+
+.queue-group > summary {
+  cursor: pointer;
+  color: var(--ink);
+  font-size: 15px;
+  list-style: none;
+  min-height: 32px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.queue-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+.queue-group > summary::before {
+  content: "▸ ";
+  color: var(--gold);
+}
+
+.queue-group[open] > summary::before {
+  content: "▾ ";
 }
 
 .queue-item .preview {

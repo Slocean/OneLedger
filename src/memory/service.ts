@@ -1,4 +1,4 @@
-import type { CollectResult, MemoryRecord, MemoryScopeKind, Sensitivity } from "../types.js";
+import type { CollectResult, MemoryRecord, MemoryScopeKind, ScopeFilter, Sensitivity } from "../types.js";
 import type { AppConfig } from "../types.js";
 import { findConflicts, shouldAutoPromote } from "../distill/conflict.js";
 import { scanAndRedact } from "../security/scan.js";
@@ -192,16 +192,29 @@ export class MemoryService {
     return removed;
   }
 
-  async search(query: string, actor: string, limit = 8): Promise<MemoryRecord[]> {
+  async search(query: string, actor: string, limit = 8, filter?: ScopeFilter): Promise<MemoryRecord[]> {
     await this.retireNonDistilled();
-    const raw = await this.store.searchMemories(query, limit);
-    const filtered = raw.filter((item) => {
-      if (item.sensitivity === "secret") return false;
-      if (item.sensitivity === "pii") return false;
-      if (item.sensitivity === "internal" && !this.config.security.allowInternalInSearch) return false;
-      return SAFE_LEVELS.has(item.sensitivity);
-    });
+    const raw = await this.store.searchMemories(query, limit, filter);
+    const filtered = raw.filter((item) => this.visibleToAgent(item));
     await this.store.audit(actor, "memory.search", query.slice(0, 80));
+    return filtered.map((item) => this.forAgent(item));
+  }
+
+  async get(
+    actor: string,
+    opts: { id?: string; scopeKind?: MemoryScopeKind; scopeId?: string },
+  ): Promise<MemoryRecord[]> {
+    if (!opts.id && !opts.scopeKind && !opts.scopeId) return [];
+    await this.retireNonDistilled();
+    const raw = opts.id
+      ? [await this.store.getMemory(opts.id)].filter((item): item is MemoryRecord => Boolean(item))
+      : await this.store.listMemories(50, { scopeKind: opts.scopeKind, scopeId: opts.scopeId });
+    const filtered = raw.filter((item) => item.status !== "forgotten" && this.visibleToAgent(item));
+    await this.store.audit(
+      actor,
+      "memory.get",
+      opts.id || `${opts.scopeKind ?? ""}:${opts.scopeId ?? ""}`.slice(0, 80),
+    );
     return filtered.map((item) => this.forAgent(item));
   }
 
@@ -219,9 +232,9 @@ export class MemoryService {
     return true;
   }
 
-  async list(limit = 100): Promise<MemoryRecord[]> {
+  async list(limit = 100, filter?: ScopeFilter): Promise<MemoryRecord[]> {
     await this.retireNonDistilled();
-    return (await this.store.listMemories(limit)).map((item) => this.forUi(item));
+    return (await this.store.listMemories(limit, filter)).map((item) => this.forUi(item));
   }
 
   async ingestCollected(
@@ -254,7 +267,7 @@ export class MemoryService {
     return { source, scannedFiles: files.length, ingested, queued, skipped, redacted };
   }
 
-  async issueKey(name: string, tools = "memory.search,memory.remember,memory.forget,memory.list") {
+  async issueKey(name: string, tools = "memory.search,memory.remember,memory.forget,memory.list,memory.get") {
     const token = `ol_${crypto.randomUUID().replaceAll("-", "")}`;
     const record = {
       id: newId("key"),
@@ -280,5 +293,12 @@ export class MemoryService {
 
   forUi(memory: MemoryRecord): MemoryRecord {
     return this.forAgent(memory);
+  }
+
+  private visibleToAgent(item: MemoryRecord): boolean {
+    if (item.sensitivity === "secret") return false;
+    if (item.sensitivity === "pii") return false;
+    if (item.sensitivity === "internal" && !this.config.security.allowInternalInSearch) return false;
+    return SAFE_LEVELS.has(item.sensitivity);
   }
 }

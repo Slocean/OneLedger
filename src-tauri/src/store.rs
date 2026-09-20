@@ -30,7 +30,7 @@ pub fn get_inbox(conn: &Connection, id: &str) -> rusqlite::Result<Option<InboxRe
 
 pub fn list_inbox(conn: &Connection) -> rusqlite::Result<Vec<InboxRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT * FROM inbox WHERE queue_status = 'proposed' ORDER BY created_at DESC LIMIT 50",
+        "SELECT * FROM inbox WHERE queue_status = 'proposed' ORDER BY created_at DESC LIMIT 20000",
     )?;
     let rows = stmt.query_map([], map_inbox)?;
     rows.collect()
@@ -106,11 +106,22 @@ pub fn get_memory(conn: &Connection, id: &str) -> rusqlite::Result<Option<Memory
         .optional()
 }
 
-pub fn list_memories(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<MemoryRecord>> {
+pub fn list_memories(
+    conn: &Connection,
+    limit: i64,
+    scope_kind: Option<&str>,
+    scope_id: Option<&str>,
+) -> rusqlite::Result<Vec<MemoryRecord>> {
+    let kind = scope_kind.unwrap_or("");
+    let id = scope_id.unwrap_or("");
     let mut stmt = conn.prepare(
-        "SELECT * FROM memories WHERE status != 'forgotten' ORDER BY updated_at DESC LIMIT ?1",
+        "SELECT * FROM memories
+         WHERE status != 'forgotten'
+           AND (?1 = '' OR scope_kind = ?1)
+           AND (?2 = '' OR scope_id = ?2)
+         ORDER BY updated_at DESC LIMIT ?3",
     )?;
-    let rows = stmt.query_map([limit], map_memory)?;
+    let rows = stmt.query_map(params![kind, id, limit], map_memory)?;
     rows.collect()
 }
 
@@ -121,15 +132,25 @@ pub fn list_active(conn: &Connection) -> rusqlite::Result<Vec<MemoryRecord>> {
     rows.collect()
 }
 
-pub fn search_memories(conn: &Connection, query: &str, limit: i64) -> rusqlite::Result<Vec<MemoryRecord>> {
+pub fn search_memories(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    scope_kind: Option<&str>,
+    scope_id: Option<&str>,
+) -> rusqlite::Result<Vec<MemoryRecord>> {
     let needle = format!("%{}%", query.replace('%', ""));
+    let kind = scope_kind.unwrap_or("");
+    let id = scope_id.unwrap_or("");
     let mut stmt = conn.prepare(
         "SELECT * FROM memories
          WHERE status = 'active' AND sensitivity != 'secret'
-           AND (title LIKE ?1 OR body LIKE ?1)
-         ORDER BY updated_at DESC LIMIT ?2",
+           AND (?1 = '' OR scope_kind = ?1)
+           AND (?2 = '' OR scope_id = ?2)
+           AND (title LIKE ?3 OR body LIKE ?3)
+         ORDER BY updated_at DESC LIMIT ?4",
     )?;
-    let rows = stmt.query_map(params![needle, limit], map_memory)?;
+    let rows = stmt.query_map(params![kind, id, needle, limit], map_memory)?;
     rows.collect()
 }
 

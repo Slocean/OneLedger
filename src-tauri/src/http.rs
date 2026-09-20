@@ -19,7 +19,7 @@ use tower_http::cors::CorsLayer;
 
 #[derive(RustEmbed)]
 #[folder = "web-assets/"]
-struct WebAssets;
+struct WebAssets; // rebuilt with memory category tabs
 
 #[derive(Clone)]
 pub struct AppState {
@@ -240,7 +240,7 @@ async fn memories(State(state): State<AppState>, headers: HeaderMap) -> Response
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
-    let list = MemoryService::list(&state.conn.lock().unwrap(), 100);
+    let list = MemoryService::list(&state.conn.lock().unwrap(), 100, None, None);
     Json(serde_json::json!({ "memories": list })).into_response()
 }
 
@@ -249,7 +249,7 @@ async fn export_memories(State(state): State<AppState>, headers: HeaderMap) -> R
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
-    let memories = MemoryService::list(&state.conn.lock().unwrap(), 10_000);
+    let memories = MemoryService::list(&state.conn.lock().unwrap(), 10_000, None, None);
     Json(serde_json::json!({
         "name": "oneledger",
         "version": APP_VERSION,
@@ -261,9 +261,12 @@ async fn export_memories(State(state): State<AppState>, headers: HeaderMap) -> R
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RememberBody {
     body: Option<String>,
     title: Option<String>,
+    scope_kind: Option<String>,
+    scope_id: Option<String>,
     promote: Option<bool>,
 }
 
@@ -281,8 +284,8 @@ async fn remember(State(state): State<AppState>, headers: HeaderMap, Json(body):
         &text,
         body.title.as_deref(),
         "ui",
-        None,
-        None,
+        body.scope_kind.as_deref(),
+        body.scope_id.as_deref(),
         "admin",
         body.promote.unwrap_or(false),
     );
@@ -613,6 +616,10 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
     let id = payload.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let permitted: Vec<&str> = tools.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let tool_ok = |name: &str| {
+        permitted.contains(&name)
+            || (name == "memory.get" && (permitted.contains(&"memory.list") || permitted.contains(&"memory.search")))
+    };
     match method {
         "initialize" => serde_json::json!({
             "jsonrpc": "2.0",
@@ -626,21 +633,22 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
         "notifications/initialized" | "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
         "tools/list" => {
             let all = [
-                ("memory.search", "Search durable shared memories. Results never include secret-classified text.", serde_json::json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"number"}},"required":["query"]})),
+                ("memory.search", "Search durable shared memories. Results never include secret-classified text. Filter with scopeKind and scopeId (repository name).", serde_json::json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"number"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"}},"required":["query"]})),
                 ("memory.remember", "Replace the distilled write-up for this scope. Send the full refined text after you distilled the source material, not one fact per call. Same scope overwrites the previous document. OneLedger does not summarize. Secrets are redacted and never recalled.", serde_json::json!({"type":"object","properties":{"body":{"type":"string"},"title":{"type":"string"},"scopeKind":{"type":"string"},"scopeId":{"type":"string"}},"required":["body"]})),
                 ("memory.forget", "Remove an official distilled memory so it is no longer recalled.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})),
-                ("memory.list", "List memory titles only, without bodies.", serde_json::json!({"type":"object","properties":{"limit":{"type":"number"}}})),
+                ("memory.list", "List memory titles only, without bodies. Includes scopeId. Filter with scopeKind and scopeId.", serde_json::json!({"type":"object","properties":{"limit":{"type":"number"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"}}})),
+                ("memory.get", "Read full distilled documents. Pass id, or scopeKind and/or scopeId (repository name). No dummy search query. Results never include secret-classified text.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"}}})),
             ];
             let tools: Vec<serde_json::Value> = all
                 .into_iter()
-                .filter(|(name, _, _)| permitted.contains(name))
+                .filter(|(name, _, _)| tool_ok(name))
                 .map(|(name, desc, schema)| serde_json::json!({"name": name, "description": desc, "inputSchema": schema}))
                 .collect();
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } })
         }
         "tools/call" => {
             let name = payload["params"]["name"].as_str().unwrap_or("");
-            if !permitted.contains(&name) {
+            if !tool_ok(name) {
                 return serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "tool not allowed" } });
             }
             let args = payload["params"]["arguments"].clone();
@@ -652,6 +660,8 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
                     args["query"].as_str().unwrap_or(""),
                     actor,
                     args["limit"].as_i64().unwrap_or(8),
+                    args["scopeKind"].as_str(),
+                    args["scopeId"].as_str(),
                 ))
                 .unwrap_or_default(),
                 "memory.remember" => MemoryService::remember(
@@ -666,12 +676,26 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
                     false,
                 ),
                 "memory.forget" => serde_json::json!({ "ok": MemoryService::forget(&conn, args["id"].as_str().unwrap_or(""), actor) }),
+                "memory.get" => serde_json::to_value(MemoryService::get(
+                    &conn,
+                    config,
+                    actor,
+                    args["id"].as_str(),
+                    args["scopeKind"].as_str(),
+                    args["scopeId"].as_str(),
+                ))
+                .unwrap_or_default(),
                 "memory.list" => {
-                    let items = MemoryService::list(&conn, args["limit"].as_i64().unwrap_or(20));
+                    let items = MemoryService::list(
+                        &conn,
+                        args["limit"].as_i64().unwrap_or(20),
+                        args["scopeKind"].as_str(),
+                        args["scopeId"].as_str(),
+                    );
                     serde_json::to_value(
                         items
                             .into_iter()
-                            .map(|item| serde_json::json!({"id": item.id, "title": item.title, "scopeKind": item.scope_kind, "updatedAt": item.updated_at}))
+                            .map(|item| serde_json::json!({"id": item.id, "title": item.title, "scopeKind": item.scope_kind, "scopeId": item.scope_id, "updatedAt": item.updated_at}))
                             .collect::<Vec<_>>(),
                     )
                     .unwrap_or_default()

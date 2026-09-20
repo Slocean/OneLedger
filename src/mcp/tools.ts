@@ -3,16 +3,21 @@ import type { MemoryService } from "../memory/service.js";
 
 export const toolSchemas = {
   "memory.search": {
-    description: "Search durable shared memories. Results never include secret-classified text.",
+    description:
+      "Search durable shared memories. Results never include secret-classified text. Filter with scopeKind and scopeId (repository name).",
     input: z.object({
       query: z.string().min(1),
       limit: z.number().int().min(1).max(20).optional(),
+      scopeKind: z.enum(["global", "project", "personal"]).optional(),
+      scopeId: z.string().optional(),
     }),
     jsonSchema: {
       type: "object",
       properties: {
         query: { type: "string" },
         limit: { type: "number" },
+        scopeKind: { type: "string", enum: ["global", "project", "personal"] },
+        scopeId: { type: "string" },
       },
       required: ["query"],
     },
@@ -47,11 +52,36 @@ export const toolSchemas = {
     },
   },
   "memory.list": {
-    description: "List memory titles only, without bodies.",
-    input: z.object({ limit: z.number().int().min(1).max(50).optional() }),
+    description: "List memory titles only, without bodies. Includes scopeId. Filter with scopeKind and scopeId.",
+    input: z.object({
+      limit: z.number().int().min(1).max(50).optional(),
+      scopeKind: z.enum(["global", "project", "personal"]).optional(),
+      scopeId: z.string().optional(),
+    }),
     jsonSchema: {
       type: "object",
-      properties: { limit: { type: "number" } },
+      properties: {
+        limit: { type: "number" },
+        scopeKind: { type: "string", enum: ["global", "project", "personal"] },
+        scopeId: { type: "string" },
+      },
+    },
+  },
+  "memory.get": {
+    description:
+      "Read full distilled documents. Pass id, or scopeKind and/or scopeId (repository name). No dummy search query. Results never include secret-classified text.",
+    input: z.object({
+      id: z.string().optional(),
+      scopeKind: z.enum(["global", "project", "personal"]).optional(),
+      scopeId: z.string().optional(),
+    }),
+    jsonSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        scopeKind: { type: "string", enum: ["global", "project", "personal"] },
+        scopeId: { type: "string" },
+      },
     },
   },
 } as const;
@@ -66,7 +96,10 @@ export async function callTool(
 ): Promise<unknown> {
   if (name === "memory.search") {
     const input = toolSchemas["memory.search"].input.parse(args);
-    return service.search(input.query, actor, input.limit ?? 8);
+    return service.search(input.query, actor, input.limit ?? 8, {
+      scopeKind: input.scopeKind,
+      scopeId: input.scopeId,
+    });
   }
   if (name === "memory.remember") {
     const input = toolSchemas["memory.remember"].input.parse(args);
@@ -85,17 +118,31 @@ export async function callTool(
   }
   if (name === "memory.list") {
     const input = toolSchemas["memory.list"].input.parse(args);
-    const items = await service.list(input.limit ?? 20);
+    const items = await service.list(input.limit ?? 20, {
+      scopeKind: input.scopeKind,
+      scopeId: input.scopeId,
+    });
     return items.map((item) => ({
       id: item.id,
       title: item.title,
       scopeKind: item.scopeKind,
+      scopeId: item.scopeId,
       updatedAt: item.updatedAt,
     }));
+  }
+  if (name === "memory.get") {
+    const input = toolSchemas["memory.get"].input.parse(args);
+    return service.get(actor, {
+      id: input.id,
+      scopeKind: input.scopeKind,
+      scopeId: input.scopeId,
+    });
   }
   throw new Error(`Unknown tool: ${name}`);
 }
 
 export function allowedTools(csv: string): Set<string> {
-  return new Set(csv.split(",").map((part) => part.trim()).filter(Boolean));
+  const set = new Set(csv.split(",").map((part) => part.trim()).filter(Boolean));
+  if (set.has("memory.list") || set.has("memory.search")) set.add("memory.get");
+  return set;
 }

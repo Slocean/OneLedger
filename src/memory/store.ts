@@ -1,5 +1,5 @@
 import type { Db } from "../db/driver.js";
-import type { AgentRecord, ApiKeyRecord, InboxRecord, MemoryRecord, QueueStatus } from "../types.js";
+import type { AgentRecord, ApiKeyRecord, InboxRecord, MemoryRecord, QueueStatus, ScopeFilter } from "../types.js";
 import { newId, nowIso } from "../util.js";
 
 interface MemoryRow {
@@ -128,6 +128,20 @@ function mapInbox(row: InboxRow): InboxRecord {
   };
 }
 
+function scopeWhere(base: string, filter?: ScopeFilter): { sql: string; params: unknown[] } {
+  const clauses = [base];
+  const params: unknown[] = [];
+  if (filter?.scopeKind) {
+    clauses.push("scope_kind = ?");
+    params.push(filter.scopeKind);
+  }
+  if (filter?.scopeId) {
+    clauses.push("scope_id = ?");
+    params.push(filter.scopeId);
+  }
+  return { sql: `SELECT * FROM memories WHERE ${clauses.join(" AND ")}`, params };
+}
+
 export class Store {
   constructor(private readonly db: Db) {}
 
@@ -162,7 +176,7 @@ export class Store {
     return row ? mapInbox(row) : undefined;
   }
 
-  async listInbox(limit = 50, status: QueueStatus = "proposed"): Promise<InboxRecord[]> {
+  async listInbox(limit = 20_000, status: QueueStatus = "proposed"): Promise<InboxRecord[]> {
     const rows = await this.db.all<InboxRow>(
       "SELECT * FROM inbox WHERE queue_status = ? ORDER BY created_at DESC LIMIT ?",
       [status, limit],
@@ -239,11 +253,9 @@ export class Store {
     return row ? mapMemory(row) : undefined;
   }
 
-  async listMemories(limit = 100): Promise<MemoryRecord[]> {
-    const rows = await this.db.all<MemoryRow>(
-      "SELECT * FROM memories WHERE status != 'forgotten' ORDER BY updated_at DESC LIMIT ?",
-      [limit],
-    );
+  async listMemories(limit = 100, filter?: ScopeFilter): Promise<MemoryRecord[]> {
+    const { sql, params } = scopeWhere("status != 'forgotten'", filter);
+    const rows = await this.db.all<MemoryRow>(`${sql} ORDER BY updated_at DESC LIMIT ?`, [...params, limit]);
     return rows.map(mapMemory);
   }
 
@@ -255,14 +267,12 @@ export class Store {
     return rows.map(mapMemory);
   }
 
-  async searchMemories(query: string, limit = 8): Promise<MemoryRecord[]> {
+  async searchMemories(query: string, limit = 8, filter?: ScopeFilter): Promise<MemoryRecord[]> {
     const needle = `%${query.replaceAll("%", "")}%`;
+    const { sql, params } = scopeWhere("status = 'active' AND sensitivity != 'secret'", filter);
     const rows = await this.db.all<MemoryRow>(
-      `SELECT * FROM memories
-       WHERE status = 'active' AND sensitivity != 'secret'
-         AND (title LIKE ? OR body LIKE ?)
-       ORDER BY updated_at DESC LIMIT ?`,
-      [needle, needle, limit],
+      `${sql} AND (title LIKE ? OR body LIKE ?) ORDER BY updated_at DESC LIMIT ?`,
+      [...params, needle, needle, limit],
     );
     return rows.map(mapMemory);
   }

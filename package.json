@@ -1,78 +1,25 @@
 {
   "name": "oneledger",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "type": "module",
   "description": "Self-hosted shared memory ledger for coding agents, exposed over MCP.",
   "author": "OneLedger",
-  "main": "desktop/main.mjs",
   "bin": {
     "oneledger": "./dist/index.js"
   },
   "scripts": {
-    "dev": "tsx src/index.ts serve",
-    "dev:web": "vite --config web/vite.config.ts",
+    "dev": "vite build --config web/vite.config.ts && node scripts/sync-web-embed.mjs && tauri dev",
+    "dev:server": "tsx src/index.ts serve",
     "build": "tsc -p tsconfig.json && vite build --config web/vite.config.ts",
     "bundle:server": "node scripts/bundle-server.mjs",
     "start": "node dist/index.js serve",
-    "desktop": "npm run build && electron desktop/main.mjs",
-    "desktop:pack": "npm run build && node scripts/prepare-runtime.mjs && node scripts/pack-desktop.mjs",
+    "tauri:dev": "tauri dev",
     "tauri:build": "vite build --config web/vite.config.ts && node scripts/sync-web-embed.mjs && tauri build --bundles nsis",
     "check": "node scripts/validate-release.mjs && tsc --noEmit -p tsconfig.json && vitest run",
     "test": "vitest run",
     "pack": "node scripts/validate-release.mjs && npm run tauri:build && node scripts/stage-tauri-release.mjs",
     "release": "node scripts/validate-release.mjs && node scripts/trigger-release.mjs"
-  },
-  "build": {
-    "appId": "ai.oneledger.app",
-    "productName": "OneLedger",
-    "asar": false,
-    "directories": {
-      "output": "release/desktop"
-    },
-    "extraMetadata": {
-      "main": "main.mjs"
-    },
-    "files": [
-      {
-        "from": "desktop",
-        "filter": [
-          "main.mjs",
-          "package.json"
-        ]
-      }
-    ],
-    "extraResources": [
-      {
-        "from": "dist",
-        "to": "app-server/dist"
-      },
-      {
-        "from": "build-assets/prod/node_modules",
-        "to": "app-server/node_modules"
-      },
-      {
-        "from": "package.json",
-        "to": "app-server/package.json"
-      },
-      {
-        "from": "build-assets/runtime",
-        "to": "runtime"
-      }
-    ],
-    "win": {
-      "icon": "desktop/icons/icon.ico",
-      "signAndEditExecutable": false,
-      "target": [
-        "nsis",
-        "portable"
-      ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "shortcutName": "OneLedger"
-    }
   },
   "engines": {
     "node": ">=22"
@@ -91,8 +38,6 @@
     "@types/react": "^19.1.13",
     "@types/react-dom": "^19.1.9",
     "@vitejs/plugin-react": "^5.0.3",
-    "electron": "^44.4.3",
-    "electron-builder": "^26.15.3",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "tsx": "^4.20.5",

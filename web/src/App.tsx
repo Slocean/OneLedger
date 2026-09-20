@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   api,
   getToken,
@@ -12,7 +12,27 @@ import {
   type UpdateInfo,
 } from "./api";
 
-type Tab = "memories" | "queue" | "agents" | "sync" | "keys" | "settings";
+function queueGroupKey(item: Inbox): string {
+  if (item.scopeKind === "project" && item.scopeId?.trim()) return item.scopeId.trim();
+  if (item.scopeKind === "personal") return "个人";
+  if (item.scopeKind === "global") return "全局";
+  if (item.scopeId?.trim()) return item.scopeId.trim();
+  return "未归属";
+}
+
+function groupInbox(items: Inbox[]): Array<{ key: string; items: Inbox[] }> {
+  const map = new Map<string, Inbox[]>();
+  for (const item of items) {
+    const key = queueGroupKey(item);
+    const list = map.get(key) ?? [];
+    list.push(item);
+    map.set(key, list);
+  }
+  const tail = new Set(["未归属", "个人", "全局"]);
+  return [...map.entries()]
+    .sort((a, b) => Number(tail.has(a[0])) - Number(tail.has(b[0])) || a[0].localeCompare(b[0], "zh"))
+    .map(([key, grouped]) => ({ key, items: grouped }));
+}
 
 const NOTICE_KEY = "oneledger.noticeAck";
 
@@ -330,23 +350,42 @@ function memoriesToMarkdown(items: Memory[]): string {
     .join("\n---\n\n");
 }
 
+type MemoryKind = "global" | "project" | "personal";
+
+const KIND_TABS: Array<{ id: MemoryKind; label: string }> = [
+  { id: "global", label: "全局" },
+  { id: "project", label: "项目" },
+  { id: "personal", label: "个人" },
+];
+
+function kindItems(items: Memory[], kind: MemoryKind): Memory[] {
+  return items.filter((item) => item.scopeKind === kind);
+}
+
 function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
   const [items, setItems] = useState<Memory[]>([]);
+  const [kind, setKind] = useState<MemoryKind>("global");
+  const [scopeId, setScopeId] = useState("");
   const [draft, setDraft] = useState("");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
+  const grouped = useMemo(() => kindItems(items, kind), [items, kind]);
+  const selected = grouped.find((item) => (item.scopeId ?? "") === scopeId) ?? grouped[0];
   const refresh = () =>
     void api.memories().then((data) => {
       setItems(data.memories);
-      setDraft((current) => {
-        if (current.trim()) return current;
-        const doc = data.memories.find((item) => item.scopeKind === "global") ?? data.memories[0];
-        return doc?.body ?? "";
-      });
     });
   useEffect(() => {
     void refresh();
   }, [refreshKey]);
+  useEffect(() => {
+    if (!grouped.some((item) => (item.scopeId ?? "") === scopeId)) {
+      setScopeId(grouped[0]?.scopeId ?? "");
+    }
+  }, [kind, grouped, scopeId]);
+  useEffect(() => {
+    setDraft(selected?.body ?? "");
+  }, [selected?.id, selected?.updatedAt]);
   const exportFile = async (format: "json" | "md") => {
     setBusy(true);
     try {
@@ -365,9 +404,28 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
       setBusy(false);
     }
   };
+  const emptyHint =
+    kind === "project"
+      ? "还没有项目记忆。Agent 蒸馏时用 memory.remember，带上 scopeKind=project、仓库名 scopeId，以及分类标题 title。"
+      : kind === "personal"
+        ? "还没有个人记忆。保存会写入个人这一份；同一作用域再写会覆盖。"
+        : "还没有全局记忆。默认写在这一页；同一作用域再写会覆盖。";
   return (
     <div className="list">
-      <div className="row row-split">
+      <div className="row row-split memory-kind-bar">
+        <nav className="tabs" aria-label="记忆分类">
+          {KIND_TABS.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              className={kind === tab.id ? "active" : ""}
+              onClick={() => setKind(tab.id)}
+            >
+              {tab.label}
+              <span className="muted"> {kindItems(items, tab.id).length}</span>
+            </button>
+          ))}
+        </nav>
         <div className="row">
           <button disabled={busy} onClick={() => void exportFile("json")}>
             导出 JSON
@@ -376,15 +434,31 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
             导出 Markdown
           </button>
         </div>
-        <p className="muted">共 {items.length} 份</p>
       </div>
+      {grouped.length > 1 ? (
+        <nav className="tabs subtabs" aria-label="蒸馏标题">
+          {grouped.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className={(item.scopeId ?? "") === (selected?.scopeId ?? "") ? "active" : ""}
+              onClick={() => setScopeId(item.scopeId ?? "")}
+            >
+              {item.title}
+            </button>
+          ))}
+        </nav>
+      ) : null}
       <form
         className="form"
         onSubmit={async (event) => {
           event.preventDefault();
           if (!draft.trim()) return;
-          const result = await api.remember(draft.trim());
-          setDraft("");
+          const result = await api.remember(draft.trim(), {
+            title: selected?.title,
+            scopeKind: kind,
+            scopeId: selected?.scopeId ?? scopeId,
+          });
           setNote(
             result.redacted
               ? "已拦截敏感内容，原文没有进检索库。"
@@ -396,29 +470,22 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
         }}
       >
         <label>
-          记忆（同一作用域覆盖，不新增条目）
-          <textarea rows={10} value={draft} onChange={(event) => setDraft(event.target.value)} />
+          {selected ? selected.title : KIND_TABS.find((tab) => tab.id === kind)?.label}
+          <span className="muted"> · 同一分类覆盖，不新增条目。标题由 Agent 蒸馏时的 title 决定。</span>
+          <textarea rows={14} value={draft} onChange={(event) => setDraft(event.target.value)} />
         </label>
+        {selected ? (
+          <p className="muted">
+            {selected.scopeKind}
+            {selected.scopeId ? ` · ${selected.scopeId}` : ""} · rev {selected.rev} · {selected.source}
+          </p>
+        ) : null}
         <button className="primary" type="submit">
           保存
         </button>
         {note ? <p className="ok">{note}</p> : null}
       </form>
-      {items.length === 0 ? (
-        <p className="muted">
-          还没有记忆。Agent 读完队列里的原料后，用 memory.remember 交一整段文字；同一作用域再写会覆盖，不会一条条堆上去。
-        </p>
-      ) : null}
-      {items.map((item) => (
-        <article className="item memory-doc" key={item.id}>
-          <h3>{item.title}</h3>
-          <p>
-            {item.scopeKind}
-            {item.scopeId ? ` · ${item.scopeId}` : ""} · rev {item.rev} · {item.source}
-          </p>
-          <p className="memory-body">{item.body}</p>
-        </article>
-      ))}
+      {!selected ? <p className="muted">{emptyHint}</p> : null}
     </div>
   );
 }
@@ -434,10 +501,11 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
   useEffect(() => {
     void refresh();
   }, [refreshKey]);
+  const groups = groupInbox(inbox);
   return (
     <div className="list">
       <p className="muted">
-        这里只放待蒸馏的原文。Agent 读完后用 memory.remember 写入「记忆」。本程序不摘要。
+        这里只放待蒸馏的原文，按仓库名收拢。Agent 读完后用 memory.remember 写入「记忆」。本程序不摘要。
       </p>
       <div className="row">
         <button type="button" onClick={() => setAdding((open) => !open)}>
@@ -473,42 +541,51 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
       ) : null}
       {note ? <p className="ok">{note}</p> : null}
       {inbox.length === 0 && !adding ? <p className="muted">队列是空的。</p> : null}
-      {inbox.map((item) => {
-        const open = openId === item.id;
-        const preview = item.body.replace(/\s+/g, " ").trim();
-        return (
-          <article
-            className={`item queue-item${open ? " is-open" : ""}`}
-            key={item.id}
-            onClick={() => setOpenId(open ? "" : item.id)}
-          >
-            <h3>{item.title}</h3>
-            <p>
-              {item.source}
-              {item.sensitivity && item.sensitivity !== "public" ? ` · ${item.sensitivity}` : ""}
-            </p>
-            {open ? (
-              <>
-                <p>{item.body}</p>
-                <p className="muted">{item.createdAt}</p>
-                <div className="row" onClick={(event) => event.stopPropagation()}>
-                  <button
-                    onClick={async () => {
-                      await api.reject(item.id);
-                      setOpenId("");
-                      refresh();
-                    }}
-                  >
-                    丢弃
-                  </button>
-                </div>
-              </>
-            ) : (
-              <p className="preview">{preview.length > 72 ? `${preview.slice(0, 72)}…` : preview || "（无正文）"}</p>
-            )}
-          </article>
-        );
-      })}
+      {groups.map((group) => (
+        <details className="queue-group" key={group.key} open={groups.length <= 3}>
+          <summary>
+            {group.key}
+            <span className="muted"> · {group.items.length} 条</span>
+          </summary>
+          {group.items.map((item) => {
+            const open = openId === item.id;
+            const preview = item.body.replace(/\s+/g, " ").trim();
+            return (
+              <article
+                className={`item queue-item${open ? " is-open" : ""}`}
+                key={item.id}
+                onClick={() => setOpenId(open ? "" : item.id)}
+              >
+                <h3>{item.title}</h3>
+                <p>
+                  {item.source}
+                  {item.scopeId ? ` · ${item.scopeId}` : ""}
+                  {item.sensitivity && item.sensitivity !== "public" ? ` · ${item.sensitivity}` : ""}
+                </p>
+                {open ? (
+                  <>
+                    <p>{item.body}</p>
+                    <p className="muted">{item.createdAt}</p>
+                    <div className="row" onClick={(event) => event.stopPropagation()}>
+                      <button
+                        onClick={async () => {
+                          await api.reject(item.id);
+                          setOpenId("");
+                          refresh();
+                        }}
+                      >
+                        丢弃
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="preview">{preview.length > 72 ? `${preview.slice(0, 72)}…` : preview || "（无正文）"}</p>
+                )}
+              </article>
+            );
+          })}
+        </details>
+      ))}
     </div>
   );
 }

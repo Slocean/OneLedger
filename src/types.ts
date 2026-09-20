@@ -1,4 +1,4 @@
-export const APP_VERSION = "0.4.2";
+export const APP_VERSION = "0.4.3";
 export const CONFIG_SCHEMA_VERSION = 1;
 export const DATA_SCHEMA_VERSION = 3;
 export const PROTOCOL_VERSION = 1;
@@ -10,6 +10,11 @@ export type Sensitivity = "public" | "internal" | "pii" | "secret";
 export type MemoryStatus = "inbox" | "proposed" | "active" | "forgotten";
 export type QueueStatus = "proposed" | "rejected";
 export type MemoryScopeKind = "global" | "project" | "personal";
+
+export interface ScopeFilter {
+  scopeKind?: MemoryScopeKind;
+  scopeId?: string;
+}
 export type AgentKind = "cursor" | "claude" | "codex" | "continue" | "zcode" | "workbuddy" | "qoder" | "project" | "custom";
 
 export interface AgentRecord {

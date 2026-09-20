@@ -197,9 +197,17 @@ impl MemoryService {
         removed
     }
 
-    pub fn search(conn: &Connection, config: &Config, query: &str, actor: &str, limit: i64) -> Vec<MemoryRecord> {
+    pub fn search(
+        conn: &Connection,
+        config: &Config,
+        query: &str,
+        actor: &str,
+        limit: i64,
+        scope_kind: Option<&str>,
+        scope_id: Option<&str>,
+    ) -> Vec<MemoryRecord> {
         let _ = Self::retire_non_distilled(conn);
-        let raw = store::search_memories(conn, query, limit).unwrap_or_default();
+        let raw = store::search_memories(conn, query, limit, scope_kind, scope_id).unwrap_or_default();
         let allow_internal = config.security.allow_internal_in_search;
         let filtered = raw
             .into_iter()
@@ -228,9 +236,53 @@ impl MemoryService {
         true
     }
 
-    pub fn list(conn: &Connection, limit: i64) -> Vec<MemoryRecord> {
+    pub fn get(
+        conn: &Connection,
+        config: &Config,
+        actor: &str,
+        id: Option<&str>,
+        scope_kind: Option<&str>,
+        scope_id: Option<&str>,
+    ) -> Vec<MemoryRecord> {
         let _ = Self::retire_non_distilled(conn);
-        store::list_memories(conn, limit)
+        let id = id.filter(|item| !item.is_empty());
+        let scope_kind = scope_kind.filter(|item| !item.is_empty());
+        let scope_id = scope_id.filter(|item| !item.is_empty());
+        if id.is_none() && scope_kind.is_none() && scope_id.is_none() {
+            return vec![];
+        }
+        let raw = if let Some(id) = id {
+            store::get_memory(conn, id).ok().flatten().into_iter().collect()
+        } else {
+            store::list_memories(conn, 50, scope_kind, scope_id).unwrap_or_default()
+        };
+        let allow_internal = config.security.allow_internal_in_search;
+        let filtered: Vec<MemoryRecord> = raw
+            .into_iter()
+            .filter(|item| item.status != "forgotten")
+            .filter(|item| match item.sensitivity.as_str() {
+                "secret" | "pii" => false,
+                "internal" => allow_internal,
+                "public" => true,
+                _ => false,
+            })
+            .map(Self::for_agent)
+            .collect();
+        let detail = id
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}:{}", scope_kind.unwrap_or(""), scope_id.unwrap_or("")));
+        let _ = store::audit(conn, actor, "memory.get", &detail.chars().take(80).collect::<String>());
+        filtered
+    }
+
+    pub fn list(
+        conn: &Connection,
+        limit: i64,
+        scope_kind: Option<&str>,
+        scope_id: Option<&str>,
+    ) -> Vec<MemoryRecord> {
+        let _ = Self::retire_non_distilled(conn);
+        store::list_memories(conn, limit, scope_kind, scope_id)
             .unwrap_or_default()
             .into_iter()
             .map(Self::for_agent)
@@ -290,7 +342,7 @@ impl MemoryService {
             token_hash: hash_token(&token),
             token_prefix: token.chars().take(8).collect(),
             scopes: "global,project,personal".into(),
-            tools: "memory.search,memory.remember,memory.forget,memory.list".into(),
+            tools: "memory.search,memory.remember,memory.forget,memory.list,memory.get".into(),
             created_at: now_iso(),
             last_used_at: None,
         };
