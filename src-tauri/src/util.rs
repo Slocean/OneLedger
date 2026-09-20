@@ -1,7 +1,7 @@
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-pub const APP_VERSION: &str = "0.3.0";
+pub const APP_VERSION: &str = "0.4.0";
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DATA_SCHEMA_VERSION: i64 = 3;
 pub const PROTOCOL_VERSION: i32 = 1;

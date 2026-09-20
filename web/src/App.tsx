@@ -39,8 +39,8 @@ function UpdateBox({ info, onRefresh }: { info: UpdateInfo | null; onRefresh: ()
     }
   };
   return (
-    <div className="panel">
-      <h3>关于与更新</h3>
+    <details className="advanced">
+      <summary>关于与更新</summary>
       <p className="muted">
         当前 {info?.current ?? "…"}
         {info?.latest ? ` · 通道 ${info.latest}` : ""} · {flavorLabel(info?.flavor)}
@@ -88,7 +88,7 @@ function UpdateBox({ info, onRefresh }: { info: UpdateInfo | null; onRefresh: ()
             </article>
           ))
         : null}
-    </div>
+    </details>
   );
 }
 
@@ -554,13 +554,59 @@ function SyncPanel() {
   );
 }
 
+function mcpEndpoint(bind: unknown, port: unknown) {
+  const host = String(bind ?? "127.0.0.1") === "0.0.0.0" ? "127.0.0.1" : String(bind ?? "127.0.0.1");
+  return `http://${host}:${Number(port ?? 7443)}/mcp`;
+}
+
+function mcpClientSnippet(url: string, token: string) {
+  return `{
+  "mcpServers": {
+    "oneledger": {
+      "url": "${url}",
+      "headers": {
+        "Authorization": "Bearer ${token}"
+      }
+    }
+  }
+}`;
+}
+
 function KeysPanel() {
   const [keys, setKeys] = useState<KeyRow[]>([]);
   const [issued, setIssued] = useState("");
+  const [mcpUrl, setMcpUrl] = useState("http://127.0.0.1:7443/mcp");
   const refresh = () => void api.keys().then((data) => setKeys(data.keys));
   useEffect(() => void refresh(), []);
+  useEffect(() => {
+    void api.config().then((config) => setMcpUrl(mcpEndpoint(config.bind, config.port)));
+  }, []);
   return (
     <div className="list">
+      <div className="panel list">
+        <h3>MCP 使用说明</h3>
+        <p className="muted">
+          管理台登录用 adminToken，Agent 连账本用这里签发的密钥，两套不能混用。OneLedger 需要先在本机跑着（桌面版或
+          oneledger serve），Agent 才能连上。
+        </p>
+        <p>
+          1. 点下方「签发一把 Agent 密钥」，完整 token 只出现一次，请立刻复制。之后列表里只剩前缀。
+        </p>
+        <p>
+          2. 把配置写进 Agent 的 MCP 设置。Cursor 用用户级 ~/.cursor/mcp.json 或项目 .cursor/mcp.json；Claude Code
+          等同样认 mcpServers。改完后重启该 Agent。
+        </p>
+        <pre>{mcpClientSnippet(mcpUrl, "ol_你刚签发的密钥")}</pre>
+        <p>
+          3. 连上后可用这些工具：memory.search 按问题检索正文；memory.list 只列标题；memory.remember
+          写入一整段蒸馏后的记忆（同一作用域覆盖，不要一条条堆）；memory.forget 按 id 删掉。secret
+          级内容不会被检索，也不会同步到远端。
+        </p>
+        <p className="muted">
+          地址来自当前监听配置。若改过端口，以「服务器与存储」里保存的为准。本说明是 HTTP MCP；源码目录下也可用
+          oneledger mcp 走 stdio，但桌面版日常用上面这段。
+        </p>
+      </div>
       <button
         className="primary"
         onClick={async () => {
@@ -574,14 +620,7 @@ function KeysPanel() {
       {issued ? (
         <div className="banner">
           只显示一次：{issued}
-          <pre>{`{
-  "mcpServers": {
-    "oneledger": {
-      "url": "http://127.0.0.1:7443/mcp",
-      "headers": { "Authorization": "Bearer ${issued}" }
-    }
-  }
-}`}</pre>
+          <pre>{mcpClientSnippet(mcpUrl, issued)}</pre>
         </div>
       ) : null}
       {keys.map((key) => (
@@ -699,7 +738,6 @@ function SettingsPanel({
         setSaved("已写入本机配置。改了监听地址或存储驱动时，请重启 oneledger serve。");
       }}
     >
-      <UpdateBox info={updateInfo} onRefresh={onRefreshUpdates} />
       <label>
         监听地址
         <input value={form.bind} onChange={(event) => setForm({ ...form, bind: event.target.value })} />
@@ -829,6 +867,7 @@ function SettingsPanel({
           <input value={form.updateUrl} onChange={(event) => setForm({ ...form, updateUrl: event.target.value })} />
         </label>
       </details>
+      <UpdateBox info={updateInfo} onRefresh={onRefreshUpdates} />
       <button className="primary" type="submit">
         保存
       </button>

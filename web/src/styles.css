@@ -12,6 +12,30 @@
 
 * {
   box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule) var(--field);
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--field);
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--rule);
+  border: 1px solid var(--paper);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--gold);
+}
+
+*::-webkit-scrollbar-corner {
+  background: var(--field);
 }
 
 html,
