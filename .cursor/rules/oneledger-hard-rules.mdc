@@ -12,3 +12,4 @@ alwaysApply: true
 - **禁止**把用户当 Agent：测 MCP 时自己连、自己调用。禁止甩 MCP JSON / Token 让用户去配。
 - **禁止**推倒重写记忆账本。用现有 `scopeKind` + `scopeId`；`scopeId` 必须是仓库名。
 - Agent 不得读 inbox / secret。管理台密钥与 Agent 密钥不得混用。
+- 动手前、改完、启动前、提交前、发版前必须全量检查：所有相关功能、所有已知错误。至少 `npm run check`；改了 Rust 还要 `cargo test --offline --lib`。失败不准推、不准打 tag、不准说修好了。Linux `check` 和 Windows `CI` 红了必须修。

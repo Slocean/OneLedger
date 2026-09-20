@@ -25,6 +25,13 @@
 - 禁止用「你去打开这个地址」「把这段配进 Cursor」代替你自己操作。
 - 禁止甩一长串自测 PASS 报告当交付；做完用产品窗口验证。
 
+## 每次必须全量检查（违反即错）
+
+- 动手前、改完、启动前、提交前、发版前，**必须全量检查**：所有相关功能，所有已知错误，不准只改嘴上说的那一点。
+- 至少跑：`npm run check`（validate + tsc + vitest）。Rust 改了还要 `cargo test --offline --lib`。失败必须先修，**不准推、不准打 tag、不准说修好了**。
+- Linux 的 `check` 和 Windows 的 `CI` 都要过。红的检查不准当没看见。
+- 禁止只改一处就发版。项目里已经红的测试、打包失败、弹窗、闪屏，本次必须处理。
+
 ## 账本与采集
 
 - **禁止推倒重写。** 已有 `scopeKind`（global / project / personal）+ `scopeId` 覆盖语义，不要新开一套账本。
@@ -40,3 +47,4 @@
 | `npm run pack` / 已打包 exe → Tauri 窗口 | Electron、浏览器当壳 |
 | Vite 只做一次性 `build`，立刻结束 | `vite` 开发服务器、`tsx serve`、挂着不关 |
 | Agent 自己调 MCP | 让用户去连 MCP、去开 vite/tsx |
+| 改完全量 `npm run check`，红了先修 | 只改一点就推、不看失败检查 |

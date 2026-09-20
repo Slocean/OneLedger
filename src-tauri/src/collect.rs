@@ -359,9 +359,15 @@ fn workspace_folder_name(path: &Path) -> Option<String> {
     None
 }
 
-fn find_git_root(start: &Path) -> Option<PathBuf> {
+fn find_git_root(start: &Path, stop_at: &Path) -> Option<PathBuf> {
+    if !start.exists() {
+        return None;
+    }
     let mut dir = start.to_path_buf();
     for _ in 0..32 {
+        if !dir.starts_with(stop_at) && dir != stop_at {
+            break;
+        }
         if dir.join(".git").exists() {
             return Some(dir);
         }
@@ -373,7 +379,7 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 }
 
 fn resolve_project_scope_id(file: &Path, collect_root: &Path) -> String {
-    if let Some(git) = find_git_root(file.parent().unwrap_or(file)) {
+    if let Some(git) = find_git_root(file.parent().unwrap_or(file), collect_root) {
         if let Some(name) = git.file_name().and_then(|n| n.to_str()) {
             return name.to_string();
         }

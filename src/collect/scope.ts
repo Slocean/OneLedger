@@ -70,7 +70,8 @@ export function isToolMemoryFile(filePath: string): boolean {
 
 export function resolveProjectScopeId(filePath: string, collectRoot: string): string {
   const abs = resolve(filePath);
-  const gitRoot = findGitRoot(dirname(abs));
+  const root = resolve(collectRoot);
+  const gitRoot = findGitRoot(dirname(abs), root);
   if (gitRoot) return basename(gitRoot);
 
   const fromWorkspaceFile = workspaceFolderName(abs);
@@ -85,7 +86,6 @@ export function resolveProjectScopeId(filePath: string, collectRoot: string): st
   const fromKnownParent = knownProjectsChild(abs);
   if (fromKnownParent) return fromKnownParent;
 
-  const root = resolve(collectRoot);
   const rel = relative(root, abs);
   if (rel && !rel.startsWith("..") && rel !== abs) {
     const first = rel.split(/[\\/]/).find((part) => part && !part.startsWith(".") && !looksLikeFile(part) && !isSkipDirName(part));
@@ -94,21 +94,31 @@ export function resolveProjectScopeId(filePath: string, collectRoot: string): st
   return basename(root);
 }
 
-export function findGitRoot(startDir: string): string | undefined {
+export function findGitRoot(startDir: string, stopAt = ""): string | undefined {
   const start = resolve(startDir);
-  const cached = gitRootCache.get(start);
-  if (cached !== undefined || gitRootCache.has(start)) return cached;
+  const cacheKey = `${start}|${stopAt}`;
+  const cached = gitRootCache.get(cacheKey);
+  if (cached !== undefined || gitRootCache.has(cacheKey)) return cached;
+  if (!existsSync(start)) {
+    gitRootCache.set(cacheKey, undefined);
+    return undefined;
+  }
+  const limit = stopAt ? resolve(stopAt) : "";
   let dir = start;
   for (let i = 0; i < 32; i++) {
+    if (limit) {
+      const rel = relative(limit, dir);
+      if (rel.startsWith("..") && rel !== "") break;
+    }
     if (existsSync(join(dir, ".git"))) {
-      gitRootCache.set(start, dir);
+      gitRootCache.set(cacheKey, dir);
       return dir;
     }
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
-  gitRootCache.set(start, undefined);
+  gitRootCache.set(cacheKey, undefined);
   return undefined;
 }
 
