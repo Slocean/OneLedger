@@ -20,9 +20,10 @@ const EMBEDDED_CHANNEL: &str = include_str!("../../app_update.json");
 const RELEASES_PAGE: &str = "https://github.com/Slocean/OneLedger/releases";
 const PORTABLE_ASSET: &str = "OneLedger-Portable.exe";
 const SETUP_ASSET: &str = "OneLedger-Setup.exe";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-const CHANNEL_BUDGET: Duration = Duration::from_secs(5);
+const CHANNEL_BUDGET: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Flavor {
@@ -84,12 +85,51 @@ fn github_token() -> Option<String> {
         .filter(|item| !item.is_empty())
 }
 
+fn attach_tls(builder: ureq::AgentBuilder) -> ureq::AgentBuilder {
+    #[cfg(windows)]
+    {
+        if let Ok(tls) = ureq::native_tls::TlsConnector::new() {
+            return builder.tls_connector(std::sync::Arc::new(tls));
+        }
+    }
+    builder
+}
+
 fn http_agent(use_proxy: bool, timeout: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(timeout)
-        .timeout_connect(Duration::from_secs(3))
-        .try_proxy_from_env(use_proxy)
-        .build()
+    attach_tls(
+        ureq::AgentBuilder::new()
+            .timeout(timeout)
+            .timeout_connect(CONNECT_TIMEOUT)
+            .try_proxy_from_env(use_proxy),
+    )
+    .build()
+}
+
+fn has_env_proxy() -> bool {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|key| std::env::var(key).ok().is_some_and(|item| !item.trim().is_empty()))
+}
+
+fn join_errors(errors: &[String], fallback: &str) -> String {
+    let mut seen = Vec::new();
+    for err in errors {
+        if !err.is_empty() && !seen.iter().any(|item| item == err) {
+            seen.push(err.clone());
+        }
+    }
+    if seen.is_empty() {
+        fallback.to_string()
+    } else {
+        seen.join("；")
+    }
 }
 
 fn cache_bust(url: &str) -> String {
@@ -295,6 +335,7 @@ fn fetch_wave(urls: &[String], use_proxy: bool, floor: &str, custom: &str) -> Re
     let deadline = Instant::now() + CHANNEL_BUDGET;
     let mut best: Option<ChannelHit> = None;
     let mut last_err = "检查更新失败".to_string();
+    let mut errors = Vec::new();
     loop {
         let remain = deadline.saturating_duration_since(Instant::now());
         if remain.is_zero() {
@@ -304,6 +345,7 @@ fn fetch_wave(urls: &[String], use_proxy: bool, floor: &str, custom: &str) -> Re
             Ok(Ok(hit)) => {
                 if !usable(&hit, floor) {
                     last_err = format!("{} 通道过期（{}）", hit.source, latest_of(&hit.history));
+                    errors.push(last_err.clone());
                     continue;
                 }
                 let canonical = is_canonical_source(&hit.source, custom);
@@ -314,26 +356,46 @@ fn fetch_wave(urls: &[String], use_proxy: bool, floor: &str, custom: &str) -> Re
                     break;
                 }
             }
-            Ok(Err(err)) => last_err = err,
+            Ok(Err(err)) => {
+                last_err = err.clone();
+                errors.push(err);
+            }
             Err(_) => break,
         }
     }
-    best.ok_or(last_err)
+    best.ok_or_else(|| join_errors(&errors, &last_err))
+}
+
+fn conclude_channel(
+    embedded: Vec<Value>,
+    direct_err: &str,
+    proxy_err: Option<&str>,
+) -> Result<(Vec<Value>, String), String> {
+    if direct_err.to_ascii_lowercase().contains("404") {
+        return Err(explain_channel_error(direct_err));
+    }
+    let err = match proxy_err {
+        Some(proxy) => format!("{direct_err}；环境变量代理重试：{proxy}"),
+        None => direct_err.to_string(),
+    };
+    if !embedded.is_empty() && err.contains("通道过期") {
+        return Ok((embedded, "embedded".into()));
+    }
+    Err(explain_channel_error(&err))
 }
 
 fn fetch_channel(update_url: &str) -> Result<(Vec<Value>, String), String> {
-    let floor = latest_of(&embedded_channel());
+    let embedded = embedded_channel();
+    let floor = latest_of(&embedded);
     let urls = channel_urls(update_url);
     let custom = update_url.trim();
     match fetch_wave(&urls, false, &floor, custom) {
         Ok(hit) => Ok((hit.history, hit.source)),
-        Err(err) if err.to_ascii_lowercase().contains("404") => Err(explain_channel_error(&err)),
-        Err(direct_err) => match fetch_wave(&urls, true, &floor, custom) {
+        Err(direct_err) if has_env_proxy() => match fetch_wave(&urls, true, &floor, custom) {
             Ok(hit) => Ok((hit.history, hit.source)),
-            Err(proxy_err) => Err(explain_channel_error(&format!(
-                "{direct_err}；系统代理重试：{proxy_err}"
-            ))),
+            Err(proxy_err) => conclude_channel(embedded, &direct_err, Some(&proxy_err)),
         },
+        Err(direct_err) => conclude_channel(embedded, &direct_err, None),
     }
 }
 
@@ -745,5 +807,50 @@ mod tests {
         };
         assert!(usable(&current, "0.4.2"));
         assert!(better(&current, &stale, ""));
+    }
+
+    #[test]
+    fn join_errors_dedups_and_falls_back() {
+        assert_eq!(join_errors(&[], "检查更新失败"), "检查更新失败");
+        assert_eq!(
+            join_errors(&["a".into(), "a".into(), "b".into()], "x"),
+            "a；b"
+        );
+    }
+
+    #[test]
+    fn stale_remote_falls_back_to_embedded() {
+        let embedded = vec![json!({"version": "0.4.6", "title": "x", "body": "y", "notice": ""})];
+        let (history, source) = conclude_channel(
+            embedded,
+            "https://raw.githubusercontent.com/Slocean/OneLedger/main/app_update.json 通道过期（0.4.5）",
+            None,
+        )
+        .unwrap();
+        assert_eq!(source, "embedded");
+        assert_eq!(latest_of(&history), "0.4.6");
+    }
+
+    #[test]
+    fn tls_error_does_not_use_embedded() {
+        let embedded = vec![json!({"version": "0.4.6", "title": "x", "body": "y", "notice": ""})];
+        let err = conclude_channel(embedded, "tls connection init failed: unexpected end of file", None)
+            .unwrap_err();
+        assert!(err.contains("tls connection init failed"));
+    }
+
+    #[test]
+    fn private_repo_404_does_not_use_embedded() {
+        let embedded = vec![json!({"version": "0.4.6", "title": "x", "body": "y", "notice": ""})];
+        let err = conclude_channel(embedded, "HTTP 404", None).unwrap_err();
+        assert!(err.contains("404"));
+        assert!(err.contains("私有"));
+    }
+
+    #[test]
+    #[ignore]
+    fn github_raw_tls_can_fetch() {
+        let hit = fetch_one(DEFAULT_CHANNEL, false).expect("github raw channel");
+        assert!(!latest_of(&hit.history).is_empty());
     }
 }
