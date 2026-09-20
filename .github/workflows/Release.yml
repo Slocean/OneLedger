@@ -86,6 +86,9 @@ jobs:
           node-version: "22"
           cache: npm
 
+      - name: Validate release channel
+        run: node scripts/validate-release.mjs
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -129,9 +132,7 @@ jobs:
           Get-ChildItem release -File | Select-Object Name, Length
 
       - name: Release notes from app_update.json
-        shell: bash
-        run: |
-          node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('app_update.json','utf8')); const h=(j.history&&j.history[0])||{}; fs.writeFileSync('release-notes.md', [h.title||'', '', h.body||''].join('\n'));"
+        run: node scripts/validate-release.mjs --notes
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

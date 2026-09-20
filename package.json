@@ -18,10 +18,10 @@
     "desktop": "npm run build && electron desktop/main.mjs",
     "desktop:pack": "npm run build && node scripts/prepare-runtime.mjs && node scripts/pack-desktop.mjs",
     "tauri:build": "vite build --config web/vite.config.ts && node scripts/sync-web-embed.mjs && tauri build --bundles nsis",
-    "check": "tsc --noEmit -p tsconfig.json && vitest run",
+    "check": "node scripts/validate-release.mjs && tsc --noEmit -p tsconfig.json && vitest run",
     "test": "vitest run",
-    "pack": "npm run tauri:build && node scripts/stage-tauri-release.mjs",
-    "release": "node scripts/trigger-release.mjs"
+    "pack": "node scripts/validate-release.mjs && npm run tauri:build && node scripts/stage-tauri-release.mjs",
+    "release": "node scripts/validate-release.mjs && node scripts/trigger-release.mjs"
   },
   "build": {
     "appId": "ai.oneledger.app",

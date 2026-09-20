@@ -118,6 +118,7 @@ function main() {
   if (version !== channelVersion) {
     throw new Error(`参数版本 v${version} 与 package.json 当前版本 v${channelVersion} 不一致；请先改版本号`);
   }
+  run("node", ["scripts/validate-release.mjs"]);
 
   let existing;
   try {
