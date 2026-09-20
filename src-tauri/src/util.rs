@@ -1,7 +1,18 @@
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use std::process::Command;
 
-pub const APP_VERSION: &str = "0.4.4";
+pub fn silent_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
+pub const APP_VERSION: &str = "0.4.5";
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DATA_SCHEMA_VERSION: i64 = 3;
 pub const PROTOCOL_VERSION: i32 = 1;

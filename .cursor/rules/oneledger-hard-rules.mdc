@@ -8,6 +8,7 @@ alwaysApply: true
 - **禁止 Electron。** 不得安装、启动、打包、引入 electron / electron-builder。桌面壳只能是 Tauri。发版用 `npm run pack`。
 - **禁止**把浏览器网页当管理台交付。不要让用户去打开 `http://127.0.0.1:7443/`。必须起 Tauri 窗口。
 - **禁止** Vite / tsx 当壳：不得起 `vite` 开发服务器、`tsx src/index.ts serve`、`npm run dev:server`；不得让用户去开 vite/tsx 文件；OneLedger 的 Vite/tsx 进程用完必须杀，不准挂在用户机器上。Vite 只许一次性 `vite build`。
+- **禁止**采集时启动 `git.exe` 或弹命令窗口。认仓库名只看目录里的 `.git`。
 - **禁止**把用户当 Agent：测 MCP 时自己连、自己调用。禁止甩 MCP JSON / Token 让用户去配。
 - **禁止**推倒重写记忆账本。用现有 `scopeKind` + `scopeId`；`scopeId` 必须是仓库名。
 - Agent 不得读 inbox / secret。管理台密钥与 Agent 密钥不得混用。

@@ -4,7 +4,6 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -668,7 +667,7 @@ try {{
     if fs::write(&ps, script).is_err() {
         return json!({"ok": false, "error": "无法写出更新助手脚本"});
     }
-    let _ = Command::new("powershell")
+    let _ = crate::util::silent_command("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &ps.display().to_string()])
         .spawn();
     std::thread::spawn(|| {

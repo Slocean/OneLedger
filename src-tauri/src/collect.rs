@@ -369,19 +369,7 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
             break;
         }
     }
-    let output = std::process::Command::new("git")
-        .args(["-C", &start.to_string_lossy(), "rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(text))
-    }
+    None
 }
 
 fn resolve_project_scope_id(file: &Path, collect_root: &Path) -> String {

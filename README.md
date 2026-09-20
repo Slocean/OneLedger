@@ -1,6 +1,6 @@
 # OneLedger
 
-自托管的 Agent 记忆总账：本机收集、安全扫描、蒸馏队列、MCP 供给其他 Code Agent 调用，并可与远端节点同步。版本 `0.4.4`。桌面壳 **只使用 Tauri**，禁止 Electron。
+自托管的 Agent 记忆总账：本机收集、安全扫描、蒸馏队列、MCP 供给其他 Code Agent 调用，并可与远端节点同步。版本 `0.4.5`。桌面壳 **只使用 Tauri**，禁止 Electron。
 
 服务器地址和存储后端不写死，在管理界面里配置。默认本机 SQLite；中心节点可改接 Postgres。
 

@@ -1,3 +1,4 @@
+use crate::util::silent_command;
 use serde_json::Value;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -98,7 +99,7 @@ fn local_has_port(local: &str, port: u16) -> bool {
 }
 
 fn listening_pids(port: u16) -> Vec<u32> {
-    let output = Command::new("netstat")
+    let output = silent_command("netstat")
         .args(["-ano", "-p", "tcp"])
         .output()
         .ok()
@@ -112,7 +113,7 @@ fn process_looks_like_oneledger(pid: u32) -> bool {
 }
 
 fn process_blob(pid: u32) -> String {
-    let output = Command::new("powershell")
+    let output = silent_command("powershell")
         .args([
             "-NoProfile",
             "-Command",
@@ -128,7 +129,7 @@ fn process_blob(pid: u32) -> String {
 }
 
 fn kill_process(pid: u32) {
-    let _ = Command::new("taskkill")
+    let _ = silent_command("taskkill")
         .args(["/PID", &pid.to_string(), "/F", "/T"])
         .output();
 }

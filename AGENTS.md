@@ -17,6 +17,7 @@
 - **禁止**让用户去打开 vite / tsx 文件、配置或进程。用户机器上不准挂着 OneLedger 的 Vite / tsx。
 - `npm run dev` 里的 Vite **只许一次性 `vite build`**，打完前端必须结束。禁止起 Vite 开发服务器，禁止验证完不关。
 - 本机验证优先用打好的 `OneLedger.exe` / Portable / Setup。自己起的调试进程，用完必须杀掉。
+- **禁止**为了采集 / 认仓库名在用户机器上启动 `git.exe` 或弹出命令窗口。只认目录里的 `.git`。
 
 ## 自己干完，禁止把用户当 Agent
 

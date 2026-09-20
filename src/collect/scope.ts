@@ -1,6 +1,5 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import { spawnSync } from "node:child_process";
 
 export const SKIP_DIR_NAMES = new Set([
   "node_modules",
@@ -109,23 +108,7 @@ export function findGitRoot(startDir: string): string | undefined {
     if (parent === dir) break;
     dir = parent;
   }
-  const fromGit = gitShowToplevel(start);
-  gitRootCache.set(start, fromGit);
-  return fromGit;
-}
-
-function gitShowToplevel(dir: string): string | undefined {
-  try {
-    const result = spawnSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], {
-      encoding: "utf8",
-      timeout: 2000,
-      windowsHide: true,
-    });
-    const out = result.stdout?.trim();
-    if (result.status === 0 && out) return resolve(out);
-  } catch {
-    return undefined;
-  }
+  gitRootCache.set(start, undefined);
   return undefined;
 }
 
