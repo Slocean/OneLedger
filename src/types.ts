@@ -1,4 +1,4 @@
-export const APP_VERSION = "0.4.6";
+export const APP_VERSION = "0.4.7";
 export const CONFIG_SCHEMA_VERSION = 1;
 export const DATA_SCHEMA_VERSION = 3;
 export const PROTOCOL_VERSION = 1;

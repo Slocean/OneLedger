@@ -48,6 +48,17 @@ function main() {
     throw new Error("app_update.json history[0] 需要非空 title 和 body");
   }
 
+  const svg = readFileSync(join(ROOT, "brand", "oneledger.svg"), "utf8");
+  if (!svg.includes("<svg") || !svg.includes("#c4a35a") || !svg.includes("#14110d")) {
+    throw new Error("brand/oneledger.svg 必须是账本配色的 SVG 源");
+  }
+  for (const name of ["nsis-header.svg", "nsis-sidebar.svg"]) {
+    const sheet = readFileSync(join(ROOT, "brand", name), "utf8");
+    if (!sheet.includes("<svg") || !sheet.includes("#c4a35a")) {
+      throw new Error(`brand/${name} 必须从同一套 SVG 账本图标画出`);
+    }
+  }
+
   if (process.argv.includes("--notes")) {
     writeFileSync(join(ROOT, "release-notes.md"), [title, "", body].join("\n"));
   }

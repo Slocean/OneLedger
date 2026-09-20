@@ -230,9 +230,12 @@ export function App() {
         <div className="app">
           <div className="chrome">
             <header className="masthead">
-              <div>
-                <h1>ONELEDGER</h1>
-                <p>共享记忆总账 · MCP · 本地与远端</p>
+              <div className="brand">
+                <img className="brand-mark" src="/favicon.svg" alt="" />
+                <div>
+                  <h1>ONELEDGER</h1>
+                  <p>共享记忆总账 · MCP · 本地与远端</p>
+                </div>
               </div>
             </header>
           </div>
@@ -244,6 +247,7 @@ export function App() {
     }
     return (
       <div className="gate">
+        <img className="brand-mark gate-mark" src="/favicon.svg" alt="" />
         <h1>OneLedger</h1>
         <p className="muted">输入本机 config.json 里的 adminToken，管理台与 Agent MCP 密钥是分开的。</p>
         <input
@@ -276,9 +280,12 @@ export function App() {
     <div className="app">
       <div className="chrome">
         <header className="masthead">
-          <div>
-            <h1>ONELEDGER</h1>
-            <p>共享记忆总账 · MCP · 本地与远端</p>
+          <div className="brand">
+            <img className="brand-mark" src="/favicon.svg" alt="" />
+            <div>
+              <h1>ONELEDGER</h1>
+              <p>共享记忆总账 · MCP · 本地与远端</p>
+            </div>
           </div>
           <button
             type="button"

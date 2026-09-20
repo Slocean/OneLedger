@@ -210,11 +210,30 @@ pre {
 .masthead {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   gap: 16px;
   border-bottom: 2px solid var(--gold);
   padding-bottom: 12px;
   margin-bottom: 20px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand-mark {
+  width: 36px;
+  height: 36px;
+  flex: none;
+  display: block;
+}
+
+.gate-mark {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 12px;
 }
 
 .masthead h1 {

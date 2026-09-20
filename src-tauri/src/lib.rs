@@ -136,6 +136,9 @@ pub fn run() {
             let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse().unwrap()))
                 .title("OneLedger")
                 .inner_size(1180.0, 820.0);
+            if let Some(icon) = app.default_window_icon() {
+                builder = builder.icon(icon.clone())?;
+            }
             if !config.admin_token.is_empty() {
                 builder = builder.initialization_script(admin_token_script(&config.admin_token));
             }

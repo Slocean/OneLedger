@@ -108,11 +108,7 @@ jobs:
         run: npm ci
 
       - name: Ensure app icon
-        shell: pwsh
-        run: |
-          powershell -File scripts/make-icon.ps1
-          New-Item -ItemType Directory -Force -Path src-tauri\icons | Out-Null
-          Copy-Item -LiteralPath desktop\icons\icon.ico -Destination src-tauri\icons\icon.ico -Force
+        run: node scripts/sync-icons.mjs
 
       - name: Pack Tauri installer
         run: npm run pack

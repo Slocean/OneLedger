@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 164 314" role="img" aria-label="OneLedger">
+  <rect width="164" height="314" fill="#14110d"/>
+  <rect x="0" y="0" width="6" height="314" fill="#c4a35a"/>
+  <rect x="158" y="0" width="6" height="314" fill="#3d3428"/>
+  <svg x="30" y="36" width="104" height="104" viewBox="0 0 64 64">
+    <rect width="64" height="64" rx="14" fill="#14110d"/>
+    <rect x="5" y="5" width="54" height="54" rx="11" fill="#1c1814" stroke="#c4a35a" stroke-width="2.2"/>
+    <rect x="9.5" y="9.5" width="45" height="45" rx="8" fill="none" stroke="#3d3428" stroke-width="1"/>
+    <rect x="21.5" y="11" width="4" height="42" rx="1.2" fill="#c4a35a"/>
+    <g stroke="#3d3428" stroke-width="1.25" stroke-linecap="round">
+      <path d="M12.5 22h7"/>
+      <path d="M12.5 28.5h7"/>
+      <path d="M12.5 35h7"/>
+      <path d="M12.5 41.5h7"/>
+    </g>
+    <g stroke-linecap="round">
+      <path d="M29 20h22" stroke="#e8dcc8" stroke-width="1.8"/>
+      <path d="M29 27h19.5" stroke="#c4a35a" stroke-width="1.55"/>
+      <path d="M29 34h17.5" stroke="#9a8b74" stroke-width="1.5"/>
+      <path d="M29 41h14.5" stroke="#9a8b74" stroke-width="1.5"/>
+      <path d="M29 48h10" stroke="#3d3428" stroke-width="1.4"/>
+    </g>
+    <path d="M46 9.2v11.2l3.3-2.3 3.3 2.3V9.2Z" fill="#c4a35a"/>
+  </svg>
+  <g stroke="#3d3428" stroke-width="1.4" stroke-linecap="round">
+    <path d="M28 168h108"/>
+    <path d="M28 184h96"/>
+    <path d="M28 200h88"/>
+    <path d="M28 216h100"/>
+    <path d="M28 232h76"/>
+    <path d="M28 248h90"/>
+    <path d="M28 264h70"/>
+  </g>
+  <path d="M28 292h48" stroke="#c4a35a" stroke-width="2" stroke-linecap="round"/>
+</svg>

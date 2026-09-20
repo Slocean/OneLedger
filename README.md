@@ -1,6 +1,6 @@
 # OneLedger
 
-自托管的 Agent 记忆总账：本机收集、安全扫描、蒸馏队列、MCP 供给其他 Code Agent 调用，并可与远端节点同步。版本 `0.4.6`。桌面壳 **只使用 Tauri**，禁止 Electron。
+自托管的 Agent 记忆总账：本机收集、安全扫描、蒸馏队列、MCP 供给其他 Code Agent 调用，并可与远端节点同步。版本 `0.4.7`。桌面壳 **只使用 Tauri**，禁止 Electron。
 
 服务器地址和存储后端不写死，在管理界面里配置。默认本机 SQLite；中心节点可改接 Postgres。
 
@@ -58,6 +58,7 @@ HTTP：管理台签发 Agent 密钥后，`url` 为 `http://127.0.0.1:7443/mcp`�
 ## 版本与热更新
 
 - 程序版本：`package.json` / `APP_VERSION`
+- 图标源：[`brand/oneledger.svg`](brand/oneledger.svg)；窗口、exe、安装包、向导页都从这份 SVG 生成
 - 通道文件：[`app_update.json`](app_update.json)（累计 `history`）
 - 检查更新：顶栏或「服务器与存储 → 关于与更新」
 - **便携版**：下载 `OneLedger-Portable.exe`，校验固定仓库域名与 `.sha256` 后替换正在运行的 exe 并重启

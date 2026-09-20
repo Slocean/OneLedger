@@ -1,6 +1,6 @@
 {
   "name": "oneledger",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "private": true,
   "type": "module",
   "description": "Self-hosted shared memory ledger for coding agents, exposed over MCP.",
@@ -9,13 +9,14 @@
     "oneledger": "./dist/index.js"
   },
   "scripts": {
-    "dev": "vite build --config web/vite.config.ts && node scripts/sync-web-embed.mjs && tauri dev",
+    "dev": "node scripts/sync-icons.mjs && vite build --config web/vite.config.ts && node scripts/sync-web-embed.mjs && tauri dev",
     "dev:server": "tsx src/index.ts serve",
     "build": "tsc -p tsconfig.json && vite build --config web/vite.config.ts",
     "bundle:server": "node scripts/bundle-server.mjs",
     "start": "node dist/index.js serve",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "vite build --config web/vite.config.ts && node scripts/sync-web-embed.mjs && tauri build --bundles nsis",
+    "icons": "node scripts/sync-icons.mjs",
+    "tauri:dev": "node scripts/sync-icons.mjs && tauri dev",
+    "tauri:build": "node scripts/sync-icons.mjs && vite build --config web/vite.config.ts && node scripts/sync-web-embed.mjs && tauri build --bundles nsis",
     "check": "node scripts/validate-release.mjs && tsc --noEmit -p tsconfig.json && vitest run",
     "test": "vitest run",
     "pack": "node scripts/validate-release.mjs && npm run tauri:build && node scripts/stage-tauri-release.mjs",
@@ -32,6 +33,7 @@
     "zod": "^4.1.11"
   },
   "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^24.5.2",
     "@types/pg": "^8.15.5",
