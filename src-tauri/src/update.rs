@@ -5,10 +5,18 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const OWNER: &str = "Slocean";
 const REPO: &str = "OneLedger";
 const DEFAULT_CHANNEL: &str = "https://raw.githubusercontent.com/Slocean/OneLedger/main/app_update.json";
+const CHANNEL_MIRRORS: &[&str] = &[
+    "https://cdn.jsdelivr.net/gh/Slocean/OneLedger@main/app_update.json",
+    "https://raw.gitmirror.com/Slocean/OneLedger/main/app_update.json",
+    "https://github.com/Slocean/OneLedger/raw/main/app_update.json",
+    DEFAULT_CHANNEL,
+];
+const EMBEDDED_CHANNEL: &str = include_str!("../../app_update.json");
 const RELEASES_PAGE: &str = "https://github.com/Slocean/OneLedger/releases";
 const PORTABLE_ASSET: &str = "OneLedger-Portable.exe";
 const SETUP_ASSET: &str = "OneLedger-Setup.exe";
@@ -66,10 +74,18 @@ fn version_gt(remote: &str, local: &str) -> bool {
     false
 }
 
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(8))
+        .try_proxy_from_env(true)
+        .build()
+}
+
 fn get_json(url: &str) -> Result<Value, String> {
-    ureq::get(url)
+    http_agent()
+        .get(url)
         .set("User-Agent", &user_agent())
-        .set("Accept", "application/json")
+        .set("Accept", "application/json,text/plain,*/*")
         .call()
         .map_err(|err| err.to_string())?
         .into_json()
@@ -77,7 +93,8 @@ fn get_json(url: &str) -> Result<Value, String> {
 }
 
 fn get_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let res = ureq::get(url)
+    let res = http_agent()
+        .get(url)
         .set("User-Agent", &user_agent())
         .call()
         .map_err(|err| err.to_string())?;
@@ -149,23 +166,35 @@ fn normalize_channel(raw: &Value) -> Vec<Value> {
 }
 
 fn fetch_channel(update_url: &str) -> Result<(Vec<Value>, String), String> {
-    let url = if update_url.trim().is_empty() {
-        DEFAULT_CHANNEL
-    } else {
-        update_url.trim()
-    };
-    match get_json(url).map(|raw| normalize_channel(&raw)) {
-        Ok(history) => Ok((history, "remote".into())),
-        Err(err) => {
-            let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("app_update.json");
-            if let Ok(text) = fs::read_to_string(local) {
-                if let Ok(raw) = serde_json::from_str::<Value>(&text) {
-                    return Ok((normalize_channel(&raw), "local".into()));
-                }
-            }
-            Err(err)
+    let mut urls = Vec::new();
+    if !update_url.trim().is_empty() {
+        urls.push(update_url.trim().to_string());
+    }
+    for mirror in CHANNEL_MIRRORS {
+        if !urls.iter().any(|item| item == mirror) {
+            urls.push((*mirror).to_string());
         }
     }
+    let mut last_err = "检查更新失败".to_string();
+    for url in urls {
+        match get_json(&url) {
+            Ok(raw) => {
+                let history = normalize_channel(&raw);
+                if !history.is_empty() {
+                    return Ok((history, url));
+                }
+                last_err = format!("{url} 通道为空");
+            }
+            Err(err) => last_err = format!("{url}: {err}"),
+        }
+    }
+    if let Ok(raw) = serde_json::from_str::<Value>(EMBEDDED_CHANNEL) {
+        let history = normalize_channel(&raw);
+        if !history.is_empty() {
+            return Ok((history, "embedded".into()));
+        }
+    }
+    Err(last_err)
 }
 
 fn detect_flavor() -> Flavor {
@@ -206,11 +235,26 @@ fn can_hot_update() -> bool {
         .is_some_and(|name| name.contains("oneledger") && name.ends_with(".exe"))
 }
 
+fn release_download_url(tag: &str, name: &str) -> String {
+    format!("https://github.com/{OWNER}/{REPO}/releases/download/{tag}/{name}")
+}
+
+fn constructed_download(tag: &str, html: &str, flavor: Flavor) -> Value {
+    json!({
+        "ok": true,
+        "download_url": release_download_url(tag, flavor.asset()),
+        "checksum_url": release_download_url(tag, &flavor.checksum()),
+        "asset_name": flavor.asset(),
+        "html_url": html
+    })
+}
+
 fn resolve_download(version: &str, flavor: Flavor) -> Value {
     let tag = format!("v{}", version.trim_start_matches(['v', 'V']));
     let api = format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/tags/{tag}");
     let html = format!("https://github.com/{OWNER}/{REPO}/releases/tag/{tag}");
-    match ureq::get(&api)
+    match http_agent()
+        .get(&api)
         .set("User-Agent", &user_agent())
         .set("Accept", "application/vnd.github+json")
         .call()
@@ -233,13 +277,13 @@ fn resolve_download(version: &str, flavor: Flavor) -> Value {
                     "html_url": data.get("html_url").and_then(|v| v.as_str()).unwrap_or(&html)
                 })
             } else {
-                json!({"ok": false, "pending": true, "html_url": html, "error": format!("{tag} 还没有完整的 {} 与校验文件", want)})
+                constructed_download(&tag, &html, flavor)
             }
         }
         Err(ureq::Error::Status(404, _)) => {
             json!({"ok": false, "pending": true, "html_url": html, "error": format!("{tag} 尚未发布或还在打包")})
         }
-        Err(err) => json!({"ok": false, "html_url": html, "error": err.to_string()}),
+        Err(_) => constructed_download(&tag, &html, flavor),
     }
 }
 

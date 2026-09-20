@@ -3,7 +3,7 @@
  * 本地一条命令打 vX.Y.Z tag 并推送，触发 GitHub Actions 打包发版。
  *
  *   node scripts/trigger-release.mjs
- *   node scripts/trigger-release.mjs 0.4.0
+ *   node scripts/trigger-release.mjs 0.4.1
  *   release.bat
  *
  * 版本须与 package.json 一致。同名 tag 已存在时先删再重打；低于远端其他最新版本会拒绝。

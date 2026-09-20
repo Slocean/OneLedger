@@ -21,7 +21,17 @@ function flavorLabel(flavor?: string) {
   return "服务模式";
 }
 
-function UpdateBox({ info, onRefresh }: { info: UpdateInfo | null; onRefresh: () => Promise<void> }) {
+function UpdateBox({
+  info,
+  open,
+  onOpenChange,
+  onRefresh,
+}: {
+  info: UpdateInfo | null;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  onRefresh: () => Promise<void>;
+}) {
   const [busy, setBusy] = useState("");
   const [note, setNote] = useState("");
   const [openHistory, setOpenHistory] = useState(false);
@@ -39,7 +49,11 @@ function UpdateBox({ info, onRefresh }: { info: UpdateInfo | null; onRefresh: ()
     }
   };
   return (
-    <details className="advanced">
+    <details
+      className="advanced"
+      open={open}
+      onToggle={(event) => onOpenChange?.(event.currentTarget.open)}
+    >
       <summary>关于与更新</summary>
       <p className="muted">
         当前 {info?.current ?? "…"}
@@ -98,11 +112,29 @@ export function App() {
   const [tab, setTab] = useState<Tab>("memories");
   const [error, setError] = useState("");
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateError, setUpdateError] = useState("");
+  const [aboutOpen, setAboutOpen] = useState(false);
   const [notice, setNotice] = useState("");
-  const loadUpdates = async () => {
-    const data = await api.updates();
-    setUpdateInfo(data);
-    if (data.notice && localStorage.getItem(NOTICE_KEY) !== data.notice) setNotice(data.notice);
+  const loadUpdates = async (opts?: { reveal?: boolean }) => {
+    setUpdateBusy(true);
+    setUpdateError("");
+    try {
+      const data = await api.updates();
+      setUpdateInfo(data);
+      if (data.ok === false || data.error) {
+        setUpdateError(data.error || data.message || "检查更新失败");
+      }
+      if (data.notice && localStorage.getItem(NOTICE_KEY) !== data.notice) setNotice(data.notice);
+      if (opts?.reveal && data.update) {
+        setTab("settings");
+        setAboutOpen(true);
+      }
+    } catch (error) {
+      setUpdateError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setUpdateBusy(false);
+    }
   };
 
   useEffect(() => {
@@ -153,8 +185,14 @@ export function App() {
             <h1>ONELEDGER</h1>
             <p>共享记忆总账 · MCP · 本地与远端</p>
           </div>
-          <button type="button" onClick={() => void loadUpdates()}>
-            {updateInfo?.update ? `更新 ${updateInfo.latest}` : "检查更新"}
+          <button type="button" disabled={updateBusy} onClick={() => void loadUpdates({ reveal: true })}>
+            {updateBusy
+              ? "检查中…"
+              : updateInfo?.update
+                ? `更新 ${updateInfo.latest}`
+                : updateError
+                  ? "检查失败"
+                  : "检查更新"}
           </button>
         </header>
         <nav className="tabs">
@@ -173,6 +211,10 @@ export function App() {
             </button>
           ))}
         </nav>
+        {updateError ? <p className="error">{updateError}</p> : null}
+        {updateInfo?.update && !updateError ? (
+          <p className="banner">发现 {updateInfo.latest}。点顶栏或打开「服务器与存储 → 关于与更新」下载。</p>
+        ) : null}
       </div>
       <main className="stage">
         {tab === "memories" ? <Memories /> : null}
@@ -180,7 +222,14 @@ export function App() {
         {tab === "agents" ? <AgentsPanel /> : null}
         {tab === "sync" ? <SyncPanel /> : null}
         {tab === "keys" ? <KeysPanel /> : null}
-        {tab === "settings" ? <SettingsPanel updateInfo={updateInfo} onRefreshUpdates={loadUpdates} /> : null}
+        {tab === "settings" ? (
+          <SettingsPanel
+            updateInfo={updateInfo}
+            aboutOpen={aboutOpen}
+            onAboutOpenChange={setAboutOpen}
+            onRefreshUpdates={() => loadUpdates({ reveal: true })}
+          />
+        ) : null}
       </main>
       {notice ? (
         <div className="modal">
@@ -637,9 +686,13 @@ function KeysPanel() {
 
 function SettingsPanel({
   updateInfo,
+  aboutOpen,
+  onAboutOpenChange,
   onRefreshUpdates,
 }: {
   updateInfo: UpdateInfo | null;
+  aboutOpen: boolean;
+  onAboutOpenChange: (open: boolean) => void;
   onRefreshUpdates: () => Promise<void>;
 }) {
   const [form, setForm] = useState({
@@ -867,7 +920,12 @@ function SettingsPanel({
           <input value={form.updateUrl} onChange={(event) => setForm({ ...form, updateUrl: event.target.value })} />
         </label>
       </details>
-      <UpdateBox info={updateInfo} onRefresh={onRefreshUpdates} />
+      <UpdateBox
+        info={updateInfo}
+        open={aboutOpen}
+        onOpenChange={onAboutOpenChange}
+        onRefresh={onRefreshUpdates}
+      />
       <button className="primary" type="submit">
         保存
       </button>
