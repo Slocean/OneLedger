@@ -7,6 +7,7 @@ import { openDb } from "../db/driver.js";
 import { MemoryService } from "../memory/service.js";
 import { Store } from "../memory/store.js";
 import { applyRemoteMemories } from "./apply.js";
+import { createCollectProgress } from "../collect/progress.js";
 import { createApp, type AppContext } from "../http/app.js";
 
 describe("sync apply", () => {
@@ -56,6 +57,7 @@ describe("sync apply", () => {
       store: hub.store,
       service: hub.service,
       reload: async () => undefined,
+      collectProgress: createCollectProgress(),
     };
     const app = createApp(ctx);
     const saved = await hub.service.remember({

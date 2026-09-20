@@ -38,28 +38,25 @@ fn ensure_default_key(state: &AppState) {
 fn start_background(state: AppState) {
     let collect_min = state.config.lock().unwrap().collect.interval_min.max(5);
     let sync_min = state.config.lock().unwrap().sync.interval_min.max(5);
-    {
-        let conn = state.conn.lock().unwrap();
-        let config = state.config.lock().unwrap().clone();
-        let _ = crate::collect::run_collectors(&conn, &MemoryService, &config);
-    }
     let collect_state = state.clone();
     tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        crate::http::kick_collect_if_pending(&collect_state);
         let mut ticker = tokio::time::interval(Duration::from_secs(collect_min * 60));
+        ticker.tick().await;
         loop {
             ticker.tick().await;
-            let conn = collect_state.conn.lock().unwrap();
-            let config = collect_state.config.lock().unwrap().clone();
-            let _ = crate::collect::run_collectors(&conn, &MemoryService, &config);
+            crate::http::start_collect(&collect_state);
         }
     });
     let sync_state = state;
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(sync_min * 60));
+        ticker.tick().await;
         loop {
             ticker.tick().await;
-            let conn = sync_state.conn.lock().unwrap();
             let config = sync_state.config.lock().unwrap().clone();
+            let conn = sync_state.conn.lock().unwrap();
             let _ = crate::sync::sync_with_remote(&conn, &config);
         }
     });
@@ -83,13 +80,18 @@ pub fn run() {
                 config: Arc::new(Mutex::new(config.clone())),
                 conn: Arc::new(Mutex::new(conn)),
                 web_dir,
+                collect: Arc::new(Mutex::new(crate::collect::CollectProgress::pending())),
             };
+            {
+                let cfg = state.config.lock().unwrap().clone();
+                let db = state.conn.lock().unwrap();
+                let _ = crate::collect::ensure_agents(&db, &cfg);
+            }
             ensure_default_key(&state);
             let serve_state = state.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = crate::http::serve(serve_state).await;
             });
-            start_background(state);
             let port = config.port;
             for _ in 0..40 {
                 if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -110,6 +112,7 @@ pub fn run() {
                 );
                 let _ = window.eval(&script);
             }
+            start_background(state);
             Ok(())
         })
         .run(tauri::generate_context!())

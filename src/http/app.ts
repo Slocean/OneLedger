@@ -10,8 +10,9 @@ import { homeDir } from "../paths.js";
 import { hashToken, newId, nowIso, safeEqual } from "../util.js";
 import type { MemoryService } from "../memory/service.js";
 import type { Store } from "../memory/store.js";
-import { collectAgent, ensureAgents, runCollectors } from "../collect/runner.js";
+import { collectAgent, ensureAgents, runCollectorsWithProgress } from "../collect/runner.js";
 import { pathExists } from "../collect/catalog.js";
+import { snapshotCollect, type CollectProgress } from "../collect/progress.js";
 import { applyRemoteMemories } from "../sync/apply.js";
 import { authorizeNode, syncWithRemote } from "../sync/engine.js";
 import { allowedTools, createMcpServer } from "../mcp/create.js";
@@ -22,6 +23,29 @@ export interface AppContext {
   store: Store;
   service: MemoryService;
   reload: () => Promise<void>;
+  collectProgress: CollectProgress;
+  collectJob?: Promise<unknown>;
+}
+
+export function startCollect(ctx: AppContext): Promise<unknown> {
+  if (ctx.collectJob) return ctx.collectJob;
+  const progress = ctx.collectProgress;
+  progress.running = true;
+  progress.phase = "scanning";
+  if (!progress.message) progress.message = "正在扫描本地记忆…";
+  ctx.collectJob = runCollectorsWithProgress(ctx.service, ctx.store, ctx.config, progress)
+    .catch((error) => {
+      console.error("collect failed", error);
+    })
+    .finally(() => {
+      ctx.collectJob = undefined;
+    });
+  return ctx.collectJob;
+}
+
+export function startCollectIfPending(ctx: AppContext): void {
+  if (ctx.collectProgress.phase !== "pending") return;
+  void startCollect(ctx);
 }
 
 function adminOk(c: { req: { header: (name: string) => string | undefined } }, config: AppConfig): boolean {
@@ -50,13 +74,17 @@ export function createApp(ctx: AppContext): Hono {
 
   app.get("/api/status", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    startCollectIfPending(ctx);
     const counts = await ctx.store.counts();
+    const collect = snapshotCollect(ctx.collectProgress);
     return c.json({
       version: APP_VERSION,
       role: ctx.config.sync.role,
       storage: ctx.config.storage.driver,
       bind: `${ctx.config.bind}:${ctx.config.port}`,
       counts,
+      collecting: collect.running,
+      collect,
     });
   });
 
@@ -253,7 +281,10 @@ export function createApp(ctx: AppContext): Hono {
 
   app.post("/api/collect", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
-    const results = await runCollectors(ctx.service, ctx.store, ctx.config);
+    if (ctx.collectProgress.phase === "scanning") {
+      return c.json({ error: "collecting", collect: snapshotCollect(ctx.collectProgress) }, 409);
+    }
+    const results = await runCollectorsWithProgress(ctx.service, ctx.store, ctx.config, ctx.collectProgress);
     return c.json({ results });
   });
 

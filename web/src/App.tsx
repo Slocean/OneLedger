@@ -4,6 +4,7 @@ import {
   getToken,
   setToken,
   type AgentRow,
+  type CollectStatus,
   type Inbox,
   type KeyRow,
   type Memory,
@@ -116,6 +117,8 @@ export function App() {
   const [updateError, setUpdateError] = useState("");
   const [aboutOpen, setAboutOpen] = useState(false);
   const [notice, setNotice] = useState("");
+  const [collect, setCollect] = useState<CollectStatus | null>(null);
+  const [collectEpoch, setCollectEpoch] = useState(0);
   const loadUpdates = async (opts?: { reveal?: boolean }) => {
     setUpdateBusy(true);
     setUpdateError("");
@@ -125,7 +128,9 @@ export function App() {
       if (data.ok === false || data.error) {
         setUpdateError(data.error || data.message || "检查更新失败");
       }
-      if (data.notice && localStorage.getItem(NOTICE_KEY) !== data.notice) setNotice(data.notice);
+      if (data.update && data.notice && localStorage.getItem(NOTICE_KEY) !== data.notice) {
+        setNotice(data.notice);
+      }
       if (opts?.reveal && data.update) {
         setTab("settings");
         setAboutOpen(true);
@@ -141,15 +146,58 @@ export function App() {
     if (!token) return;
     api
       .status()
-      .then(() => setReady(true))
+      .then((data) => {
+        setReady(true);
+        setCollect(data.collect ?? { running: Boolean(data.collecting) });
+      })
       .catch(() => setReady(false));
   }, [token]);
   useEffect(() => {
     if (!ready) return;
     void loadUpdates().catch(() => undefined);
   }, [ready]);
+  useEffect(() => {
+    if (!ready) return;
+    let cancelled = false;
+    let wasRunning = Boolean(collect?.running);
+    const tick = async () => {
+      try {
+        const data = await api.status();
+        if (cancelled) return;
+        const next = data.collect ?? { running: Boolean(data.collecting) };
+        if (wasRunning && !next.running) setCollectEpoch((value) => value + 1);
+        wasRunning = next.running;
+        setCollect(next);
+      } catch {
+        /* keep last known status */
+      }
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [ready]);
 
   if (!ready) {
+    if (getToken()) {
+      return (
+        <div className="app">
+          <div className="chrome">
+            <header className="masthead">
+              <div>
+                <h1>ONELEDGER</h1>
+                <p>共享记忆总账 · MCP · 本地与远端</p>
+              </div>
+            </header>
+          </div>
+          <main className="stage">
+            <CollectBanner collect={{ running: true, message: "正在启动…" }} />
+          </main>
+        </div>
+      );
+    }
     return (
       <div className="gate">
         <h1>OneLedger</h1>
@@ -166,7 +214,10 @@ export function App() {
             setReady(false);
             api
               .status()
-              .then(() => setReady(true))
+              .then((data) => {
+                setReady(true);
+                setCollect(data.collect ?? { running: Boolean(data.collecting) });
+              })
               .catch((err: Error) => setError(err.message));
           }}
         >
@@ -215,11 +266,12 @@ export function App() {
         {updateInfo?.update && !updateError ? (
           <p className="banner">发现 {updateInfo.latest}。点顶栏或打开「服务器与存储 → 关于与更新」下载。</p>
         ) : null}
+        {collect?.running ? <CollectBanner collect={collect} /> : null}
       </div>
       <main className="stage">
-        {tab === "memories" ? <Memories /> : null}
-        {tab === "queue" ? <QueuePanel /> : null}
-        {tab === "agents" ? <AgentsPanel /> : null}
+        {tab === "memories" ? <Memories refreshKey={collectEpoch} /> : null}
+        {tab === "queue" ? <QueuePanel refreshKey={collectEpoch} /> : null}
+        {tab === "agents" ? <AgentsPanel refreshKey={collectEpoch} collecting={Boolean(collect?.running)} /> : null}
         {tab === "sync" ? <SyncPanel /> : null}
         {tab === "keys" ? <KeysPanel /> : null}
         {tab === "settings" ? (
@@ -253,6 +305,15 @@ export function App() {
   );
 }
 
+function CollectBanner({ collect }: { collect: CollectStatus }) {
+  return (
+    <p className="banner collect-banner">
+      <span className="spinner" aria-hidden />
+      <span>{collect.message || "正在扫描本地记忆…"}</span>
+    </p>
+  );
+}
+
 function downloadText(filename: string, text: string, type: string) {
   const blob = new Blob([text], { type });
   const url = URL.createObjectURL(blob);
@@ -269,7 +330,7 @@ function memoriesToMarkdown(items: Memory[]): string {
     .join("\n---\n\n");
 }
 
-function Memories() {
+function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
   const [items, setItems] = useState<Memory[]>([]);
   const [draft, setDraft] = useState("");
   const [note, setNote] = useState("");
@@ -285,7 +346,7 @@ function Memories() {
     });
   useEffect(() => {
     void refresh();
-  }, []);
+  }, [refreshKey]);
   const exportFile = async (format: "json" | "md") => {
     setBusy(true);
     try {
@@ -362,7 +423,7 @@ function Memories() {
   );
 }
 
-function QueuePanel() {
+function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
   const [inbox, setInbox] = useState<Inbox[]>([]);
   const [openId, setOpenId] = useState<string>("");
   const [adding, setAdding] = useState(false);
@@ -372,7 +433,7 @@ function QueuePanel() {
   const refresh = () => void api.inbox().then((data) => setInbox(data.inbox));
   useEffect(() => {
     void refresh();
-  }, []);
+  }, [refreshKey]);
   return (
     <div className="list">
       <p className="muted">
@@ -452,7 +513,7 @@ function QueuePanel() {
   );
 }
 
-function AgentsPanel() {
+function AgentsPanel({ refreshKey = 0, collecting = false }: { refreshKey?: number; collecting?: boolean }) {
   const [agents, setAgents] = useState<AgentRow[]>([]);
   const [name, setName] = useState("");
   const [rootPath, setRootPath] = useState("");
@@ -461,7 +522,7 @@ function AgentsPanel() {
   const refresh = () => void api.agents().then((data) => setAgents(data.agents));
   useEffect(() => {
     void refresh();
-  }, []);
+  }, [refreshKey]);
 
   return (
     <div className="list">
@@ -469,7 +530,7 @@ function AgentsPanel() {
       <div className="row">
         <button
           className="primary"
-          disabled={Boolean(busy)}
+          disabled={Boolean(busy) || collecting}
           onClick={async () => {
             setBusy("all");
             try {
@@ -526,7 +587,7 @@ function AgentsPanel() {
             </button>
             <button
               className="primary"
-              disabled={busy === agent.id}
+              disabled={busy === agent.id || collecting}
               onClick={async () => {
                 setBusy(agent.id);
                 try {

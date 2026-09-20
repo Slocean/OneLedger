@@ -6,9 +6,10 @@ import { loadConfig } from "./config.js";
 import { openDb, type Db } from "./db/driver.js";
 import { Store } from "./memory/store.js";
 import { MemoryService } from "./memory/service.js";
-import { createApp, type AppContext } from "./http/app.js";
+import { createApp, startCollect, type AppContext } from "./http/app.js";
+import { createCollectProgress, markCollectPending } from "./collect/progress.js";
 import { startStdioMcp } from "./mcp/stdio.js";
-import { runCollectors } from "./collect/runner.js";
+import { ensureAgents, runCollectors } from "./collect/runner.js";
 import { syncWithRemote } from "./sync/engine.js";
 import { APP_VERSION } from "./types.js";
 import { configPath, homeDir } from "./paths.js";
@@ -41,11 +42,14 @@ function printBanner(config: ReturnType<typeof loadConfig>): void {
 
 async function serveCmd(): Promise<void> {
   let db: Db | undefined;
+  const collectProgress = createCollectProgress();
+  markCollectPending(collectProgress);
   const ctx: AppContext = {
     config: loadConfig(),
     store: undefined as unknown as Store,
     service: undefined as unknown as MemoryService,
     reload: async () => undefined,
+    collectProgress,
   };
 
   const start = async () => {
@@ -57,6 +61,7 @@ async function serveCmd(): Promise<void> {
     ctx.service = bootstrapped.service;
     await ensureDefaultKey(ctx.service, ctx.store);
     await ctx.service.retireNonDistilled();
+    await ensureAgents(ctx.store, ctx.config);
   };
 
   ctx.reload = start;
@@ -68,7 +73,7 @@ async function serveCmd(): Promise<void> {
   const syncMs = Math.max(ctx.config.sync.intervalMin, 5) * 60_000;
   timers.push(
     setInterval(() => {
-      void runCollectors(ctx.service, ctx.store, ctx.config).catch((error) => console.error("collect failed", error));
+      void startCollect(ctx);
     }, collectMs),
   );
   timers.push(
@@ -76,7 +81,6 @@ async function serveCmd(): Promise<void> {
       void syncWithRemote(ctx.store, ctx.config).catch((error) => console.error("sync failed", error));
     }, syncMs),
   );
-  void runCollectors(ctx.service, ctx.store, ctx.config);
 
   serve(
     {
@@ -86,6 +90,9 @@ async function serveCmd(): Promise<void> {
     },
     (info) => {
       console.log(`listening on http://${info.address}:${info.port}`);
+      setTimeout(() => {
+        void startCollect(ctx);
+      }, 1500);
     },
   );
 

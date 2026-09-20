@@ -6,6 +6,7 @@ import { nowIso } from "../util.js";
 import { readCollected } from "./fs.js";
 import { readProjectMemories } from "./projects.js";
 import { builtinBlueprints, pathExists, toAgentRecord } from "./catalog.js";
+import type { CollectProgress } from "./progress.js";
 
 export async function ensureAgents(store: Store, config: AppConfig): Promise<void> {
   const existing = new Set((await store.listAgents()).map((item) => item.id));
@@ -57,11 +58,43 @@ export async function runCollectors(
   store: Store,
   config: AppConfig,
 ): Promise<CollectResult[]> {
-  await ensureAgents(store, config);
-  const results: CollectResult[] = [];
-  for (const agent of await store.listAgents()) {
-    if (!agent.enabled) continue;
-    results.push(await collectAgent(service, store, agent));
+  return runCollectorsWithProgress(service, store, config);
+}
+
+export async function runCollectorsWithProgress(
+  service: MemoryService,
+  store: Store,
+  config: AppConfig,
+  progress?: CollectProgress,
+): Promise<CollectResult[]> {
+  if (progress) {
+    progress.running = true;
+    progress.phase = "scanning";
+    progress.message = progress.message || "正在扫描本地记忆…";
   }
-  return results;
+  try {
+    await ensureAgents(store, config);
+    const results: CollectResult[] = [];
+    for (const agent of await store.listAgents()) {
+      if (!agent.enabled) continue;
+      if (progress) {
+        progress.currentAgent = agent.name;
+        progress.message = `正在扫描 ${agent.name}…`;
+      }
+      results.push(await collectAgent(service, store, agent));
+      await yieldEventLoop();
+    }
+    return results;
+  } finally {
+    if (progress) {
+      progress.running = false;
+      progress.phase = "idle";
+      progress.currentAgent = "";
+      progress.message = "";
+    }
+  }
+}
+
+function yieldEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }

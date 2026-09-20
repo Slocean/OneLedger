@@ -6,6 +6,35 @@ use crate::util::now_iso;
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+#[derive(Debug, Clone)]
+pub struct CollectProgress {
+    pub running: bool,
+    pub phase: String,
+    pub current_agent: String,
+    pub message: String,
+}
+
+impl CollectProgress {
+    pub fn pending() -> Self {
+        Self {
+            running: true,
+            phase: "pending".into(),
+            current_agent: String::new(),
+            message: "准备扫描本地记忆…".into(),
+        }
+    }
+
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "running": self.running,
+            "phase": self.phase,
+            "currentAgent": self.current_agent,
+            "message": self.message,
+        })
+    }
+}
 
 pub fn ensure_agents(conn: &Connection, config: &Config) -> rusqlite::Result<()> {
     let existing: Vec<String> = store::list_agents(conn)?.into_iter().map(|item| item.id).collect();
@@ -60,15 +89,18 @@ pub fn path_exists(root: &str) -> bool {
     !root.trim().is_empty() && Path::new(root).exists()
 }
 
-pub fn collect_agent(conn: &Connection, _service: &MemoryService, mut agent: AgentRecord) -> CollectResult {
-    let files = if agent.kind == "project" {
+pub fn read_agent_files(agent: &AgentRecord) -> Vec<(String, String, String)> {
+    if agent.kind == "project" {
         read_project_memories(&agent.root_path)
     } else if path_exists(&agent.root_path) {
         read_collected(&agent.root_path)
     } else {
         vec![]
-    };
-    let result = MemoryService::ingest_collected(conn, &agent.id, &files);
+    }
+}
+
+pub fn ingest_collected_files(conn: &Connection, mut agent: AgentRecord, files: &[(String, String, String)]) -> CollectResult {
+    let result = MemoryService::ingest_collected(conn, &agent.id, files);
     agent.last_scanned_at = Some(now_iso());
     agent.last_scanned_files = result.scanned_files;
     agent.last_ingested = result.ingested;
@@ -83,6 +115,12 @@ pub fn collect_agent(conn: &Connection, _service: &MemoryService, mut agent: Age
     result
 }
 
+pub fn collect_agent(conn: &Connection, _service: &MemoryService, agent: AgentRecord) -> CollectResult {
+    let files = read_agent_files(&agent);
+    ingest_collected_files(conn, agent, &files)
+}
+
+#[allow(dead_code)]
 pub fn run_collectors(conn: &Connection, service: &MemoryService, config: &Config) -> Vec<CollectResult> {
     let _ = ensure_agents(conn, config);
     store::list_agents(conn)
@@ -91,6 +129,48 @@ pub fn run_collectors(conn: &Connection, service: &MemoryService, config: &Confi
         .filter(|agent| agent.enabled)
         .map(|agent| collect_agent(conn, service, agent))
         .collect()
+}
+
+pub fn run_collectors_progress(
+    conn: &Mutex<Connection>,
+    config: &Config,
+    progress: &Mutex<CollectProgress>,
+) -> Vec<CollectResult> {
+    {
+        let mut status = progress.lock().unwrap();
+        status.running = true;
+        status.phase = "scanning".into();
+        if status.message.is_empty() {
+            status.message = "正在扫描本地记忆…".into();
+        }
+    }
+    {
+        let db = conn.lock().unwrap();
+        let _ = ensure_agents(&db, config);
+    }
+    let agents = {
+        let db = conn.lock().unwrap();
+        store::list_agents(&db).unwrap_or_default()
+    };
+    let mut results = Vec::new();
+    for agent in agents.into_iter().filter(|item| item.enabled) {
+        {
+            let mut status = progress.lock().unwrap();
+            status.current_agent = agent.name.clone();
+            status.message = format!("正在扫描 {}…", agent.name);
+        }
+        let files = read_agent_files(&agent);
+        let db = conn.lock().unwrap();
+        results.push(ingest_collected_files(&db, agent, &files));
+    }
+    {
+        let mut status = progress.lock().unwrap();
+        status.running = false;
+        status.phase = "idle".into();
+        status.current_agent.clear();
+        status.message.clear();
+    }
+    results
 }
 
 fn read_collected(root: &str) -> Vec<(String, String, String)> {

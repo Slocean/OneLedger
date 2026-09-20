@@ -1,4 +1,4 @@
-use crate::collect::{collect_agent, ensure_agents, path_exists, run_collectors};
+use crate::collect::{collect_agent, ensure_agents, path_exists, run_collectors_progress, CollectProgress};
 use crate::config::{load_config, public_config, save_config, Config};
 use crate::service::MemoryService;
 use crate::store;
@@ -26,6 +26,32 @@ pub struct AppState {
     pub config: Arc<Mutex<Config>>,
     pub conn: Arc<Mutex<Connection>>,
     pub web_dir: PathBuf,
+    pub collect: Arc<Mutex<CollectProgress>>,
+}
+
+pub fn start_collect(state: &AppState) {
+    {
+        let mut progress = state.collect.lock().unwrap();
+        if progress.phase == "scanning" {
+            return;
+        }
+        progress.running = true;
+        progress.phase = "scanning".into();
+        if progress.message.is_empty() {
+            progress.message = "正在扫描本地记忆…".into();
+        }
+    }
+    let worker = state.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = worker.config.lock().unwrap().clone();
+        let _ = run_collectors_progress(&worker.conn, &config, &worker.collect);
+    });
+}
+
+pub fn kick_collect_if_pending(state: &AppState) {
+    if state.collect.lock().unwrap().phase == "pending" {
+        start_collect(state);
+    }
 }
 
 fn admin_ok(headers: &HeaderMap, config: &Config) -> bool {
@@ -123,13 +149,17 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
+    kick_collect_if_pending(&state);
     let counts = store::counts(&state.conn.lock().unwrap()).unwrap_or(serde_json::json!({}));
+    let collect = state.collect.lock().unwrap().snapshot();
     Json(serde_json::json!({
         "version": APP_VERSION,
         "role": config.sync.role,
         "storage": config.storage.driver,
         "bind": format!("{}:{}", config.bind, config.port),
-        "counts": counts
+        "counts": counts,
+        "collecting": collect.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
+        "collect": collect
     }))
     .into_response()
 }
@@ -460,7 +490,22 @@ async fn collect_all(State(state): State<AppState>, headers: HeaderMap) -> Respo
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
-    let results = run_collectors(&state.conn.lock().unwrap(), &MemoryService, &config);
+    if state.collect.lock().unwrap().phase == "scanning" {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "collecting",
+                "collect": state.collect.lock().unwrap().snapshot()
+            })),
+        )
+            .into_response();
+    }
+    let worker = state.clone();
+    let results = tokio::task::spawn_blocking(move || {
+        run_collectors_progress(&worker.conn, &config, &worker.collect)
+    })
+    .await
+    .unwrap_or_default();
     Json(serde_json::json!({ "results": results })).into_response()
 }
 

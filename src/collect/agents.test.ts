@@ -6,7 +6,8 @@ import { defaultConfig } from "../config.js";
 import { openDb } from "../db/driver.js";
 import { MemoryService } from "../memory/service.js";
 import { Store } from "../memory/store.js";
-import { collectAgent, ensureAgents } from "./runner.js";
+import { createCollectProgress } from "./progress.js";
+import { collectAgent, ensureAgents, runCollectorsWithProgress } from "./runner.js";
 
 describe("agent registry", () => {
   const dirs: string[] = [];
@@ -50,6 +51,30 @@ describe("agent registry", () => {
     expect(result.scannedFiles).toBe(1);
     const updated = await store.getAgent("custom_test");
     expect(updated?.lastScannedFiles).toBe(1);
+    await db.close();
+  });
+
+  it("clears collect progress after a scan finishes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ol-progress-"));
+    dirs.push(dir);
+    const config = defaultConfig();
+    config.storage.sqlitePath = join(dir, "db.sqlite");
+    config.collect.cursor = false;
+    config.collect.claude = false;
+    config.collect.codex = false;
+    config.collect.continue = false;
+    config.collect.zcode = false;
+    config.collect.workbuddy = false;
+    config.collect.qoder = false;
+    config.collect.projects = false;
+    const db = await openDb(config);
+    const store = new Store(db);
+    const service = new MemoryService(store, config);
+    const progress = createCollectProgress();
+    await runCollectorsWithProgress(service, store, config, progress);
+    expect(progress.running).toBe(false);
+    expect(progress.phase).toBe("idle");
+    expect(progress.message).toBe("");
     await db.close();
   });
 });

@@ -31,6 +31,8 @@ export const api = {
       storage: string;
       bind: string;
       counts: { active: number; inbox: number };
+      collecting?: boolean;
+      collect?: CollectStatus;
     }>("/api/status"),
   config: () => request<Record<string, unknown>>("/api/config"),
   saveConfig: (body: unknown) => request<{ ok: boolean }>("/api/config", { method: "PUT", body: JSON.stringify(body) }),
@@ -68,6 +70,13 @@ export const api = {
   createKey: (name: string) =>
     request<{ token: string; name: string }>("/api/keys", { method: "POST", body: JSON.stringify({ name }) }),
 };
+
+export interface CollectStatus {
+  running: boolean;
+  phase?: string;
+  currentAgent?: string;
+  message?: string;
+}
 
 export interface Memory {
   id: string;
