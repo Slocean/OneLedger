@@ -55,34 +55,39 @@ describe("DistillJobService", () => {
     await db.close();
   });
 
+  // 造 300 个作用域 × 3 条材料；逐作用域查询会明显变慢甚至拖死连接。
+  // 种子数据在一个事务内写入，避免把写入耗时算进被测的聚合耗时。
   it("aggregates many scopes without one query per scope", async () => {
-    const { db, job, store } = await setup();
-    // 造 300 个作用域 × 3 条材料；逐作用域查询会明显变慢甚至拖死连接
-    for (let index = 0; index < 300; index += 1) {
-      for (let item = 0; item < 3; item += 1) {
-        await store.insertInbox({
-          title: `材料 ${index}-${item}`,
-          body: `正文 ${index}-${item}`,
-          source: index % 2 === 0 ? "workbuddy" : "cursor",
-          scopeKind: "project",
-          scopeId: `scope-${index}`,
-          sensitivity: "public",
-          redacted: 0,
-          queueStatus: "proposed",
-          conflictIds: [],
-        });
+    const { db, job } = await setup();
+    const now = new Date().toISOString();
+    await db.transaction(async (tx) => {
+      for (let index = 0; index < 300; index += 1) {
+        for (let item = 0; item < 3; item += 1) {
+          await tx.run(
+            `INSERT INTO inbox (id, title, body, source, scope_kind, scope_id, sensitivity, redacted, created_at, queue_status, conflict_ids)
+             VALUES (?, ?, ?, ?, 'project', ?, 'public', 0, ?, 'proposed', '')`,
+            [
+              `in_seed_${index}_${item}`,
+              `材料 ${index}-${item}`,
+              `正文 ${index}-${item}`,
+              index % 2 === 0 ? "workbuddy" : "cursor",
+              `scope-${index}`,
+              now,
+            ],
+          );
+        }
       }
-    }
+    });
     const startedAt = Date.now();
     const tasks = await job.tasks();
     const elapsed = Date.now() - startedAt;
     expect(tasks).toHaveLength(300);
     expect(tasks.every((task) => task.pending === 3)).toBe(true);
     expect(tasks.every((task) => task.sources.length === 3)).toBe(true);
-    // 逐作用域查询在 900 行规模下就会远超此阈值
-    expect(elapsed).toBeLessThan(20_000);
+    // 逐作用域查询（600 次往返）在 CI 机器上会慢一个数量级
+    expect(elapsed).toBeLessThan(5_000);
     await db.close();
-  });
+  }, 30_000);
 
   it("stays usable with distill.provider=none and never auto-promotes", async () => {
     const { db, job, store, service } = await setup();
