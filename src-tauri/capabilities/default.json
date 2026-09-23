@@ -3,5 +3,12 @@
   "identifier": "default",
   "description": "Main window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "remote": { "urls": ["http://127.0.0.1:*"] },
+  "permissions": [
+    "core:default",
+    "allow-vault-list",
+    "allow-vault-put",
+    "allow-vault-reveal",
+    "allow-vault-delete"
+  ]
 }

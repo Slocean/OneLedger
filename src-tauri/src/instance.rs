@@ -1,5 +1,6 @@
 use crate::util::silent_command;
 use serde_json::Value;
+#[cfg(test)]
 use std::process::Command;
 use std::time::{Duration, Instant};
 

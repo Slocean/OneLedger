@@ -207,6 +207,27 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)", params![6, now_iso()])?;
         version = 6;
     }
+    if version < 7 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS vault_items (
+              id TEXT PRIMARY KEY,
+              label TEXT NOT NULL,
+              scope_kind TEXT NOT NULL,
+              scope_id TEXT NOT NULL,
+              protected_value BLOB NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS vault_items_scope
+              ON vault_items(scope_kind, scope_id, updated_at);
+            "#,
+        )?;
+        tx.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)", params![7, now_iso()])?;
+        tx.commit()?;
+        version = 7;
+    }
     if version < DATA_SCHEMA_VERSION {
         panic!("Database is behind schema {DATA_SCHEMA_VERSION}; update OneLedger.");
     }
@@ -224,4 +245,26 @@ fn add_column(conn: &Connection, table: &str, column: &str, definition: &str) ->
         conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_schema_upgrades_from_six_and_is_repeatable() {
+        let conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(INIT_SQL).expect("base schema");
+        migrate(&conn).expect("initial migrations");
+        conn.execute("DELETE FROM schema_migrations WHERE version = 7", []).expect("restore schema 6 marker");
+        conn.execute_batch("DROP TABLE vault_items; DROP INDEX IF EXISTS vault_items_scope;").expect("restore schema 6 tables");
+        migrate(&conn).expect("upgrade to seven");
+        migrate(&conn).expect("repeat upgrade");
+        let versions: i64 = conn.query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 7", [], |row| row.get(0)).expect("marker");
+        assert_eq!(versions, 1);
+        conn.execute(
+            "INSERT INTO vault_items (id, label, scope_kind, scope_id, protected_value, created_at, updated_at) VALUES ('vault_test', '测试凭据', 'project', 'OneLedger', ?1, 'now', 'now')",
+            [vec![1_u8, 2, 3]],
+        ).expect("vault table");
+    }
 }

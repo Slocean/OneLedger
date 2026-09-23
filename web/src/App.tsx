@@ -3,6 +3,7 @@ import {
   api,
   getToken,
   setToken,
+  vaultApi,
   type AgentRow,
   type CollectStatus,
   type DistillTask,
@@ -11,6 +12,7 @@ import {
   type Memory,
   type SyncReport,
   type UpdateInfo,
+  type VaultItem,
 } from "./api";
 
 function queueGroupKey(item: Inbox): string {
@@ -40,7 +42,7 @@ function groupInbox(items: Inbox[]): Array<{ key: string; items: Inbox[] }> {
 
 const NOTICE_KEY = "oneledger.noticeAck";
 
-type Tab = "memories" | "queue" | "agents" | "sync" | "keys" | "settings";
+type Tab = "memories" | "queue" | "agents" | "sync" | "keys" | "vault" | "settings";
 
 function flavorLabel(flavor?: string) {
   if (flavor === "setup") return "安装版";
@@ -328,6 +330,7 @@ export function App() {
               ["agents", "Agent"],
               ["sync", "同步"],
               ["keys", "MCP 密钥"],
+              ["vault", "凭据空间"],
               ["settings", "服务器与存储"],
             ] as const
           ).map(([id, label]) => (
@@ -351,6 +354,7 @@ export function App() {
         {tab === "agents" ? <AgentsPanel refreshKey={collectEpoch} collecting={Boolean(collect?.running)} /> : null}
         {tab === "sync" ? <SyncPanel /> : null}
         {tab === "keys" ? <KeysPanel /> : null}
+        {tab === "vault" ? <VaultPanel /> : null}
         {tab === "settings" ? (
           <SettingsPanel
             updateInfo={updateInfo}
@@ -1203,6 +1207,176 @@ function KeysPanel() {
           <p>
             {key.tokenPrefix}… · {key.tools}
           </p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function VaultPanel() {
+  const [items, setItems] = useState<VaultItem[]>([]);
+  const [editing, setEditing] = useState<VaultItem | null>(null);
+  const [label, setLabel] = useState("");
+  const [scopeKind, setScopeKind] = useState<VaultItem["scopeKind"]>("personal");
+  const [scopeId, setScopeId] = useState("");
+  const [value, setValue] = useState("");
+  const [showInput, setShowInput] = useState(false);
+  const [revealed, setRevealed] = useState<{ id: string; value: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void vaultApi.list().then(setItems).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
+  }, []);
+  useEffect(() => {
+    if (!revealed) return;
+    const timer = window.setTimeout(() => setRevealed(null), 15_000);
+    return () => window.clearTimeout(timer);
+  }, [revealed]);
+
+  const resetForm = () => {
+    setEditing(null);
+    setLabel("");
+    setScopeKind("personal");
+    setScopeId("");
+    setValue("");
+    setShowInput(false);
+  };
+  const report = (cause: unknown) => {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    if (message !== "操作已取消") setError(message);
+  };
+  const refresh = async () => setItems(await vaultApi.list());
+  const save = async () => {
+    setError("");
+    setRevealed(null);
+    setBusy(true);
+    try {
+      await vaultApi.put({
+        id: editing?.id,
+        label: label.trim(),
+        scopeKind,
+        scopeId: scopeKind === "project" ? scopeId.trim() : "",
+        value,
+      });
+      resetForm();
+      await refresh();
+    } catch (cause) {
+      report(cause);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const reveal = async (id: string) => {
+    setError("");
+    setRevealed(null);
+    setBusy(true);
+    try {
+      const secret = await vaultApi.reveal(id);
+      setRevealed({ id, value: secret });
+    } catch (cause) {
+      report(cause);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async (id: string) => {
+    setError("");
+    setRevealed(null);
+    setBusy(true);
+    try {
+      await vaultApi.delete(id);
+      if (editing?.id === id) resetForm();
+      await refresh();
+    } catch (cause) {
+      report(cause);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="list">
+      <div className="panel list">
+        <h2>本机凭据空间</h2>
+        <p className="muted">
+          原值由当前 Windows 用户的系统保护机制加密保存在本机。MCP 密钥只用于连接 Agent；
+          Agent 的五个记忆工具不能读取这里的原值。每次保存、查看或删除都会弹出原生确认窗口。
+        </p>
+        <p className="muted">凭据不会进入记忆检索、蒸馏、同步或普通导出。复制数据库到另一台机器后，这些原值无法直接解锁。</p>
+      </div>
+
+      <div className="panel list">
+        <h3>{editing ? "替换凭据" : "新增凭据"}</h3>
+        <label>
+          名称（不含原值）
+          <input value={label} maxLength={80} autoComplete="off" onChange={(event) => setLabel(event.target.value)} placeholder="例如：生产 API" />
+        </label>
+        <label>
+          作用域
+          <select value={scopeKind} onChange={(event) => {
+            const next = event.target.value as VaultItem["scopeKind"];
+            setScopeKind(next);
+            if (next !== "project") setScopeId("");
+          }}>
+            <option value="personal">个人</option>
+            <option value="project">项目</option>
+            <option value="global">全局</option>
+          </select>
+        </label>
+        {scopeKind === "project" ? (
+          <label>
+            仓库名
+            <input value={scopeId} maxLength={120} autoComplete="off" onChange={(event) => setScopeId(event.target.value)} placeholder="例如：CofoeAirLink_Web" />
+          </label>
+        ) : null}
+        <label>
+          原值
+          <textarea
+            className={showInput ? "vault-value" : "vault-value vault-value-hidden"}
+            value={value}
+            rows={3}
+            autoComplete="off"
+            spellCheck={false}
+            onChange={(event) => setValue(event.target.value)}
+            placeholder={editing ? "输入替换后的原值" : "输入 API key、密码或其他敏感值"}
+          />
+        </label>
+        <div className="row">
+          <button type="button" onClick={() => setShowInput((visible) => !visible)}>{showInput ? "隐藏输入" : "显示输入"}</button>
+          <button className="primary" type="button" disabled={busy || !label.trim() || !value} onClick={() => void save()}>
+            {editing ? "确认替换" : "确认保存"}
+          </button>
+          {editing ? <button type="button" onClick={resetForm}>取消编辑</button> : null}
+        </div>
+      </div>
+
+      {error ? <p className="error" role="alert">{error}</p> : null}
+      {items.map((item) => (
+        <div className="item list" key={item.id}>
+          <div>
+            <h3>{item.label}</h3>
+            <p className="muted">
+              {item.scopeKind === "project" ? `项目 · ${item.scopeId}` : item.scopeKind === "global" ? "全局" : "个人"}
+              {" · "}更新于 {item.updatedAt}
+            </p>
+          </div>
+          <div className="row">
+            <button type="button" disabled={busy} onClick={() => void reveal(item.id)}>查看原值 15 秒</button>
+            <button type="button" disabled={busy} onClick={() => {
+              setRevealed(null);
+              setEditing(item);
+              setLabel(item.label);
+              setScopeKind(item.scopeKind);
+              setScopeId(item.scopeId);
+              setValue("");
+              setShowInput(false);
+            }}>替换</button>
+            <button type="button" disabled={busy} onClick={() => void remove(item.id)}>删除</button>
+          </div>
+          {revealed?.id === item.id ? (
+            <pre className="vault-revealed" aria-label={`${item.label} 的原值`}>{revealed.value}</pre>
+          ) : null}
         </div>
       ))}
     </div>

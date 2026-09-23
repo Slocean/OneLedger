@@ -250,6 +250,25 @@ async function migrate(db: Db): Promise<void> {
     await db.run("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", [6, new Date().toISOString()]);
     current = 6;
   }
+  if (current < 7) {
+    await db.transaction(async (tx) => {
+      await tx.exec(`
+        CREATE TABLE IF NOT EXISTS vault_items (
+          id TEXT PRIMARY KEY,
+          label TEXT NOT NULL,
+          scope_kind TEXT NOT NULL,
+          scope_id TEXT NOT NULL,
+          protected_value ${tx.driver === "postgres" ? "BYTEA" : "BLOB"} NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS vault_items_scope
+          ON vault_items(scope_kind, scope_id, updated_at);
+      `);
+      await tx.run("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", [7, new Date().toISOString()]);
+    });
+    current = 7;
+  }
   if (current < DATA_SCHEMA_VERSION) {
     throw new Error(`Database is behind schema ${DATA_SCHEMA_VERSION}; update OneLedger.`);
   }

@@ -127,6 +127,16 @@ textarea::placeholder {
   color: var(--muted);
 }
 
+.vault-value-hidden {
+  -webkit-text-security: disc;
+}
+
+.vault-revealed {
+  user-select: text;
+  max-height: 180px;
+  overflow: auto;
+}
+
 input:-webkit-autofill,
 textarea:-webkit-autofill,
 select:-webkit-autofill {

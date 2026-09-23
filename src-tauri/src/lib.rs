@@ -12,6 +12,7 @@ mod store;
 mod sync;
 mod update;
 mod util;
+mod vault;
 
 use crate::config::{home_dir, load_config, save_config};
 use crate::http::AppState;
@@ -61,11 +62,6 @@ fn admin_token_script(token: &str) -> String {
     )
 }
 
-#[tauri::command]
-fn admin_token() -> String {
-    load_config().admin_token
-}
-
 fn ensure_default_key(state: &AppState) {
     let conn = state.conn.lock().unwrap();
     if store::list_keys(&conn).map(|keys| keys.is_empty()).unwrap_or(true) {
@@ -106,7 +102,12 @@ fn start_background(state: AppState) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![admin_token])
+        .invoke_handler(tauri::generate_handler![
+            vault::vault_list,
+            vault::vault_put,
+            vault::vault_reveal,
+            vault::vault_delete
+        ])
         .setup(|app| {
             let mut config = load_config();
             save_config(&config);
@@ -123,6 +124,7 @@ pub fn run() {
                 web_dir,
                 collect: Arc::new(Mutex::new(crate::collect::CollectProgress::pending())),
             };
+            app.manage(state.clone());
             {
                 let cfg = state.config.lock().unwrap().clone();
                 let db = state.conn.lock().unwrap();
@@ -135,7 +137,19 @@ pub fn run() {
             wait_for_our_http(&url)?;
             let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse().unwrap()))
                 .title("OneLedger")
-                .inner_size(1180.0, 820.0);
+                .inner_size(1180.0, 820.0)
+                .on_navigation({
+                    let port = config.port;
+                    move |target| {
+                        target.scheme() == "http"
+                            && target.host_str() == Some("127.0.0.1")
+                            && target.port_or_known_default() == Some(port)
+                    }
+                });
+            #[cfg(windows)]
+            if std::env::var_os("ONELEDGER_HOME").is_some() {
+                builder = builder.data_directory(home_dir().join("webview"));
+            }
             if let Some(icon) = app.default_window_icon() {
                 builder = builder.icon(icon.clone())?;
             }

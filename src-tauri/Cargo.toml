@@ -1,6 +1,6 @@
 [package]
 name = "oneledger"
-version = "0.4.8"
+version = "0.4.9"
 description = "OneLedger desktop"
 authors = ["OneLedger"]
 edition = "2021"
@@ -30,6 +30,7 @@ mime_guess = "2"
 
 [target.'cfg(windows)'.dependencies]
 ureq = { version = "2.12", default-features = false, features = ["json", "tls", "native-tls"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(not(windows))'.dependencies]
 ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }

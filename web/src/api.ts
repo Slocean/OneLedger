@@ -101,6 +101,37 @@ export const api = {
     request<{ token: string; name: string }>("/api/keys", { method: "POST", body: JSON.stringify({ name }) }),
 };
 
+declare global {
+  interface Window {
+    __TAURI_INTERNALS__?: {
+      invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
+    };
+  }
+}
+
+function vaultInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  const invoke = window.__TAURI_INTERNALS__?.invoke;
+  if (!invoke) return Promise.reject(new Error("凭据空间只能在 OneLedger 的 Tauri 窗口中使用"));
+  return invoke<T>(command, args);
+}
+
+export interface VaultItem {
+  id: string;
+  label: string;
+  scopeKind: "global" | "project" | "personal";
+  scopeId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const vaultApi = {
+  list: () => vaultInvoke<VaultItem[]>("vault_list"),
+  put: (input: { id?: string; label: string; scopeKind: VaultItem["scopeKind"]; scopeId: string; value: string }) =>
+    vaultInvoke<VaultItem>("vault_put", { input }),
+  reveal: (id: string) => vaultInvoke<string>("vault_reveal", { id }),
+  delete: (id: string) => vaultInvoke<void>("vault_delete", { id }),
+};
+
 export interface CollectStatus {
   running: boolean;
   phase?: string;
