@@ -24,12 +24,13 @@ export const toolSchemas = {
   },
   "memory.remember": {
     description:
-      "Replace the distilled write-up for this scope. Send the full refined text after you distilled the source material, not one fact per call. Same scope overwrites the previous document. OneLedger does not summarize. Secrets are redacted and never recalled.",
+      "Replace the distilled write-up for this scope. Read the current rev first and pass expectedRev to protect concurrent edits. Send the full refined text, not one fact per call. OneLedger does not summarize.",
     input: z.object({
       body: z.string().min(1),
       title: z.string().optional(),
       scopeKind: z.enum(["global", "project", "personal"]).optional(),
       scopeId: z.string().optional(),
+      expectedRev: z.number().int().min(0).optional(),
     }),
     jsonSchema: {
       type: "object",
@@ -38,6 +39,7 @@ export const toolSchemas = {
         title: { type: "string" },
         scopeKind: { type: "string", enum: ["global", "project", "personal"] },
         scopeId: { type: "string" },
+        expectedRev: { type: "integer", minimum: 0 },
       },
       required: ["body"],
     },
@@ -108,6 +110,7 @@ export async function callTool(
       title: input.title,
       scopeKind: input.scopeKind,
       scopeId: input.scopeId,
+      expectedRev: input.expectedRev,
       source: `mcp:${actor}`,
       actor,
     });
@@ -118,7 +121,7 @@ export async function callTool(
   }
   if (name === "memory.list") {
     const input = toolSchemas["memory.list"].input.parse(args);
-    const items = await service.list(input.limit ?? 20, {
+    const items = await service.listForAgent(input.limit ?? 20, {
       scopeKind: input.scopeKind,
       scopeId: input.scopeId,
     });

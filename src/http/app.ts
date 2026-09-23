@@ -9,6 +9,7 @@ import { loadConfig, publicConfig, saveConfig } from "../config.js";
 import { homeDir } from "../paths.js";
 import { hashToken, newId, nowIso, safeEqual } from "../util.js";
 import type { MemoryService } from "../memory/service.js";
+import type { DistillJobService } from "../memory/distillJob.js";
 import type { Store } from "../memory/store.js";
 import { collectAgent, ensureAgents, runCollectorsWithProgress } from "../collect/runner.js";
 import { pathExists } from "../collect/catalog.js";
@@ -22,6 +23,7 @@ export interface AppContext {
   config: AppConfig;
   store: Store;
   service: MemoryService;
+  distillJob: DistillJobService;
   reload: () => Promise<void>;
   collectProgress: CollectProgress;
   collectJob?: Promise<unknown>;
@@ -124,7 +126,10 @@ export function createApp(ctx: AppContext): Hono {
 
   app.get("/api/memories", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
-    return c.json({ memories: await ctx.service.list() });
+    return c.json({ memories: await ctx.service.list(100, {
+      scopeKind: c.req.query("scopeKind") as "global" | "project" | "personal" | undefined,
+      scopeId: c.req.query("scopeId"),
+    }) });
   });
 
   app.get("/api/memories/export", async (c) => {
@@ -146,6 +151,7 @@ export function createApp(ctx: AppContext): Hono {
       title?: string;
       scopeKind?: "global" | "project" | "personal";
       scopeId?: string;
+      expectedRev?: number;
     };
     if (!body.body?.trim()) return c.json({ error: "body required" }, 400);
     const result = await ctx.service.remember({
@@ -153,6 +159,7 @@ export function createApp(ctx: AppContext): Hono {
       title: body.title,
       scopeKind: body.scopeKind,
       scopeId: body.scopeId,
+      expectedRev: body.expectedRev,
       source: "ui",
       actor: "admin",
     });
@@ -163,6 +170,20 @@ export function createApp(ctx: AppContext): Hono {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
     const ok = await ctx.service.rejectInbox(c.req.param("id"), "admin");
     return c.json({ ok }, ok ? 200 : 404);
+  });
+
+  app.post("/api/inbox/resolve", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json()) as { ids?: string[]; body?: string; title?: string; expectedRev?: number };
+    if (!body.ids?.length || !body.body?.trim()) return c.json({ error: "ids and body required" }, 400);
+    const result = await ctx.service.confirmSources({
+      ids: body.ids,
+      body: body.body,
+      title: body.title,
+      expectedRev: body.expectedRev,
+      actor: "admin",
+    });
+    return c.json(result);
   });
 
   app.get("/api/version", (c) =>
@@ -209,7 +230,46 @@ export function createApp(ctx: AppContext): Hono {
 
   app.get("/api/inbox", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
-    return c.json({ inbox: await ctx.store.listInbox() });
+    const rejected = c.req.query("status") === "rejected";
+    const offset = Math.max(0, Number(c.req.query("offset") ?? 0) || 0);
+    const items = await ctx.store.listInbox(200, rejected ? "rejected" : "proposed", offset);
+    const inbox = await Promise.all(items.map(async (item) => ({
+      ...item,
+      title: rejected ? "已拒收材料" : item.title,
+      body: rejected ? "[REDACTED:rejected]" : item.body,
+      hits: await ctx.store.inboxHitTypes(item.id),
+    })));
+    return c.json({ inbox, hasMore: items.length === 200 });
+  });
+
+  app.post("/api/history/prune", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    return c.json({ ok: true, ...await ctx.store.pruneHistory() });
+  });
+
+  app.get("/api/distill/tasks", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    // 审核前刷新草稿过期状态：只检查已有草稿的作用域，且限定次数
+    const drafts = await ctx.store.pendingDrafts();
+    for (const draft of drafts.slice(0, 50)) await ctx.distillJob.markStaleIfChanged(draft);
+    return c.json({
+      tasks: await ctx.distillJob.tasks(),
+      provider: ctx.config.distill.provider,
+      model: ctx.config.distill.model,
+    });
+  });
+
+  app.post("/api/distill/draft", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json()) as { scopeKind?: string; scopeId?: string };
+    if (!body.scopeKind) return c.json({ error: "scopeKind required" }, 400);
+    return c.json(await ctx.distillJob.generateDraft(body.scopeKind, body.scopeId ?? "", "admin"));
+  });
+
+  app.post("/api/distill/draft/:id/discard", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const ok = await ctx.distillJob.discardDraft(c.req.param("id"), "admin");
+    return c.json({ ok }, ok ? 200 : 404);
   });
 
   app.post("/api/inbox", async (c) => {

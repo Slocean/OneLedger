@@ -14,7 +14,8 @@ pub fn silent_command(program: &str) -> Command {
 
 pub const APP_VERSION: &str = "0.4.7";
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
-pub const DATA_SCHEMA_VERSION: i64 = 3;
+pub const DATA_SCHEMA_VERSION: i64 = 6;
+pub const SCAN_RULES_VERSION: i64 = 1;
 pub const PROTOCOL_VERSION: i32 = 1;
 
 pub fn now_iso() -> String {

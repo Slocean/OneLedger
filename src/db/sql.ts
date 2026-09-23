@@ -60,6 +60,13 @@ export const INIT_SQL = `
     inbox_id TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS redaction_archive (
+    day TEXT NOT NULL,
+    hit_type TEXT NOT NULL,
+    count INTEGER NOT NULL,
+    PRIMARY KEY (day, hit_type)
+  );
+
   CREATE TABLE IF NOT EXISTS sync_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -67,4 +74,6 @@ export const INIT_SQL = `
 
   CREATE INDEX IF NOT EXISTS memories_status_updated ON memories(status, updated_at);
   CREATE INDEX IF NOT EXISTS memories_hash ON memories(content_hash);
+  CREATE INDEX IF NOT EXISTS redactions_at ON redaction_events(at);
+  CREATE INDEX IF NOT EXISTS inbox_dedupe_prefix ON inbox(source, scope_kind, scope_id, substr(body, 1, 128));
 `;

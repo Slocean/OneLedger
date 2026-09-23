@@ -1,6 +1,7 @@
 export const APP_VERSION = "0.4.7";
 export const CONFIG_SCHEMA_VERSION = 1;
-export const DATA_SCHEMA_VERSION = 3;
+export const DATA_SCHEMA_VERSION = 6;
+export const SCAN_RULES_VERSION = 1;
 export const PROTOCOL_VERSION = 1;
 
 export type StorageDriver = "sqlite" | "postgres";
@@ -120,6 +121,7 @@ export interface ApiKeyRecord {
 export interface ScanHit {
   type: string;
   level: Sensitivity;
+  line?: number;
 }
 
 export interface ScanResult {

@@ -36,19 +36,23 @@ export const api = {
     }>("/api/status"),
   config: () => request<Record<string, unknown>>("/api/config"),
   saveConfig: (body: unknown) => request<{ ok: boolean }>("/api/config", { method: "PUT", body: JSON.stringify(body) }),
-  memories: () => request<{ memories: Memory[] }>("/api/memories"),
+  memories: (scope?: { scopeKind: string; scopeId?: string }) =>
+    request<{ memories: Memory[] }>(scope
+      ? `/api/memories?${new URLSearchParams({ scopeKind: scope.scopeKind, scopeId: scope.scopeId ?? "" })}`
+      : "/api/memories"),
   exportMemories: () =>
     request<{ name: string; version: string; exportedAt: string; count: number; memories: Memory[] }>(
       "/api/memories/export",
     ),
-  remember: (body: string, opts?: { title?: string; scopeKind?: string; scopeId?: string }) =>
-    request<{ inboxId: string; memoryId?: string; redacted: boolean; queued: boolean }>("/api/remember", {
+  remember: (body: string, opts?: { title?: string; scopeKind?: string; scopeId?: string; expectedRev?: number }) =>
+    request<{ status: string; inboxId: string; memoryId?: string; redacted: boolean; queued: boolean; currentRev?: number; hits?: Array<{ type: string; field?: string; line?: number }> }>("/api/remember", {
       method: "POST",
       body: JSON.stringify({
         body,
         title: opts?.title,
         scopeKind: opts?.scopeKind,
         scopeId: opts?.scopeId,
+        expectedRev: opts?.expectedRev,
       }),
     }),
   queueCustom: (body: string, title?: string) =>
@@ -57,6 +61,11 @@ export const api = {
       body: JSON.stringify({ body, title }),
     }),
   reject: (id: string) => request<{ ok: boolean }>(`/api/inbox/${id}/reject`, { method: "POST" }),
+  resolveInbox: (ids: string[], body: string, title: string, expectedRev: number) =>
+    request<{ status: string; currentRev?: number; hits?: Array<{ type: string; field?: string; line?: number }> }>("/api/inbox/resolve", {
+      method: "POST",
+      body: JSON.stringify({ ids, body, title, expectedRev }),
+    }),
   updates: () => {
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 20000);
@@ -68,7 +77,15 @@ export const api = {
     request<{ ok: boolean; message?: string; error?: string; html_url?: string }>("/api/updates/install", {
       method: "POST",
     }),
-  inbox: () => request<{ inbox: Inbox[] }>("/api/inbox"),
+  inbox: (status: "proposed" | "rejected" = "proposed", offset = 0) => request<{ inbox: Inbox[]; hasMore: boolean }>(`/api/inbox?status=${status}&offset=${offset}`),
+  pruneHistory: () => request<{ ok: boolean; archivedEvents: number; removedRejected: number }>("/api/history/prune", { method: "POST" }),
+  distillTasks: () => request<{ tasks: DistillTask[]; provider: string; model: string }>("/api/distill/tasks"),
+  distillDraft: (scopeKind: string, scopeId: string) =>
+    request<{ status: string; draft?: DistillDraft; error?: string; blocked?: string[]; attempts?: number }>("/api/distill/draft", {
+      method: "POST",
+      body: JSON.stringify({ scopeKind, scopeId }),
+    }),
+  discardDraft: (id: string) => request<{ ok: boolean }>(`/api/distill/draft/${id}/discard`, { method: "POST" }),
   audit: () => request<{ audit: Audit[]; redactions: Redaction[] }>("/api/audit"),
   collect: () => request<{ results: Collect[] }>("/api/collect", { method: "POST" }),
   agents: () => request<{ agents: AgentRow[] }>("/api/agents"),
@@ -114,6 +131,37 @@ export interface Inbox {
   createdAt: string;
   queueStatus: string;
   conflictIds: string[];
+  hits?: string[];
+}
+
+export interface DistillDraft {
+  id: string;
+  scopeKind: string;
+  scopeId: string;
+  title: string;
+  body: string;
+  sourceIds: string[];
+  sourceFingerprints: string[];
+  expectedRev: number;
+  provider: string;
+  model: string;
+  status: string;
+  staleReason: string;
+  error: string;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DistillTask {
+  scopeKind: string;
+  scopeId: string;
+  pending: number;
+  oldestWaitingAt?: string;
+  highSignal: number;
+  sources: Array<{ id: string; title: string; source: string; sensitivity: string; createdAt: string; redacted: boolean }>;
+  draft?: DistillDraft;
+  lastResult?: { status: string; error: string; attempts: number; at: string };
 }
 
 export interface Audit {

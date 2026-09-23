@@ -13,13 +13,15 @@ import { ensureAgents, runCollectors } from "./collect/runner.js";
 import { syncWithRemote } from "./sync/engine.js";
 import { APP_VERSION } from "./types.js";
 import { configPath, homeDir } from "./paths.js";
+import { DistillJobService } from "./memory/distillJob.js";
 
 async function boot() {
   const config = loadConfig();
   const db = await openDb(config);
   const store = new Store(db);
   const service = new MemoryService(store, config);
-  return { config, db, store, service };
+  const distillJob = new DistillJobService(store, config);
+  return { config, db, store, service, distillJob };
 }
 
 async function ensureDefaultKey(service: MemoryService, store: Store): Promise<void> {
@@ -48,6 +50,7 @@ async function serveCmd(): Promise<void> {
     config: loadConfig(),
     store: undefined as unknown as Store,
     service: undefined as unknown as MemoryService,
+    distillJob: undefined as unknown as DistillJobService,
     reload: async () => undefined,
     collectProgress,
   };
@@ -59,8 +62,8 @@ async function serveCmd(): Promise<void> {
     ctx.config = bootstrapped.config;
     ctx.store = bootstrapped.store;
     ctx.service = bootstrapped.service;
+    ctx.distillJob = bootstrapped.distillJob;
     await ensureDefaultKey(ctx.service, ctx.store);
-    await ctx.service.retireNonDistilled();
     await ensureAgents(ctx.store, ctx.config);
   };
 

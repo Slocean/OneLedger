@@ -2,6 +2,7 @@ mod collect;
 mod config;
 mod db;
 mod distill;
+mod distill_job;
 mod http;
 mod instance;
 mod models;
@@ -67,7 +68,6 @@ fn admin_token() -> String {
 
 fn ensure_default_key(state: &AppState) {
     let conn = state.conn.lock().unwrap();
-    let _ = MemoryService::retire_non_distilled(&conn);
     if store::list_keys(&conn).map(|keys| keys.is_empty()).unwrap_or(true) {
         let issued = MemoryService::issue_key(&conn, "default-agent");
         if let Some(token) = issued.get("token").and_then(|v| v.as_str()) {

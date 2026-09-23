@@ -84,13 +84,18 @@ pub fn router(state: AppState) -> Router {
         .route("/api/memories/export", get(export_memories))
         .route("/api/remember", post(remember))
         .route("/api/inbox/:id/reject", post(reject))
+        .route("/api/inbox/resolve", post(resolve_inbox))
         .route("/api/version", get(version))
         .route("/api/updates", get(updates))
         .route("/api/updates/download", post(download_update))
         .route("/api/updates/apply", post(apply_update))
         .route("/api/updates/install", post(install_update))
         .route("/api/inbox", get(inbox).post(create_inbox))
+        .route("/api/distill/tasks", get(distill_tasks))
+        .route("/api/distill/draft", post(distill_draft))
+        .route("/api/distill/draft/:id/discard", post(discard_draft))
         .route("/api/audit", get(audit))
+        .route("/api/history/prune", post(prune_history))
         .route("/api/agents", get(agents).post(create_agent))
         .route("/api/agents/:id", put(update_agent).delete(delete_agent))
         .route("/api/agents/:id/collect", post(collect_one))
@@ -235,12 +240,19 @@ fn merge_patch(next: &mut Config, patch: &serde_json::Value, current: &Config) {
     }
 }
 
-async fn memories(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeParams {
+    scope_kind: Option<String>,
+    scope_id: Option<String>,
+}
+
+async fn memories(State(state): State<AppState>, headers: HeaderMap, Query(scope): Query<ScopeParams>) -> Response {
     let config = state.config.lock().unwrap().clone();
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
-    let list = MemoryService::list(&state.conn.lock().unwrap(), 100, None, None);
+    let list = MemoryService::list(&state.conn.lock().unwrap(), 100, scope.scope_kind.as_deref(), scope.scope_id.as_deref());
     Json(serde_json::json!({ "memories": list })).into_response()
 }
 
@@ -268,6 +280,7 @@ struct RememberBody {
     scope_kind: Option<String>,
     scope_id: Option<String>,
     promote: Option<bool>,
+    expected_rev: Option<i64>,
 }
 
 async fn remember(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<RememberBody>) -> Response {
@@ -288,6 +301,7 @@ async fn remember(State(state): State<AppState>, headers: HeaderMap, Json(body):
         body.scope_id.as_deref(),
         "admin",
         body.promote.unwrap_or(false),
+        body.expected_rev,
     );
     Json(result).into_response()
 }
@@ -299,6 +313,36 @@ async fn reject(State(state): State<AppState>, headers: HeaderMap, Path(id): Pat
     }
     let ok = MemoryService::reject_inbox(&state.conn.lock().unwrap(), &id, "admin");
     (if ok { StatusCode::OK } else { StatusCode::NOT_FOUND }, Json(serde_json::json!({ "ok": ok }))).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveInboxBody {
+    ids: Vec<String>,
+    body: String,
+    title: Option<String>,
+    expected_rev: Option<i64>,
+}
+
+async fn resolve_inbox(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<ResolveInboxBody>) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    if body.ids.is_empty() || body.body.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "ids and body required"}))).into_response();
+    }
+    let conn = state.conn.lock().unwrap();
+    let result = MemoryService::confirm_sources(
+        &conn,
+        &config,
+        &body.ids,
+        &body.body,
+        body.title.as_deref(),
+        "admin",
+        body.expected_rev,
+    );
+    Json(result).into_response()
 }
 
 async fn version() -> impl IntoResponse {
@@ -390,17 +434,84 @@ async fn create_inbox(State(state): State<AppState>, headers: HeaderMap, Json(bo
         None,
         "admin",
         false,
+        None,
     );
     Json(result).into_response()
 }
 
-async fn inbox(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+struct InboxParams {
+    status: Option<String>,
+    offset: Option<i64>,
+}
+
+async fn inbox(State(state): State<AppState>, headers: HeaderMap, Query(params): Query<InboxParams>) -> Response {
     let config = state.config.lock().unwrap().clone();
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
-    let items = store::list_inbox(&state.conn.lock().unwrap()).unwrap_or_default();
-    Json(serde_json::json!({ "inbox": items })).into_response()
+    let rejected = params.status.as_deref() == Some("rejected");
+    let conn = state.conn.lock().unwrap();
+    let items = store::list_inbox_status(&conn, if rejected { "rejected" } else { "proposed" }, 200, params.offset.unwrap_or(0).max(0)).unwrap_or_default();
+    let has_more = items.len() == 200;
+    let safe_items: Vec<serde_json::Value> = items.into_iter().map(|mut item| {
+        let hits = store::inbox_hit_types(&conn, &item.id).unwrap_or_default();
+        if rejected {
+            item.title = "已拒收材料".into();
+            item.body = "[REDACTED:rejected]".into();
+        }
+        let mut value = serde_json::to_value(item).unwrap_or_default();
+        value["hits"] = serde_json::json!(hits);
+        value
+    }).collect();
+    Json(serde_json::json!({ "inbox": safe_items, "hasMore": has_more })).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DistillScopeBody {
+    scope_kind: String,
+    scope_id: Option<String>,
+}
+
+async fn distill_tasks(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let conn = state.conn.lock().unwrap();
+    // 审核前刷新草稿过期状态：只检查已有草稿的作用域，且限定次数
+    let drafts = crate::distill_job::pending_drafts(&conn).unwrap_or_default();
+    for draft in drafts.iter().take(50) {
+        let _ = crate::distill_job::mark_stale_if_changed(&conn, draft);
+    }
+    let items = crate::distill_job::tasks(&conn).unwrap_or_default();
+    Json(serde_json::json!({
+        "tasks": items,
+        "provider": config.distill.provider,
+        "model": config.distill.model,
+    }))
+    .into_response()
+}
+
+async fn distill_draft(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<DistillScopeBody>) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let scope_id = body.scope_id.unwrap_or_default();
+    let conn = state.conn.lock().unwrap();
+    let result = crate::distill_job::generate_draft(&conn, &config, &body.scope_kind, &scope_id, "admin");
+    Json(result).into_response()
+}
+
+async fn discard_draft(State(state): State<AppState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let ok = crate::distill_job::discard_draft(&state.conn.lock().unwrap(), &id, "admin");
+    (if ok { StatusCode::OK } else { StatusCode::NOT_FOUND }, Json(serde_json::json!({ "ok": ok }))).into_response()
 }
 
 async fn audit(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -414,6 +525,17 @@ async fn audit(State(state): State<AppState>, headers: HeaderMap) -> Response {
         "redactions": store::list_redactions(&conn).unwrap_or_default()
     }))
     .into_response()
+}
+
+async fn prune_history(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    match store::prune_history(&state.conn.lock().unwrap()) {
+        Ok((events, rejected)) => Json(serde_json::json!({"ok": true, "archivedEvents": events, "removedRejected": rejected})).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "history cleanup failed"}))).into_response(),
+    }
 }
 
 async fn agents(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -660,20 +782,40 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
             || (name == "memory.get" && (permitted.contains(&"memory.list") || permitted.contains(&"memory.search")))
     };
     match method {
-        "initialize" => serde_json::json!({
+        "initialize" => {
+            let project_scope = payload["params"]["projectScopeId"].as_str()
+                .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains('\\'));
+            let index = if tool_ok("memory.list") || tool_ok("memory.search") {
+                let conn = state.conn.lock().unwrap();
+                let mut items = store::list_memories(&conn, 12, Some("global"), None).unwrap_or_default();
+                if let Some(scope) = project_scope {
+                    items.extend(store::list_memories(&conn, 12, Some("project"), Some(scope)).unwrap_or_default());
+                }
+                items.into_iter()
+                    .filter(|item| item.sensitivity == "public" || (item.sensitivity == "internal" && config.security.allow_internal_in_search))
+                    .map(|item| format!("{}:{} [{} rev {}]", item.scope_kind, item.scope_id, item.title, item.rev))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            } else {
+                String::new()
+            };
+            let instructions = format!("OneLedger stores distilled scope documents. At task start, call memory.get with scopeKind=project and scopeId=repository name, plus global if useful. Read rev before replacing a scope and pass expectedRev to memory.remember. Available index: {index}");
+            serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "oneledger", "version": APP_VERSION }
+                "serverInfo": { "name": "oneledger", "version": APP_VERSION },
+                "instructions": instructions
             }
-        }),
+        })
+        },
         "notifications/initialized" | "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
         "tools/list" => {
             let all = [
                 ("memory.search", "Search durable shared memories. Results never include secret-classified text. Filter with scopeKind and scopeId (repository name).", serde_json::json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"number"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"}},"required":["query"]})),
-                ("memory.remember", "Replace the distilled write-up for this scope. Send the full refined text after you distilled the source material, not one fact per call. Same scope overwrites the previous document. OneLedger does not summarize. Secrets are redacted and never recalled.", serde_json::json!({"type":"object","properties":{"body":{"type":"string"},"title":{"type":"string"},"scopeKind":{"type":"string"},"scopeId":{"type":"string"}},"required":["body"]})),
+                ("memory.remember", "Replace the distilled write-up for this scope. Read the current rev first and pass expectedRev to protect concurrent edits. Same scope overwrites the previous document. OneLedger does not summarize.", serde_json::json!({"type":"object","properties":{"body":{"type":"string"},"title":{"type":"string"},"scopeKind":{"type":"string"},"scopeId":{"type":"string"},"expectedRev":{"type":"integer"}},"required":["body"]})),
                 ("memory.forget", "Remove an official distilled memory so it is no longer recalled.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})),
                 ("memory.list", "List memory titles only, without bodies. Includes scopeId. Filter with scopeKind and scopeId.", serde_json::json!({"type":"object","properties":{"limit":{"type":"number"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"}}})),
                 ("memory.get", "Read full distilled documents. Pass id, or scopeKind and/or scopeId (repository name). No dummy search query. Results never include secret-classified text.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"}}})),
@@ -713,6 +855,7 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
                     args["scopeId"].as_str(),
                     actor,
                     false,
+                    args["expectedRev"].as_i64(),
                 ),
                 "memory.forget" => serde_json::json!({ "ok": MemoryService::forget(&conn, args["id"].as_str().unwrap_or(""), actor) }),
                 "memory.get" => serde_json::to_value(MemoryService::get(
@@ -725,12 +868,12 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
                 ))
                 .unwrap_or_default(),
                 "memory.list" => {
-                    let items = MemoryService::list(
+                    let items: Vec<_> = MemoryService::list(
                         &conn,
                         args["limit"].as_i64().unwrap_or(20),
                         args["scopeKind"].as_str(),
                         args["scopeId"].as_str(),
-                    );
+                    ).into_iter().filter(|item| item.sensitivity == "public" || (item.sensitivity == "internal" && config.security.allow_internal_in_search)).collect();
                     serde_json::to_value(
                         items
                             .into_iter()

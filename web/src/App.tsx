@@ -5,6 +5,7 @@ import {
   setToken,
   type AgentRow,
   type CollectStatus,
+  type DistillTask,
   type Inbox,
   type KeyRow,
   type Memory,
@@ -30,11 +31,16 @@ function groupInbox(items: Inbox[]): Array<{ key: string; items: Inbox[] }> {
   }
   const tail = new Set(["未归属", "个人", "全局"]);
   return [...map.entries()]
-    .sort((a, b) => Number(tail.has(a[0])) - Number(tail.has(b[0])) || a[0].localeCompare(b[0], "zh"))
-    .map(([key, grouped]) => ({ key, items: grouped }));
+    .sort((a, b) => Number(b[1].some((item) => item.source.toLowerCase().includes("workbuddy"))) - Number(a[1].some((item) => item.source.toLowerCase().includes("workbuddy")))
+      || Number(tail.has(a[0])) - Number(tail.has(b[0])) || a[0].localeCompare(b[0], "zh"))
+    .map(([key, grouped]) => ({ key, items: grouped.sort((a, b) =>
+      Number(b.source.toLowerCase().includes("workbuddy")) - Number(a.source.toLowerCase().includes("workbuddy"))
+      || b.createdAt.localeCompare(a.createdAt)) }));
 }
 
 const NOTICE_KEY = "oneledger.noticeAck";
+
+type Tab = "memories" | "queue" | "agents" | "sync" | "keys" | "settings";
 
 function flavorLabel(flavor?: string) {
   if (flavor === "setup") return "安装版";
@@ -341,7 +347,7 @@ export function App() {
       </div>
       <main className="stage">
         {tab === "memories" ? <Memories refreshKey={collectEpoch} /> : null}
-        {tab === "queue" ? <QueuePanel refreshKey={collectEpoch} /> : null}
+        {tab === "queue" ? <QueueView refreshKey={collectEpoch} /> : null}
         {tab === "agents" ? <AgentsPanel refreshKey={collectEpoch} collecting={Boolean(collect?.running)} /> : null}
         {tab === "sync" ? <SyncPanel /> : null}
         {tab === "keys" ? <KeysPanel /> : null}
@@ -512,15 +518,20 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
             title: selected?.title,
             scopeKind: kind,
             scopeId: selected?.scopeId ?? scopeId,
+            expectedRev: selected?.rev ?? 0,
           });
+          const hitSummary = result.hits?.length
+            ? ` 命中：${result.hits.map((hit) => `${hit.type}${hit.field ? `（${hit.field === "title" ? "标题" : "正文"}` : ""}${hit.line ? `第 ${hit.line} 行` : ""}${hit.field ? "）" : ""}`).join("、")}。`
+            : "";
           setNote(
-            result.redacted
-              ? "已拦截敏感内容，原文没有进检索库。"
-              : result.queued
-                ? "未写入正式记忆。"
-                : "已保存。",
+            result.status === "conflict" ? `记忆已被其他写入更新到 rev ${result.currentRev}，请核对后再保存。`
+              : result.status === "rejected" ? `敏感内容被拒收，未进入记忆。${hitSummary}`
+              : result.status === "queued" ? `材料已进入待蒸馏队列。${hitSummary}`
+              : result.status === "error" ? "写入失败，请重试。"
+              : result.status === "unchanged" ? "内容没有变化。"
+              : `已保存。${hitSummary}`,
           );
-          refresh();
+          if (result.status === "stored" || result.status === "unchanged") refresh();
         }}
       >
         <label>
@@ -544,28 +555,288 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
   );
 }
 
+function ageLabel(iso?: string): string {
+  if (!iso) return "—";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return "刚刚";
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时`;
+  return `${Math.floor(hours / 24)} 天`;
+}
+
+function draftStatusLabel(status: string): string {
+  if (status === "pending") return "待审核";
+  if (status === "stale") return "已过期，需重审";
+  if (status === "failed") return "生成失败";
+  if (status === "discarded") return "已废弃";
+  return status;
+}
+
+function DistillTasks({ refreshKey = 0, onHandled }: { refreshKey?: number; onHandled?: () => void }) {
+  const [tasks, setTasks] = useState<DistillTask[]>([]);
+  const [provider, setProvider] = useState("none");
+  const [model, setModel] = useState("");
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState("");
+  const [openKey, setOpenKey] = useState("");
+  const [editing, setEditing] = useState("");
+  const [editTitle, setEditTitle] = useState("");
+  const [editBody, setEditBody] = useState("");
+  const [editRev, setEditRev] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [visible, setVisible] = useState(20);
+  const [filter, setFilter] = useState("");
+
+  const refresh = () =>
+    void api.distillTasks().then((data) => {
+      setTasks(data.tasks);
+      setProvider(data.provider);
+      setModel(data.model);
+    });
+  useEffect(() => {
+    void refresh();
+  }, [refreshKey]);
+
+  const key = (task: DistillTask) => `${task.scopeKind}\u0000${task.scopeId}`;
+  const scopeLabel = (task: DistillTask) =>
+    task.scopeKind === "project" && task.scopeId ? task.scopeId : task.scopeKind === "personal" ? "个人" : "全局";
+
+  const openEditor = async (task: DistillTask) => {
+    setOpenKey(key(task));
+    setEditing(key(task));
+    setNote("");
+    if (task.draft && task.draft.status !== "stale" && task.draft.status !== "discarded") {
+      setEditTitle(task.draft.title);
+      setEditBody(task.draft.body);
+      setEditRev(task.draft.expectedRev);
+      return;
+    }
+    const { memories } = await api.memories({ scopeKind: task.scopeKind, scopeId: task.scopeId });
+    const current = memories[0];
+    setEditTitle(current?.title ?? "");
+    setEditBody(current?.body ?? "");
+    setEditRev(current?.rev ?? 0);
+  };
+
+  const submitEdit = async (task: DistillTask) => {
+    setSaving(true);
+    try {
+      const ids = task.draft && task.draft.status === "pending" ? task.draft.sourceIds : task.sources.map((item) => item.id);
+      const result = await api.resolveInbox(ids, editBody.trim(), editTitle.trim(), editRev);
+      if (result.status === "stored" || result.status === "unchanged") {
+        setEditing("");
+        setOpenKey("");
+        setNote(`${scopeLabel(task)} 已写入正式记忆，材料已处理。`);
+        refresh();
+        onHandled?.();
+      } else if (result.status === "conflict") {
+        setNote(`作用域已更新到 rev ${result.currentRev}，请重新生成草稿或核对后再写入。`);
+        refresh();
+      } else {
+        setNote(`写入未成功：${result.status}。`);
+      }
+    } catch (error) {
+      setNote(`写入失败：${String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const needle = filter.trim().toLowerCase();
+  const matched = needle ? tasks.filter((task) => scopeLabel(task).toLowerCase().includes(needle)) : tasks;
+  const shown = matched.slice(0, visible);
+  const totalPending = tasks.reduce((sum, task) => sum + task.pending, 0);
+
+  if (!tasks.length) {
+    return <p className="muted">没有待蒸馏任务。采集到新材料后会自动出现在这里。</p>;
+  }
+  return (
+    <div className="list">
+      <p className="muted">
+        {tasks.length} 个作用域、共 {totalPending} 条待蒸馏材料。模型提供方：
+        <b>{provider === "none" ? " 未配置（手工整理正文）" : ` ${provider}${model ? ` · ${model}` : ""}`}</b>
+      </p>
+      {note ? <p className="ok">{note}</p> : null}
+      {tasks.length > 20 ? (
+        <label>
+          筛选作用域
+          <input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="输入仓库名片段" />
+        </label>
+      ) : null}
+      {shown.map((task) => {
+        const open = openKey === key(task);
+        const draft = task.draft;
+        return (
+          <article className={`item queue-item${open ? " is-open" : ""}`} key={key(task)}>
+            <h3>
+              {scopeLabel(task)}
+              <span className="muted">
+                {" "}
+                · 待处理 {task.pending} 条 · 最旧等待 {ageLabel(task.oldestWaitingAt)}
+                {task.highSignal ? ` · 高信号 ${task.highSignal} 条` : ""}
+              </span>
+            </h3>
+            {draft ? (
+              <p className="muted">
+                草稿 {draftStatusLabel(draft.status)} · 生成于 {draft.updatedAt} · 尝试 {draft.attempts} 次
+                {draft.staleReason ? ` · ${draft.staleReason}` : ""}
+                {draft.error ? ` · ${draft.error}` : ""}
+              </p>
+            ) : (
+              <p className="muted">尚无草稿。{provider === "none" ? "可直接手工整理整篇摘要。" : "可生成模型草稿后审核。"}</p>
+            )}
+            <div className="row">
+              <button type="button" className={open ? "active" : ""} onClick={() => (open ? setOpenKey("") : void openEditor(task))}>
+                {open ? "收起" : "审核 / 整理"}
+              </button>
+              {provider !== "none" ? (
+                <button
+                  type="button"
+                  disabled={busy === key(task)}
+                  onClick={async () => {
+                    setBusy(key(task));
+                    setNote("");
+                    try {
+                      const result = await api.distillDraft(task.scopeKind, task.scopeId);
+                      if (result.status === "pending") setNote(`${scopeLabel(task)} 草稿已生成，请审核后再写入。`);
+                      else if (result.status === "failed") setNote(`草稿生成失败：${result.error ?? ""}`);
+                      else setNote(`未生成草稿：${result.error ?? result.status}`);
+                      refresh();
+                    } finally {
+                      setBusy("");
+                    }
+                  }}
+                >
+                  {busy === key(task) ? "生成中…" : draft ? "重新生成草稿" : "生成草稿"}
+                </button>
+              ) : null}
+              {draft && draft.status !== "discarded" ? (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await api.discardDraft(draft.id);
+                    setNote("草稿已废弃，来源材料保持待处理。");
+                    refresh();
+                  }}
+                >
+                  废弃草稿
+                </button>
+              ) : null}
+            </div>
+            {open ? (
+              <div className="form">
+                <p className="muted">来源材料 {task.sources.length} 条（已按高信号优先排列）；写入成功后这些材料会从队列移除。</p>
+                <ul className="muted">
+                  {task.sources.slice(0, 8).map((item) => (
+                    <li key={item.id}>
+                      {item.source} · {item.title}
+                      {item.redacted ? " · 已脱敏" : ""}
+                    </li>
+                  ))}
+                </ul>
+                {draft?.status === "stale" ? <p className="error">草稿已过期：{draft.staleReason}。请重新生成或手工整理。</p> : null}
+                {editing === key(task) ? (
+                  <>
+                    <label>
+                      标题
+                      <input value={editTitle} onChange={(event) => setEditTitle(event.target.value)} />
+                    </label>
+                    <label>
+                      蒸馏后的整篇正文
+                      <textarea rows={12} value={editBody} onChange={(event) => setEditBody(event.target.value)} />
+                    </label>
+                    <button className="primary" disabled={saving || !editBody.trim()} onClick={() => void submitEdit(task)}>
+                      {saving ? "写入中…" : "确认写入"}
+                    </button>
+                  </>
+                ) : (
+                  <button type="button" onClick={() => void openEditor(task)}>
+                    打开编辑
+                  </button>
+                )}
+              </div>
+            ) : null}
+          </article>
+        );
+      })}
+      {matched.length > shown.length ? (
+        <button type="button" onClick={() => setVisible((value) => value + 20)}>
+          显示更多（还有 {matched.length - shown.length} 个作用域）
+        </button>
+      ) : null}
+      {needle && !matched.length ? <p className="muted">没有匹配「{filter}」的作用域。</p> : null}
+    </div>
+  );
+}
+
+function QueueView({ refreshKey = 0 }: { refreshKey?: number }) {
+  const [view, setView] = useState<"tasks" | "materials">("tasks");
+  const [epoch, setEpoch] = useState(0);
+  return (
+    <div className="list">
+      <nav className="tabs subtabs" aria-label="蒸馏视图">
+        <button type="button" className={view === "tasks" ? "active" : ""} onClick={() => setView("tasks")}>
+          待蒸馏任务
+        </button>
+        <button type="button" className={view === "materials" ? "active" : ""} onClick={() => setView("materials")}>
+          材料明细
+        </button>
+      </nav>
+      {view === "tasks" ? (
+        <DistillTasks refreshKey={refreshKey + epoch} onHandled={() => setEpoch((value) => value + 1)} />
+      ) : (
+        <QueuePanel refreshKey={refreshKey + epoch} />
+      )}
+    </div>
+  );
+}
+
 function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
   const [inbox, setInbox] = useState<Inbox[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [queueStatus, setQueueStatus] = useState<"proposed" | "rejected">("proposed");
   const [openId, setOpenId] = useState<string>("");
   const [adding, setAdding] = useState(false);
   const [customTitle, setCustomTitle] = useState("");
   const [customBody, setCustomBody] = useState("");
   const [note, setNote] = useState("");
-  const refresh = () => void api.inbox().then((data) => setInbox(data.inbox));
+  const [draftFor, setDraftFor] = useState("");
+  const [draftBody, setDraftBody] = useState("");
+  const [draftTitle, setDraftTitle] = useState("");
+  const [draftRev, setDraftRev] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const refresh = () => void api.inbox(queueStatus).then((data) => { setInbox(data.inbox); setHasMore(data.hasMore); });
   useEffect(() => {
     void refresh();
-  }, [refreshKey]);
+  }, [refreshKey, queueStatus]);
   const groups = groupInbox(inbox);
   return (
     <div className="list">
-      <p className="muted">
-        这里只放待蒸馏的原文，按仓库名收拢。Agent 读完后用 memory.remember 写入「记忆」。本程序不摘要。
-      </p>
+      <p className="muted">{queueStatus === "proposed"
+        ? "待蒸馏材料按仓库名收拢。整理整篇记忆并确认写入后，材料才会从队列移除。"
+        : "这里显示已拒收材料的来源与命中规则。正文不展示；可清理 90 天前的记录。"}</p>
       <div className="row">
+        <button type="button" className={queueStatus === "proposed" ? "active" : ""} onClick={() => setQueueStatus("proposed")}>待蒸馏</button>
+        <button type="button" className={queueStatus === "rejected" ? "active" : ""} onClick={() => setQueueStatus("rejected")}>已拒收</button>
+      </div>
+      {queueStatus === "rejected" ? <button type="button" onClick={async () => {
+        if (!window.confirm("清理 90 天前的拒收记录，并将过期脱敏事件汇总归档？")) return;
+        try {
+          const result = await api.pruneHistory();
+          setNote(`已清理 ${result.removedRejected} 条拒收记录，归档 ${result.archivedEvents} 条脱敏事件。`);
+          refresh();
+        } catch (error) {
+          setNote(`清理失败：${String(error)}`);
+        }
+      }}>清理 90 天前记录</button> : null}
+      {queueStatus === "proposed" ? <div className="row">
         <button type="button" onClick={() => setAdding((open) => !open)}>
           添加自定义
         </button>
-      </div>
+      </div> : null}
       {adding ? (
         <form
           className="form"
@@ -594,7 +865,7 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
         </form>
       ) : null}
       {note ? <p className="ok">{note}</p> : null}
-      {inbox.length === 0 && !adding ? <p className="muted">队列是空的。</p> : null}
+      {inbox.length === 0 && !adding ? <p className="muted">{queueStatus === "rejected" ? "暂无拒收记录。" : "队列是空的。"}</p> : null}
       {groups.map((group) => (
         <details className="queue-group" key={group.key} open={groups.length <= 3}>
           <summary>
@@ -615,12 +886,41 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
                   {item.source}
                   {item.scopeId ? ` · ${item.scopeId}` : ""}
                   {item.sensitivity && item.sensitivity !== "public" ? ` · ${item.sensitivity}` : ""}
+                  {item.source.toLowerCase().includes("workbuddy") ? " · 高信号" : ""}
+                  {item.hits?.length ? ` · 命中 ${item.hits.join("、")}` : ""}
                 </p>
                 {open ? (
                   <>
                     <p>{item.body}</p>
                     <p className="muted">{item.createdAt}</p>
                     <div className="row" onClick={(event) => event.stopPropagation()}>
+                      {queueStatus === "proposed" ? <label>
+                        <input type="checkbox" checked={selectedIds.includes(item.id)} onChange={(event) => {
+                          if (!event.target.checked) {
+                            setSelectedIds((ids) => ids.filter((id) => id !== item.id));
+                          } else {
+                            setSelectedIds((ids) => {
+                              const sameScope = ids.filter((id) => inbox.some((candidate) => candidate.id === id && candidate.scopeKind === item.scopeKind && candidate.scopeId === item.scopeId));
+                              return [...sameScope, item.id];
+                            });
+                          }
+                        }} />
+                        选入本次蒸馏
+                      </label> : null}
+                      {queueStatus === "proposed" ? <button
+                        onClick={async () => {
+                          const { memories } = await api.memories({ scopeKind: item.scopeKind ?? "personal", scopeId: item.scopeId });
+                          const current = memories[0];
+                          setDraftFor(item.id);
+                          setDraftBody(current?.body ?? "");
+                          setDraftTitle(current?.title ?? item.title);
+                          setDraftRev(current?.rev ?? 0);
+                          setSelectedIds((ids) => ids.includes(item.id) ? ids : [item.id]);
+                          setNote("");
+                        }}
+                      >
+                        蒸馏写入
+                      </button> : null}
                       <button
                         onClick={async () => {
                           await api.reject(item.id);
@@ -631,6 +931,34 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
                         丢弃
                       </button>
                     </div>
+                    {queueStatus === "proposed" && draftFor === item.id ? (
+                      <div className="form" onClick={(event) => event.stopPropagation()}>
+                        <p className="muted">请根据已选的 {selectedIds.length} 条同作用域材料整理完整记忆。成功写入后，这些材料会从待蒸馏队列移除。</p>
+                        <label>标题<input value={draftTitle} onChange={(event) => setDraftTitle(event.target.value)} /></label>
+                        <label>蒸馏后的正文<textarea rows={12} value={draftBody} onChange={(event) => setDraftBody(event.target.value)} /></label>
+                        <button className="primary" disabled={saving || !draftBody.trim()} onClick={async () => {
+                          setSaving(true);
+                          try {
+                            const result = await api.resolveInbox(selectedIds.length ? selectedIds : [item.id], draftBody.trim(), draftTitle.trim(), draftRev);
+                            if (result.status === "stored" || result.status === "unchanged") {
+                              setDraftFor("");
+                              setOpenId("");
+                              setSelectedIds([]);
+                              setNote("记忆已保存，材料已处理。");
+                              refresh();
+                            } else if (result.status === "conflict") {
+                              setNote(`记忆已更新到 rev ${result.currentRev}，请核对后再写入。`);
+                            } else {
+                              setNote(`写入未成功：${result.status}。`);
+                            }
+                          } catch (error) {
+                            setNote(`写入失败：${String(error)}`);
+                          } finally {
+                            setSaving(false);
+                          }
+                        }}>确认写入</button>
+                      </div>
+                    ) : null}
                   </>
                 ) : (
                   <p className="preview">{preview.length > 72 ? `${preview.slice(0, 72)}…` : preview || "（无正文）"}</p>
@@ -640,6 +968,11 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
           })}
         </details>
       ))}
+      {hasMore ? <button type="button" onClick={async () => {
+        const data = await api.inbox(queueStatus, inbox.length);
+        setInbox((items) => [...items, ...data.inbox.filter((item) => !items.some((old) => old.id === item.id))]);
+        setHasMore(data.hasMore);
+      }}>加载更多材料</button> : null}
     </div>
   );
 }

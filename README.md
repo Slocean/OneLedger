@@ -43,7 +43,7 @@ npm run dev
 
 HTTP：管理台签发 Agent 密钥后，`url` 为 `http://127.0.0.1:7443/mcp`，`Authorization: Bearer ol_...`。
 
-工具：`memory.search` / `memory.remember` / `memory.forget` / `memory.list` / `memory.get`。secret 级内容不会进入可检索记忆，也不会同步到远端。
+工具：`memory.search` / `memory.remember` / `memory.forget` / `memory.list` / `memory.get`。覆盖已有作用域时先读取 `rev`，再在 `memory.remember` 中传入 `expectedRev`；版本不一致会返回 `conflict`。完整识别的凭据只以脱敏占位符写入；无法安全脱敏的材料会拒收，原始 secret 不进入可检索记忆，也不会同步到远端。
 
 ## 运行模式
 
