@@ -1,4 +1,4 @@
-export const APP_VERSION = "0.4.7";
+export const APP_VERSION = "0.4.8";
 export const CONFIG_SCHEMA_VERSION = 1;
 export const DATA_SCHEMA_VERSION = 6;
 export const SCAN_RULES_VERSION = 1;

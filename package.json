@@ -1,6 +1,6 @@
 {
   "name": "oneledger",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "private": true,
   "type": "module",
   "description": "Self-hosted shared memory ledger for coding agents, exposed over MCP.",

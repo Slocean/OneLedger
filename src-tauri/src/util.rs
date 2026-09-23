@@ -12,7 +12,7 @@ pub fn silent_command(program: &str) -> Command {
     cmd
 }
 
-pub const APP_VERSION: &str = "0.4.7";
+pub const APP_VERSION: &str = "0.4.8";
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DATA_SCHEMA_VERSION: i64 = 6;
 pub const SCAN_RULES_VERSION: i64 = 1;
