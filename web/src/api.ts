@@ -98,7 +98,7 @@ export const api = {
   sync: () => request<SyncReport>("/api/sync", { method: "POST" }),
   keys: () => request<{ keys: KeyRow[] }>("/api/keys"),
   createKey: (name: string) =>
-    request<{ token: string; name: string }>("/api/keys", { method: "POST", body: JSON.stringify({ name }) }),
+    request<{ id: string; token: string; name: string }>("/api/keys", { method: "POST", body: JSON.stringify({ name }) }),
 };
 
 declare global {
@@ -109,11 +109,15 @@ declare global {
   }
 }
 
-function vaultInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+function desktopInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const invoke = window.__TAURI_INTERNALS__?.invoke;
-  if (!invoke) return Promise.reject(new Error("凭据空间只能在 OneLedger 的 Tauri 窗口中使用"));
+  if (!invoke) return Promise.reject(new Error("此操作只能在 OneLedger 的 Tauri 窗口中使用"));
   return invoke<T>(command, args);
 }
+
+export const keyApi = {
+  reveal: (id: string) => desktopInvoke<string>("key_reveal", { id }),
+};
 
 export interface VaultItem {
   id: string;
@@ -125,11 +129,13 @@ export interface VaultItem {
 }
 
 export const vaultApi = {
-  list: () => vaultInvoke<VaultItem[]>("vault_list"),
-  put: (input: { id?: string; label: string; scopeKind: VaultItem["scopeKind"]; scopeId: string; value: string }) =>
-    vaultInvoke<VaultItem>("vault_put", { input }),
-  reveal: (id: string) => vaultInvoke<string>("vault_reveal", { id }),
-  delete: (id: string) => vaultInvoke<void>("vault_delete", { id }),
+  list: () => desktopInvoke<VaultItem[]>("vault_list"),
+  put: (input: { id?: string; label: string; scopeKind: VaultItem["scopeKind"]; scopeId: string; value: string; expectedUpdatedAt?: string }) =>
+    desktopInvoke<VaultItem>("vault_put", { input }),
+  organize: (input: { id: string; label: string; scopeKind: VaultItem["scopeKind"]; scopeId: string; expectedUpdatedAt: string }) =>
+    desktopInvoke<VaultItem>("vault_organize", { input }),
+  reveal: (id: string) => desktopInvoke<string>("vault_reveal", { id }),
+  delete: (id: string) => desktopInvoke<void>("vault_delete", { id }),
 };
 
 export interface CollectStatus {
@@ -262,4 +268,5 @@ export interface KeyRow {
   tokenPrefix: string;
   tools: string;
   createdAt: string;
+  recoverable: boolean;
 }

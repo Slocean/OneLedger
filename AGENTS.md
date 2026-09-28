@@ -37,7 +37,8 @@
 - **禁止推倒重写。** 已有 `scopeKind`（global / project / personal）+ `scopeId` 覆盖语义，不要新开一套账本。
 - `scopeId` 必须是 **仓库名**（如 `CofoeAirLink_Web`），禁止用文件相对路径当项目 id。
 - 采集只收约定文件 / 会话摘要 / `.workbuddy/memory`；排除 `vendor_imports`、`site-packages`、`modify_backup`、虚拟环境、插件缓存、Blender 资源。
-- Agent MCP：search / remember / forget / list / get。禁止让 Agent 读 inbox / secret。已有 list/search 权限的密钥自动拥有 get。
+- Agent MCP：记忆工具 search / remember / forget / list / get；桌面版 HTTP MCP 另有凭据目录 list 与需 Tauri 原生逐次确认的 put / organize / delete。Agent 禁止读取 inbox 或已保存的凭据原值；凭据 MCP 不提供 reveal。已有 list/search 权限的密钥自动拥有 get 与凭据目录 list；remember / forget 权限分别对应凭据写入整理 / 删除。
+- 桌面版 HTTP MCP 保留 Agent Bearer 密钥，并在每次启动中每把密钥从同一来源地址首次连接时要求 Tauri 原生确认。新签发密钥可在 Tauri 窗口确认后再次查看；旧哈希密钥仍可连接，但无法恢复原值。完整密钥不得经管理台 HTTP 查询接口返回。
 - 管理台密钥与 Agent 密钥分离，禁止混用。
 
 ## 命令对照

@@ -17,8 +17,9 @@ mod vault;
 use crate::config::{home_dir, load_config, save_config};
 use crate::http::AppState;
 use crate::service::MemoryService;
-use crate::util::APP_VERSION;
+use crate::util::{hash_token, APP_VERSION};
 use std::path::PathBuf;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
@@ -65,9 +66,21 @@ fn admin_token_script(token: &str) -> String {
 fn ensure_default_key(state: &AppState) {
     let conn = state.conn.lock().unwrap();
     if store::list_keys(&conn).map(|keys| keys.is_empty()).unwrap_or(true) {
-        let issued = MemoryService::issue_key(&conn, "default-agent");
-        if let Some(token) = issued.get("token").and_then(|v| v.as_str()) {
-            let _ = std::fs::write(home_dir().join("FIRST_MCP_KEY.txt"), format!("{token}\n"));
+        if let Ok(issued) = MemoryService::issue_key(&conn, "default-agent") {
+            if let Some(token) = issued.get("token").and_then(|v| v.as_str()) {
+                let _ = std::fs::write(home_dir().join("FIRST_MCP_KEY.txt"), format!("{token}\n"));
+            }
+        }
+    } else if let Ok(saved) = std::fs::read_to_string(home_dir().join("FIRST_MCP_KEY.txt")) {
+        let token = saved.trim();
+        if let Ok(Some(key)) = store::find_key_by_hash(&conn, &hash_token(token)) {
+            if key.protected_token.is_none() {
+                if let Ok(protected) = vault::protect_key(&key.id, token) {
+                    if store::protect_existing_key(&conn, &key.id, &protected).unwrap_or(false) {
+                        let _ = store::audit(&conn, "system", "key.protect_existing", &key.id);
+                    }
+                }
+            }
         }
     }
 }
@@ -105,8 +118,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             vault::vault_list,
             vault::vault_put,
+            vault::vault_organize,
             vault::vault_reveal,
-            vault::vault_delete
+            vault::vault_delete,
+            vault::key_reveal
         ])
         .setup(|app| {
             let mut config = load_config();
@@ -123,6 +138,10 @@ pub fn run() {
                 conn: Arc::new(Mutex::new(conn)),
                 web_dir,
                 collect: Arc::new(Mutex::new(crate::collect::CollectProgress::pending())),
+                app_handle: app.handle().clone(),
+                vault_approval: Arc::new(Mutex::new(())),
+                mcp_approval: Arc::new(Mutex::new(())),
+                mcp_approved: Arc::new(Mutex::new(HashSet::new())),
             };
             app.manage(state.clone());
             {

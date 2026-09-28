@@ -228,6 +228,13 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         tx.commit()?;
         version = 7;
     }
+    if version < 8 {
+        let tx = conn.unchecked_transaction()?;
+        add_column(&tx, "api_keys", "protected_token", "BLOB")?;
+        tx.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)", params![8, now_iso()])?;
+        tx.commit()?;
+        version = 8;
+    }
     if version < DATA_SCHEMA_VERSION {
         panic!("Database is behind schema {DATA_SCHEMA_VERSION}; update OneLedger.");
     }
@@ -256,7 +263,7 @@ mod tests {
         let conn = Connection::open_in_memory().expect("memory db");
         conn.execute_batch(INIT_SQL).expect("base schema");
         migrate(&conn).expect("initial migrations");
-        conn.execute("DELETE FROM schema_migrations WHERE version = 7", []).expect("restore schema 6 marker");
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 7", []).expect("restore schema 6 marker");
         conn.execute_batch("DROP TABLE vault_items; DROP INDEX IF EXISTS vault_items_scope;").expect("restore schema 6 tables");
         migrate(&conn).expect("upgrade to seven");
         migrate(&conn).expect("repeat upgrade");
@@ -266,5 +273,40 @@ mod tests {
             "INSERT INTO vault_items (id, label, scope_kind, scope_id, protected_value, created_at, updated_at) VALUES ('vault_test', '测试凭据', 'project', 'OneLedger', ?1, 'now', 'now')",
             [vec![1_u8, 2, 3]],
         ).expect("vault table");
+    }
+
+    #[test]
+    fn old_hash_only_keys_survive_protected_token_migration() {
+        let conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(INIT_SQL).expect("base schema");
+        let old_hash = crate::util::hash_token("ol_existing-fixture");
+        conn.execute("INSERT INTO api_keys (id, name, token_hash, token_prefix, scopes, tools, created_at) VALUES ('key_old', 'existing', ?1, 'ol_old', 'global', 'memory.search', 'now')", [old_hash.as_str()]).expect("old key");
+        migrate(&conn).expect("migrate");
+        migrate(&conn).expect("repeat");
+        let key = crate::store::find_key_by_id(&conn, "key_old").expect("read key").expect("existing key");
+        assert_eq!(key.name, "existing");
+        assert!(key.protected_token.is_none());
+        assert!(crate::store::find_key_by_hash(&conn, &old_hash).expect("auth").is_some());
+        #[cfg(windows)]
+        {
+            let protected = crate::vault::protect_key("key_old", "ol_existing-fixture").expect("protect old key");
+            assert!(crate::store::protect_existing_key(&conn, "key_old", &protected).expect("upgrade old key"));
+            assert!(!crate::store::protect_existing_key(&conn, "key_old", &protected).expect("do not overwrite"));
+            assert!(crate::store::find_key_by_hash(&conn, &old_hash).expect("auth after upgrade").is_some());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn newly_issued_key_remains_hash_authenticated_and_can_be_unprotected_locally() {
+        let conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(INIT_SQL).expect("base schema");
+        migrate(&conn).expect("migrate");
+        let issued = crate::service::MemoryService::issue_key(&conn, "test-agent").expect("issue");
+        let token = issued["token"].as_str().expect("token");
+        let key = crate::store::find_key_by_hash(&conn, &crate::util::hash_token(token)).expect("lookup").expect("stored key");
+        let protected = key.protected_token.expect("protected token");
+        assert!(!protected.windows(token.len()).any(|part| part == token.as_bytes()));
+        assert_eq!(crate::vault::unprotect_key(&key.id, &protected).expect("unprotect"), token);
     }
 }

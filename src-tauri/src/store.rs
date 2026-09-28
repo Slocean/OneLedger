@@ -278,13 +278,14 @@ pub fn list_audit(conn: &Connection) -> rusqlite::Result<Vec<serde_json::Value>>
 
 pub fn insert_key(conn: &Connection, record: &ApiKeyRecord) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO api_keys (id, name, token_hash, token_prefix, scopes, tools, created_at, last_used_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO api_keys (id, name, token_hash, token_prefix, protected_token, scopes, tools, created_at, last_used_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             record.id,
             record.name,
             record.token_hash,
             record.token_prefix,
+            record.protected_token,
             record.scopes,
             record.tools,
             record.created_at,
@@ -297,6 +298,14 @@ pub fn insert_key(conn: &Connection, record: &ApiKeyRecord) -> rusqlite::Result<
 pub fn find_key_by_hash(conn: &Connection, token_hash: &str) -> rusqlite::Result<Option<ApiKeyRecord>> {
     conn.query_row("SELECT * FROM api_keys WHERE token_hash = ?1", [token_hash], map_key)
         .optional()
+}
+
+pub fn find_key_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<ApiKeyRecord>> {
+    conn.query_row("SELECT * FROM api_keys WHERE id = ?1", [id], map_key).optional()
+}
+
+pub fn protect_existing_key(conn: &Connection, id: &str, protected: &[u8]) -> rusqlite::Result<bool> {
+    Ok(conn.execute("UPDATE api_keys SET protected_token = ?1 WHERE id = ?2 AND protected_token IS NULL", params![protected, id])? == 1)
 }
 
 pub fn list_keys(conn: &Connection) -> rusqlite::Result<Vec<ApiKeyRecord>> {
@@ -530,6 +539,7 @@ fn map_key(row: &rusqlite::Row) -> rusqlite::Result<ApiKeyRecord> {
         name: row.get("name")?,
         token_hash: row.get("token_hash")?,
         token_prefix: row.get("token_prefix")?,
+        protected_token: row.get("protected_token")?,
         scopes: row.get("scopes")?,
         tools: row.get("tools")?,
         created_at: row.get("created_at")?,

@@ -61,6 +61,8 @@ pub struct ApiKeyRecord {
     pub name: String,
     pub token_hash: String,
     pub token_prefix: String,
+    #[serde(skip_serializing)]
+    pub protected_token: Option<Vec<u8>>,
     pub scopes: String,
     pub tools: String,
     pub created_at: String,

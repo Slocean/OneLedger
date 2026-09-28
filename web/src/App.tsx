@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   api,
   getToken,
+  keyApi,
   setToken,
   vaultApi,
   type AgentRow,
@@ -1152,10 +1153,17 @@ function mcpClientSnippet(url: string, token: string) {
 
 function KeysPanel() {
   const [keys, setKeys] = useState<KeyRow[]>([]);
-  const [issued, setIssued] = useState("");
+  const [revealed, setRevealed] = useState<{ id: string; token: string } | null>(null);
+  const [busyId, setBusyId] = useState("");
+  const [error, setError] = useState("");
   const [mcpUrl, setMcpUrl] = useState("http://127.0.0.1:7443/mcp");
   const refresh = () => void api.keys().then((data) => setKeys(data.keys));
   useEffect(() => void refresh(), []);
+  useEffect(() => {
+    if (!revealed) return;
+    const timer = window.setTimeout(() => setRevealed(null), 15_000);
+    return () => window.clearTimeout(timer);
+  }, [revealed]);
   useEffect(() => {
     void api.config().then((config) => setMcpUrl(mcpEndpoint(config.bind, config.port)));
   }, []);
@@ -1164,11 +1172,10 @@ function KeysPanel() {
       <div className="panel list">
         <h3>MCP 使用说明</h3>
         <p className="muted">
-          管理台登录用 adminToken，Agent 连账本用这里签发的密钥，两套不能混用。OneLedger 需要先在本机跑着（桌面版或
-          oneledger serve），Agent 才能连上。
+          管理台登录用 adminToken，Agent 连账本用这里签发的密钥，两套不能混用。OneLedger 的 Tauri 桌面窗口需在本机运行，Agent 才能连上。
         </p>
         <p>
-          1. 点下方「签发一把 Agent 密钥」，完整 token 只出现一次，请立刻复制。之后列表里只剩前缀。
+          1. 点下方「签发一把 Agent 密钥」。新密钥可在此 Tauri 窗口再次查看，每次查看都要原生确认。旧密钥若只存有哈希，会继续有效，但无法恢复原值。
         </p>
         <p>
           2. 把配置写进 Agent 的 MCP 设置。Cursor 用用户级 ~/.cursor/mcp.json 或项目 .cursor/mcp.json；Claude Code
@@ -1176,10 +1183,11 @@ function KeysPanel() {
         </p>
         <pre>{mcpClientSnippet(mcpUrl, "ol_你刚签发的密钥")}</pre>
         <p>
-          3. 连上后可用这些工具：memory.search 按问题检索正文；memory.list 只列标题；memory.remember
+          3. 每把密钥在本次启动首次连接时会弹窗确认；同意后可用这些工具：memory.search 按问题检索正文；memory.list 只列标题；memory.remember
           写入一整段蒸馏后的记忆（同一作用域覆盖，不要一条条堆）；memory.forget 按 id 删掉。secret
           级内容不会被检索，也不会同步到远端。
         </p>
+        <p>凭据空间另有 vault.list、vault.put、vault.organize、vault.delete：Agent 可查看目录并提出整理操作；写入、移动或删除都须在桌面窗口逐次确认，MCP 不返回已保存的原值。</p>
         <p className="muted">
           地址来自当前监听配置。若改过端口，以「服务器与存储」里保存的为准。本说明是 HTTP MCP；源码目录下也可用
           oneledger mcp 走 stdio，但桌面版日常用上面这段。
@@ -1187,26 +1195,51 @@ function KeysPanel() {
       </div>
       <button
         className="primary"
+        disabled={Boolean(busyId)}
         onClick={async () => {
-          const created = await api.createKey(`agent-${keys.length + 1}`);
-          setIssued(created.token);
-          refresh();
+          setError("");
+          setBusyId("create");
+          try {
+            const created = await api.createKey(`agent-${keys.length + 1}`);
+            setRevealed({ id: created.id, token: created.token });
+            refresh();
+          } catch (cause) {
+            setError(cause instanceof Error ? cause.message : String(cause));
+          } finally {
+            setBusyId("");
+          }
         }}
       >
         签发一把 Agent 密钥
       </button>
-      {issued ? (
-        <div className="banner">
-          只显示一次：{issued}
-          <pre>{mcpClientSnippet(mcpUrl, issued)}</pre>
-        </div>
-      ) : null}
+      {error ? <div className="banner error">{error}</div> : null}
       {keys.map((key) => (
         <div className="item" key={key.id}>
           <h4>{key.name}</h4>
           <p>
             {key.tokenPrefix}… · {key.tools}
           </p>
+          {key.recoverable ? (
+            <button type="button" disabled={Boolean(busyId)} onClick={async () => {
+              setError("");
+              setRevealed(null);
+              setBusyId(key.id);
+              try {
+                const token = await keyApi.reveal(key.id);
+                setRevealed({ id: key.id, token });
+              } catch (cause) {
+                setError(cause instanceof Error ? cause.message : String(cause));
+              } finally {
+                setBusyId("");
+              }
+            }}>查看完整密钥</button>
+          ) : <p className="muted">旧密钥仅存哈希，无法查看原值；当前连接仍有效。</p>}
+          {revealed?.id === key.id ? (
+            <div className="banner">
+              完整密钥（15 秒后隐藏）：{revealed.token}
+              <pre>{mcpClientSnippet(mcpUrl, revealed.token)}</pre>
+            </div>
+          ) : null}
         </div>
       ))}
     </div>
@@ -1258,6 +1291,28 @@ function VaultPanel() {
         scopeKind,
         scopeId: scopeKind === "project" ? scopeId.trim() : "",
         value,
+        expectedUpdatedAt: editing?.updatedAt,
+      });
+      resetForm();
+      await refresh();
+    } catch (cause) {
+      report(cause);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const organize = async () => {
+    if (!editing) return;
+    setError("");
+    setRevealed(null);
+    setBusy(true);
+    try {
+      await vaultApi.organize({
+        id: editing.id,
+        label: label.trim(),
+        scopeKind,
+        scopeId: scopeKind === "project" ? scopeId.trim() : "",
+        expectedUpdatedAt: editing.updatedAt,
       });
       resetForm();
       await refresh();
@@ -1301,13 +1356,13 @@ function VaultPanel() {
         <h2>本机凭据空间</h2>
         <p className="muted">
           原值由当前 Windows 用户的系统保护机制加密保存在本机。MCP 密钥只用于连接 Agent；
-          Agent 的五个记忆工具不能读取这里的原值。每次保存、查看或删除都会弹出原生确认窗口。
+          Agent 可列出目录并请求写入、整理或删除，但不能通过 MCP 读取已保存的原值。每次修改都须在本机确认。
         </p>
         <p className="muted">凭据不会进入记忆检索、蒸馏、同步或普通导出。复制数据库到另一台机器后，这些原值无法直接解锁。</p>
       </div>
 
       <div className="panel list">
-        <h3>{editing ? "替换凭据" : "新增凭据"}</h3>
+        <h3>{editing ? "编辑凭据" : "新增凭据"}</h3>
         <label>
           名称（不含原值）
           <input value={label} maxLength={80} autoComplete="off" onChange={(event) => setLabel(event.target.value)} placeholder="例如：生产 API" />
@@ -1347,7 +1402,12 @@ function VaultPanel() {
           <button className="primary" type="button" disabled={busy || !label.trim() || !value} onClick={() => void save()}>
             {editing ? "确认替换" : "确认保存"}
           </button>
-          {editing ? <button type="button" onClick={resetForm}>取消编辑</button> : null}
+          {editing ? (
+            <>
+              <button type="button" disabled={busy || !label.trim() || (label.trim() === editing.label && scopeKind === editing.scopeKind && (scopeKind === "project" ? scopeId.trim() : "") === editing.scopeId)} onClick={() => void organize()}>只整理目录</button>
+              <button type="button" onClick={resetForm}>取消编辑</button>
+            </>
+          ) : null}
         </div>
       </div>
 
@@ -1371,7 +1431,7 @@ function VaultPanel() {
               setScopeId(item.scopeId);
               setValue("");
               setShowInput(false);
-            }}>替换</button>
+            }}>编辑</button>
             <button type="button" disabled={busy} onClick={() => void remove(item.id)}>删除</button>
           </div>
           {revealed?.id === item.id ? (

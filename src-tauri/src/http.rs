@@ -4,7 +4,8 @@ use crate::service::MemoryService;
 use crate::store;
 use crate::sync::{apply_remote_memories, authorize_node, sync_with_remote};
 use crate::util::{hash_token, new_id, now_iso, safe_equal, APP_VERSION, DATA_SCHEMA_VERSION, PROTOCOL_VERSION};
-use axum::extract::{Path, Query, State};
+use crate::vault;
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -12,8 +13,11 @@ use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use rusqlite::Connection;
 use serde::Deserialize;
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tauri::AppHandle;
 use tower_http::cors::CorsLayer;
 
 #[derive(RustEmbed)]
@@ -26,6 +30,10 @@ pub struct AppState {
     pub conn: Arc<Mutex<Connection>>,
     pub web_dir: PathBuf,
     pub collect: Arc<Mutex<CollectProgress>>,
+    pub app_handle: AppHandle,
+    pub vault_approval: Arc<Mutex<()>>,
+    pub mcp_approval: Arc<Mutex<()>>,
+    pub mcp_approved: Arc<Mutex<HashSet<(String, IpAddr)>>>,
 }
 
 pub fn start_collect(state: &AppState) {
@@ -696,7 +704,8 @@ async fn keys(State(state): State<AppState>, headers: HeaderMap) -> Response {
                 "tokenPrefix": key.token_prefix,
                 "tools": key.tools,
                 "createdAt": key.created_at,
-                "lastUsedAt": key.last_used_at
+                "lastUsedAt": key.last_used_at,
+                "recoverable": key.protected_token.is_some()
             })
         })
         .collect();
@@ -713,7 +722,10 @@ async fn create_key(State(state): State<AppState>, headers: HeaderMap, Json(body
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
-    Json(MemoryService::issue_key(&state.conn.lock().unwrap(), body.name.as_deref().unwrap_or("agent"))).into_response()
+    match MemoryService::issue_key(&state.conn.lock().unwrap(), body.name.as_deref().unwrap_or("agent")) {
+        Ok(issued) => Json(issued).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": error }))).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -757,30 +769,110 @@ async fn mcp_get() -> impl IntoResponse {
     Json(serde_json::json!({}))
 }
 
-async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, Json(payload): Json<serde_json::Value>) -> Response {
+async fn mcp_post(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Json(payload): Json<serde_json::Value>) -> Response {
     let config = state.config.lock().unwrap().clone();
     let Some(token) = bearer(&headers) else {
         return unauthorized();
     };
-    let conn = state.conn.lock().unwrap();
-    let Some(key) = store::find_key_by_hash(&conn, &hash_token(&token)).ok().flatten() else {
-        return unauthorized();
+    let (key_id, name, tools) = {
+        let conn = state.conn.lock().unwrap();
+        let Some(key) = store::find_key_by_hash(&conn, &hash_token(&token)).ok().flatten() else {
+            return unauthorized();
+        };
+        (key.id, key.name, key.tools)
     };
-    let _ = store::touch_key(&conn, &key.id);
-    let name = key.name.clone();
-    let tools = key.tools.clone();
-    drop(conn);
-    Json(handle_mcp(&state, &config, &name, &tools, payload)).into_response()
+    let request_id = payload.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let response = tokio::task::spawn_blocking(move || {
+        approve_mcp_connection(&state, &key_id, &name, peer.ip())?;
+        let _ = store::touch_key(&state.conn.lock().unwrap(), &key_id);
+        Ok::<_, String>(handle_mcp(&state, &config, &name, &tools, payload))
+    }).await;
+    match response {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(error)) => (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": error }))).into_response(),
+        Err(_) => Json(serde_json::json!({ "jsonrpc": "2.0", "id": request_id, "error": { "code": -32603, "message": "MCP 处理失败" } })).into_response(),
+    }
+}
+
+fn approve_mcp_connection(state: &AppState, key_id: &str, name: &str, source: IpAddr) -> Result<(), String> {
+    let identity = (key_id.to_string(), source);
+    approve_once(&state.mcp_approval, &state.mcp_approved, identity, || {
+        let window = vault::agent_window(state)?;
+        let visible_name: String = name.chars().filter(|ch| !ch.is_control()).take(60).collect();
+        vault::confirm_with_title(&window, "OneLedger MCP 连接确认", &format!("Agent 密钥「{visible_name}」请求从 {source} 连接 OneLedger。\n同意后，这把密钥从该地址发起的请求在本次启动期间可直接连接。\n是否同意？"))
+    })
+}
+
+fn approve_once<F>(gate: &Mutex<()>, approved: &Mutex<HashSet<(String, IpAddr)>>, identity: (String, IpAddr), confirm: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    if approved.lock().map_err(|_| "连接确认不可用".to_string())?.contains(&identity) {
+        return Ok(());
+    }
+    let _approval = gate.lock().map_err(|_| "连接确认不可用".to_string())?;
+    if approved.lock().map_err(|_| "连接确认不可用".to_string())?.contains(&identity) {
+        return Ok(());
+    }
+    confirm()?;
+    approved.lock().map_err(|_| "连接确认不可用".to_string())?.insert(identity);
+    Ok(())
+}
+
+fn tool_allowed(tools: &str, name: &str) -> bool {
+    let permitted: Vec<&str> = tools.split(',').map(str::trim).filter(|item| !item.is_empty()).collect();
+    if matches!(name, "memory.search" | "memory.remember" | "memory.forget" | "memory.list" | "memory.get" | "vault.list" | "vault.put" | "vault.organize" | "vault.delete") && permitted.contains(&name) {
+        return true;
+    }
+    match name {
+        "memory.get" | "vault.list" => permitted.contains(&"memory.list") || permitted.contains(&"memory.search"),
+        "vault.put" | "vault.organize" => permitted.contains(&"memory.remember"),
+        "vault.delete" => permitted.contains(&"memory.forget"),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod vault_permission_tests {
+    use super::{approve_once, tool_allowed};
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    #[test]
+    fn vault_permissions_follow_existing_key_scopes_and_never_expose_reveal() {
+        let read = "memory.search,memory.list";
+        assert!(tool_allowed(read, "vault.list"));
+        assert!(!tool_allowed(read, "vault.put"));
+        assert!(!tool_allowed(read, "vault.organize"));
+        assert!(!tool_allowed(read, "vault.delete"));
+
+        let write = "memory.remember,memory.forget";
+        assert!(tool_allowed(write, "vault.put"));
+        assert!(tool_allowed(write, "vault.organize"));
+        assert!(tool_allowed(write, "vault.delete"));
+        assert!(!tool_allowed(write, "vault.list"));
+        assert!(!tool_allowed("memory.search,memory.remember,memory.forget,vault.reveal", "vault.reveal"));
+    }
+
+    #[test]
+    fn mcp_connection_requires_approval_once_per_key_and_source() {
+        let gate = Mutex::new(());
+        let approved = Mutex::new(HashSet::new());
+        let local = ("key_a".to_string(), "127.0.0.1".parse().expect("ip"));
+        assert!(approve_once(&gate, &approved, local.clone(), || Err("denied".into())).is_err());
+        assert!(!approved.lock().unwrap().contains(&local));
+        approve_once(&gate, &approved, local.clone(), || Ok(())).expect("approve");
+        approve_once(&gate, &approved, local.clone(), || panic!("approved connection prompted again")).expect("reuse");
+        let other_source = ("key_a".to_string(), "192.168.0.2".parse().expect("ip"));
+        assert!(approve_once(&gate, &approved, other_source.clone(), || Err("denied".into())).is_err());
+        assert!(!approved.lock().unwrap().contains(&other_source));
+    }
 }
 
 fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, payload: serde_json::Value) -> serde_json::Value {
     let id = payload.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    let permitted: Vec<&str> = tools.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-    let tool_ok = |name: &str| {
-        permitted.contains(&name)
-            || (name == "memory.get" && (permitted.contains(&"memory.list") || permitted.contains(&"memory.search")))
-    };
+    let tool_ok = |name: &str| tool_allowed(tools, name);
     match method {
         "initialize" => {
             let project_scope = payload["params"]["projectScopeId"].as_str()
@@ -799,7 +891,7 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
             } else {
                 String::new()
             };
-            let instructions = format!("OneLedger stores distilled scope documents. At task start, call memory.get with scopeKind=project and scopeId=repository name, plus global if useful. Read rev before replacing a scope and pass expectedRev to memory.remember. Available index: {index}");
+            let instructions = format!("OneLedger stores distilled scope documents. At task start, call memory.get with scopeKind=project and scopeId=repository name, plus global if useful. Read rev before replacing a scope and pass expectedRev to memory.remember. Vault tools list metadata and propose changes; ask the user first, then wait for desktop approval. Vault tools never return stored raw values. Available index: {index}");
             serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -819,6 +911,10 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
                 ("memory.forget", "Remove an official distilled memory so it is no longer recalled.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})),
                 ("memory.list", "List memory titles only, without bodies. Includes scopeId. Filter with scopeKind and scopeId.", serde_json::json!({"type":"object","properties":{"limit":{"type":"number"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"}}})),
                 ("memory.get", "Read full distilled documents. Pass id, or scopeKind and/or scopeId (repository name). No dummy search query. Results never include secret-classified text.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"}}})),
+                ("vault.list", "List local vault metadata only. Never returns stored values. Use limit and offset to page; filter by scopeKind and scopeId when useful.", serde_json::json!({"type":"object","properties":{"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":200},"offset":{"type":"integer","minimum":0}}})),
+                ("vault.put", "Propose saving or replacing a raw value. Ask the user first; OneLedger requires explicit desktop approval. The value is present in this tool call and must not be repeated in other tools or logs. To replace, pass id and expectedUpdatedAt from vault.list. Returns metadata only.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"},"value":{"type":"string"},"expectedUpdatedAt":{"type":"string"}},"required":["label","scopeKind","scopeId","value"]})),
+                ("vault.organize", "Propose renaming or moving a vault item without reading or changing its stored value. Ask the user first; desktop approval is required. Pass id and expectedUpdatedAt from vault.list.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"},"expectedUpdatedAt":{"type":"string"}},"required":["id","label","scopeKind","scopeId","expectedUpdatedAt"]})),
+                ("vault.delete", "Propose permanently deleting a vault item. Ask the user first; desktop approval is required. Pass id and expectedUpdatedAt from vault.list.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"expectedUpdatedAt":{"type":"string"}},"required":["id","expectedUpdatedAt"]})),
             ];
             let tools: Vec<serde_json::Value> = all
                 .into_iter()
@@ -833,6 +929,36 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
                 return serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "tool not allowed" } });
             }
             let args = payload["params"]["arguments"].clone();
+            if name.starts_with("vault.") {
+                let result: Result<serde_json::Value, String> = match name {
+                    "vault.list" => {
+                        let limit = args["limit"].as_i64().unwrap_or(50).clamp(1, 200);
+                        let offset = args["offset"].as_i64().unwrap_or(0).max(0);
+                        vault::agent_list(state, actor, args["scopeKind"].as_str(), args["scopeId"].as_str(), limit, offset)
+                            .map(|items| {
+                                let next_offset = if items.len() == limit as usize { Some(offset.saturating_add(limit)) } else { None };
+                                serde_json::json!({ "items": items, "nextOffset": next_offset })
+                            })
+                    }
+                    "vault.put" => serde_json::from_value::<vault::VaultInput>(args)
+                        .map_err(|_| "凭据输入不合法".to_string())
+                        .and_then(|input| vault::agent_put(state, actor, input))
+                        .map(|item| serde_json::json!({ "status": "stored", "item": item })),
+                    "vault.organize" => serde_json::from_value::<vault::VaultOrganizeInput>(args)
+                        .map_err(|_| "整理输入不合法".to_string())
+                        .and_then(|input| vault::agent_organize(state, actor, input))
+                        .map(|item| serde_json::json!({ "status": "organized", "item": item })),
+                    "vault.delete" => match (args["id"].as_str(), args["expectedUpdatedAt"].as_str()) {
+                        (Some(item_id), Some(expected)) => vault::agent_delete(state, actor, item_id, expected)
+                            .map(|_| serde_json::json!({ "status": "deleted" })),
+                        _ => Err("需要 id 和 expectedUpdatedAt".into()),
+                    },
+                    _ => Err("未知凭据工具".into()),
+                };
+                let is_error = result.is_err();
+                let body = result.unwrap_or_else(|error| serde_json::json!({ "status": "rejected", "error": error }));
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&body).unwrap_or_default() }], "isError": is_error } });
+            }
             let conn = state.conn.lock().unwrap();
             let result = match name {
                 "memory.search" => serde_json::to_value(MemoryService::search(
@@ -904,7 +1030,7 @@ pub fn spawn(state: AppState) -> Result<(), String> {
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(listener) => {
                 let _ = tx.send(Ok(()));
-                if let Err(err) = axum::serve(listener, router(state)).await {
+                if let Err(err) = axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).await {
                     eprintln!("oneledger http stopped: {err}");
                 }
             }

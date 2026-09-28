@@ -8,7 +8,9 @@
     "core:default",
     "allow-vault-list",
     "allow-vault-put",
+    "allow-vault-organize",
     "allow-vault-reveal",
-    "allow-vault-delete"
+    "allow-vault-delete",
+    "allow-key-reveal"
   ]
 }

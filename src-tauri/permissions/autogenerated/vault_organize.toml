@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-vault-organize"
+description = "Enables the vault_organize command without any pre-configured scope."
+commands.allow = ["vault_organize"]
+
+[[permission]]
+identifier = "deny-vault-organize"
+description = "Denies the vault_organize command without any pre-configured scope."
+commands.deny = ["vault_organize"]

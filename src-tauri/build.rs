@@ -4,8 +4,10 @@ fn main() {
             tauri_build::AppManifest::new().commands(&[
                 "vault_list",
                 "vault_put",
+                "vault_organize",
                 "vault_reveal",
                 "vault_delete",
+                "key_reveal",
             ]),
         ),
     )

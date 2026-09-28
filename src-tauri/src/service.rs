@@ -740,28 +740,31 @@ impl MemoryService {
         }
     }
 
-    pub fn issue_key(conn: &Connection, name: &str) -> serde_json::Value {
+    pub fn issue_key(conn: &Connection, name: &str) -> Result<serde_json::Value, String> {
         let mut raw = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut raw);
         let token = format!("ol_{}", hex::encode(raw));
+        let id = new_id("key");
+        let protected_token = crate::vault::protect_key(&id, &token)?;
         let record = crate::models::ApiKeyRecord {
-            id: new_id("key"),
+            id,
             name: name.to_string(),
             token_hash: hash_token(&token),
             token_prefix: token.chars().take(8).collect(),
+            protected_token: Some(protected_token),
             scopes: "global,project,personal".into(),
             tools: "memory.search,memory.remember,memory.forget,memory.list,memory.get".into(),
             created_at: now_iso(),
             last_used_at: None,
         };
-        let _ = store::insert_key(conn, &record);
+        store::insert_key(conn, &record).map_err(|_| "无法保存 Agent 密钥".to_string())?;
         let _ = store::audit(conn, "admin", "key.create", &record.id);
-        serde_json::json!({
+        Ok(serde_json::json!({
             "id": record.id,
             "name": record.name,
             "token": token,
             "prefix": record.token_prefix
-        })
+        }))
     }
 
     fn for_agent(mut memory: MemoryRecord) -> MemoryRecord {
