@@ -32,6 +32,23 @@
 - Linux 的 `check` 和 Windows 的 `CI` 都要过。红的检查不准当没看见。
 - 禁止只改一处就发版。项目里已经红的测试、打包失败、弹窗、闪屏，本次必须处理。
 
+## 发版必升全部版本号（违反即错）
+
+升版本时**六处必须全部同步**，漏一处即返工：
+
+1. `package.json` 的 `version`
+2. `src-tauri/tauri.conf.json` 的 `version`
+3. `src-tauri/Cargo.toml` 的 `version`（跑 `cargo update -p oneledger --offline` 刷 Cargo.lock）
+4. `package-lock.json`（`npm install --package-lock-only`）
+5. `src/types.ts` 的 `export const APP_VERSION`（TS 硬编码，检查更新与 HTTP status 用它）
+6. `src-tauri/src/util.rs` 的 `pub const APP_VERSION: &str`（Rust 检查更新的本地版本比对、旧进程检测都靠它）
+
+另外：`app_update.json` 顶部必须新增本版公告条目（validate-release.mjs 会校验它与 package.json 一致）。
+
+- 改完必须 `grep -rn "旧版本号"` 全仓库复核，只允许 `app_update.json` 历史条目里出现旧版本号。
+- 打完包必须验证 exe 里嵌的是新版本号（如 `grep -aoc "0\.4\.10" src-tauri/target/release/oneledger.exe`），不准只看打包成功就交。
+- 已推出的 tag 若发现版本号漏改：修复提交后把 tag 移到修复提交强推（`git tag -f` + `git push -f`，前提是 GitHub Release 还没发）。
+
 ## 账本与采集
 
 - **禁止推倒重写。** 已有 `scopeKind`（global / project / personal）+ `scopeId` 覆盖语义，不要新开一套账本。
