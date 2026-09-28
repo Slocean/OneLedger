@@ -45,7 +45,7 @@ HTTP：管理台签发 Agent 密钥后，`url` 为 `http://127.0.0.1:7443/mcp`�
 
 桌面版 HTTP MCP 继续使用现有 Agent 密钥。每把密钥从同一来源地址首次连接时，Tauri 原生窗口会要求用户确认，确认时可勾选「记住此设备」——勾选后这台电脑上该密钥从同一地址连接不再询问，记录保存在本机 SQLite，可随时在管理台 MCP 密钥页的「记住的连接」里撤销；未勾选则维持原行为，重启 OneLedger 后重新确认。拒绝则本次请求不会进入 MCP 工具。新签发的密钥除哈希外，还会以 Windows DPAPI 加密保存在本机，可在 Tauri 管理台逐次确认后再次查看完整值。升级前仅存哈希的旧密钥保持可用，但无法从哈希恢复原值；若首次默认密钥仍保存在本机 `FIRST_MCP_KEY.txt`，启动时会将其加密补存，不改变密钥本身。
 
-工具：`memory.search` / `memory.remember` / `memory.forget` / `memory.list` / `memory.get`。覆盖已有作用域时先读取 `rev`，再在 `memory.remember` 中传入 `expectedRev`；版本不一致会返回 `conflict`。完整识别的凭据只以脱敏占位符写入；无法安全脱敏的材料会拒收，原始 secret 不进入可检索记忆，也不会同步到远端。
+工具：`memory.search` / `memory.remember` / `memory.forget` / `memory.list` / `memory.get` / `memory.export` / `memory.import`。覆盖已有作用域时先读取 `rev`，再在 `memory.remember` 中传入 `expectedRev`；版本不一致会返回 `conflict`。完整识别的凭据只以脱敏占位符写入；无法安全脱敏的材料会拒收，原始 secret 不进入可检索记忆，也不会同步到远端。`memory.export` 导出一份 `oneledger-backup` JSON（同一格式，桌面控制台导出的是全量备份，MCP 导出为可共享的记忆子集：不含 secret/pii 记忆、收件箱、凭据密文与密钥材料）；`memory.import` 把这份文件按 id 合并回账本（记忆仅当文件 rev 更新时覆盖），每次导入都要在 Tauri 窗口原生确认。管理台「记忆」页的「导出全部数据 / 导入备份」使用同一个备份文件，覆盖数据库全部内容（含收件箱、凭据密文、Agent 密钥、审计等；config.json 设置不在备份内）。
 
 ## 运行模式
 

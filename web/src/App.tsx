@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   getToken,
@@ -435,6 +435,7 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
   const [draft, setDraft] = useState("");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
+  const backupInputRef = useRef<HTMLInputElement>(null);
   const grouped = useMemo(() => kindItems(items, kind), [items, kind]);
   const selected = grouped.find((item) => (item.scopeId ?? "") === scopeId) ?? grouped[0];
   const refresh = () =>
@@ -470,6 +471,36 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
       setBusy(false);
     }
   };
+  const exportBackup = async () => {
+    setBusy(true);
+    try {
+      const filename = await api.backupExport();
+      setNote(`已导出全部数据：${filename}`);
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const importBackup = async (file: File) => {
+    setBusy(true);
+    try {
+      const parsed = JSON.parse(await file.text()) as unknown;
+      const result = await api.backupImport(parsed);
+      const applied = Object.entries(result.applied ?? {})
+        .map(([key, count]) => `${key} ${count}`)
+        .join("，");
+      const skipped = Object.entries(result.skipped ?? {})
+        .map(([key, count]) => `${key} 跳过 ${count}`)
+        .join("，");
+      setNote(`导入完成：${applied || "无变更"}${skipped ? `（${skipped}）` : ""}。`);
+      refresh();
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
   const emptyHint =
     kind === "project"
       ? "还没有项目记忆。Agent 蒸馏时用 memory.remember，带上 scopeKind=project、仓库名 scopeId，以及分类标题 title。"
@@ -493,9 +524,23 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
           ))}
         </nav>
         <div className="row">
-          <button disabled={busy} onClick={() => void exportFile("json")}>
-            导出 JSON
+          <button disabled={busy} onClick={() => void exportBackup()}>
+            导出全部数据
           </button>
+          <button disabled={busy} onClick={() => backupInputRef.current?.click()}>
+            导入备份
+          </button>
+          <input
+            ref={backupInputRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: "none" }}
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              if (file) void importBackup(file);
+            }}
+          />
           <button disabled={busy} onClick={() => void exportFile("md")}>
             导出 Markdown
           </button>

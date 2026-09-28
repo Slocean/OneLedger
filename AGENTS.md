@@ -54,7 +54,7 @@
 - **禁止推倒重写。** 已有 `scopeKind`（global / project / personal）+ `scopeId` 覆盖语义，不要新开一套账本。
 - `scopeId` 必须是 **仓库名**（如 `CofoeAirLink_Web`），禁止用文件相对路径当项目 id。
 - 采集只收约定文件 / 会话摘要 / `.workbuddy/memory`；排除 `vendor_imports`、`site-packages`、`modify_backup`、虚拟环境、插件缓存、Blender 资源。
-- Agent MCP：记忆工具 search / remember / forget / list / get；桌面版 HTTP MCP 另有凭据目录 list 与需 Tauri 原生逐次确认的 put / organize / delete。Agent 禁止读取 inbox 或已保存的凭据原值；凭据 MCP 不提供 reveal。已有 list/search 权限的密钥自动拥有 get 与凭据目录 list；remember / forget 权限分别对应凭据写入整理 / 删除。
+- Agent MCP：记忆工具 search / remember / forget / list / get / export / import；桌面版 HTTP MCP 另有凭据目录 list 与需 Tauri 原生逐次确认的 put / organize / delete。memory.export 只导出可共享的记忆子集（不含 secret/pii 记忆、收件箱、凭据密文与密钥材料）；memory.import 需 Tauri 原生确认后按 id 合并（记忆仅当文件 rev 更新时覆盖）。独立的 stdio MCP 只提供记忆读写工具，不含 export/import。Agent 禁止读取 inbox 或已保存的凭据原值；凭据 MCP 不提供 reveal。已有 list/search 权限的密钥自动拥有 get、export 与凭据目录 list；remember 权限对应凭据写入整理与备份导入；forget 权限对应凭据删除。
 - 桌面版 HTTP MCP 保留 Agent Bearer 密钥，并在每把密钥从同一来源地址首次连接时要求 Tauri 原生确认；确认弹窗带「记住此设备」勾选框，勾选后该密钥与地址组合持久化进 SQLite（trusted_mcp_sources），连接不再询问，MCP 密钥页必须提供撤销入口。记住只豁免连接确认；vault.put / vault.organize / vault.delete 的逐次确认不得被豁免。新签发密钥可在 Tauri 窗口确认后再次查看；旧哈希密钥仍可连接，但无法恢复原值。完整密钥不得经管理台 HTTP 查询接口返回。
 - 管理台密钥与 Agent 密钥分离，禁止混用。
 

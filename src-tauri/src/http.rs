@@ -90,6 +90,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/memories", get(memories))
         .route("/api/memories/export", get(export_memories))
+        .route("/api/backup/export", get(backup_export))
+        .route("/api/backup/import", post(backup_import))
         .route("/api/remember", post(remember))
         .route("/api/inbox/:id/reject", post(reject))
         .route("/api/inbox/resolve", post(resolve_inbox))
@@ -113,6 +115,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sync/pull", get(sync_pull))
         .route("/api/sync/push", post(sync_push))
         .route("/mcp", get(mcp_get).post(mcp_post))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .with_state(state)
         .route("/", get(serve_root))
@@ -278,6 +281,49 @@ async fn export_memories(State(state): State<AppState>, headers: HeaderMap) -> R
         "memories": memories
     }))
     .into_response()
+}
+
+async fn backup_export(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let backup = {
+        let conn = state.conn.lock().unwrap();
+        crate::backup::export_backup(&conn)
+    };
+    match backup {
+        Ok(document) => {
+            let _ = store::audit(&state.conn.lock().unwrap(), "admin", "backup.export", "full");
+            let day = crate::util::now_iso().chars().take(10).collect::<String>().replace('-', "");
+            let filename = format!("OneLedger-Backup-{APP_VERSION}-{day}.json");
+            let mut response = Json(document).into_response();
+            response
+                .headers_mut()
+                .insert(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\"").parse().unwrap());
+            response
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": error }))).into_response(),
+    }
+}
+
+async fn backup_import(State(state): State<AppState>, headers: HeaderMap, Json(envelope): Json<serde_json::Value>) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let mut conn = state.conn.lock().unwrap();
+    match crate::backup::import_backup(&mut conn, &envelope) {
+        Ok(report) => {
+            let _ = store::audit(&conn, "admin", "backup.import", &serde_json::to_string(&report.applied).unwrap_or_default());
+            Json(serde_json::json!({ "ok": true, "applied": report.applied, "skipped": report.skipped })).into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -838,12 +884,12 @@ where
 
 fn tool_allowed(tools: &str, name: &str) -> bool {
     let permitted: Vec<&str> = tools.split(',').map(str::trim).filter(|item| !item.is_empty()).collect();
-    if matches!(name, "memory.search" | "memory.remember" | "memory.forget" | "memory.list" | "memory.get" | "vault.list" | "vault.put" | "vault.organize" | "vault.delete") && permitted.contains(&name) {
+    if matches!(name, "memory.search" | "memory.remember" | "memory.forget" | "memory.list" | "memory.get" | "memory.export" | "memory.import" | "vault.list" | "vault.put" | "vault.organize" | "vault.delete") && permitted.contains(&name) {
         return true;
     }
     match name {
-        "memory.get" | "vault.list" => permitted.contains(&"memory.list") || permitted.contains(&"memory.search"),
-        "vault.put" | "vault.organize" => permitted.contains(&"memory.remember"),
+        "memory.get" | "memory.export" | "vault.list" => permitted.contains(&"memory.list") || permitted.contains(&"memory.search"),
+        "memory.import" | "vault.put" | "vault.organize" => permitted.contains(&"memory.remember"),
         "vault.delete" => permitted.contains(&"memory.forget"),
         _ => false,
     }
@@ -859,11 +905,14 @@ mod vault_permission_tests {
     fn vault_permissions_follow_existing_key_scopes_and_never_expose_reveal() {
         let read = "memory.search,memory.list";
         assert!(tool_allowed(read, "vault.list"));
+        assert!(tool_allowed(read, "memory.export"));
+        assert!(!tool_allowed(read, "memory.import"));
         assert!(!tool_allowed(read, "vault.put"));
         assert!(!tool_allowed(read, "vault.organize"));
         assert!(!tool_allowed(read, "vault.delete"));
 
         let write = "memory.remember,memory.forget";
+        assert!(tool_allowed(write, "memory.import"));
         assert!(tool_allowed(write, "vault.put"));
         assert!(tool_allowed(write, "vault.organize"));
         assert!(tool_allowed(write, "vault.delete"));
@@ -883,6 +932,30 @@ mod vault_permission_tests {
         let other_source = ("key_a".to_string(), "192.168.0.2".parse().expect("ip"));
         assert!(approve_once(&gate, &approved, other_source.clone(), || Err("denied".into())).is_err());
         assert!(!approved.lock().unwrap().contains(&other_source));
+    }
+}
+
+fn counts_summary(counts: &serde_json::Map<String, serde_json::Value>) -> String {
+    const LABELS: &[(&str, &str)] = &[
+        ("memories", "记忆"),
+        ("inbox", "收件箱"),
+        ("vaultItems", "凭据密文"),
+        ("apiKeys", "Agent 密钥"),
+        ("agents", "采集源"),
+        ("redactionEvents", "脱敏记录"),
+        ("redactionArchive", "脱敏归档"),
+        ("collectFingerprints", "采集指纹"),
+        ("distillDrafts", "蒸馏草稿"),
+        ("trustedMcpSources", "记住的连接"),
+    ];
+    let parts: Vec<String> = LABELS
+        .iter()
+        .filter_map(|(key, label)| counts.get(*key).map(|count| format!("{label} {}", count)))
+        .collect();
+    if parts.is_empty() {
+        "空备份".into()
+    } else {
+        parts.join("、")
     }
 }
 
@@ -928,6 +1001,8 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
                 ("memory.forget", "Remove an official distilled memory so it is no longer recalled.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})),
                 ("memory.list", "List memory titles only, without bodies. Includes scopeId. Filter with scopeKind and scopeId.", serde_json::json!({"type":"object","properties":{"limit":{"type":"number"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"}}})),
                 ("memory.get", "Read full distilled documents. Pass id, or scopeKind and/or scopeId (repository name). No dummy search query. Results never include secret-classified text.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"}}})),
+                ("memory.export", "Export a portable backup of this ledger as one JSON document (kind oneledger-backup). Carries the shareable memory subset: no secret/pii rows, no inbox, no vault ciphertext, no key material. Save the returned text as a .json file; import it later with memory.import or the desktop console.", serde_json::json!({"type":"object","properties":{}})),
+                ("memory.import", "Import a OneLedger backup previously produced by memory.export or the desktop console. Pass the parsed file content as data. Merge semantics: rows are matched by id, memories only overwrite older revisions, local rows absent from the file are kept. Requires explicit desktop approval.", serde_json::json!({"type":"object","properties":{"data":{"type":"object","description":"The parsed JSON content of the backup file"}},"required":["data"]})),
                 ("vault.list", "List local vault metadata only. Never returns stored values. Use limit and offset to page; filter by scopeKind and scopeId when useful.", serde_json::json!({"type":"object","properties":{"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":200},"offset":{"type":"integer","minimum":0}}})),
                 ("vault.put", "Propose saving or replacing a raw value. Ask the user first; OneLedger requires explicit desktop approval. The value is present in this tool call and must not be repeated in other tools or logs. To replace, pass id and expectedUpdatedAt from vault.list. Returns metadata only.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"},"value":{"type":"string"},"expectedUpdatedAt":{"type":"string"}},"required":["label","scopeKind","scopeId","value"]})),
                 ("vault.organize", "Propose renaming or moving a vault item without reading or changing its stored value. Ask the user first; desktop approval is required. Pass id and expectedUpdatedAt from vault.list.", serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"},"scopeKind":{"type":"string","enum":["global","project","personal"]},"scopeId":{"type":"string"},"expectedUpdatedAt":{"type":"string"}},"required":["id","label","scopeKind","scopeId","expectedUpdatedAt"]})),
@@ -946,8 +1021,28 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
                 return serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "tool not allowed" } });
             }
             let args = payload["params"]["arguments"].clone();
-            if name.starts_with("vault.") {
-                let result: Result<serde_json::Value, String> = match name {
+            if name == "memory.import" {
+                let envelope = args.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let outcome: Result<serde_json::Value, String> = (|| {
+                    let counts = crate::backup::summarize(&envelope)?;
+                    let _approval = state.vault_approval.lock().map_err(|_| "确认窗口不可用".to_string())?;
+                    let window = vault::agent_window(state)?;
+                    let summary = counts_summary(&counts);
+                    vault::confirm_with_title(
+                        &window,
+                        "OneLedger 备份导入确认",
+                        &format!("Agent「{actor}」请求导入备份数据（{summary}）。\n按 id 合并：记忆仅当文件里的版本更新时覆盖，本地多出的数据保留。\n是否同意？"),
+                    )?;
+                    let mut conn = state.conn.lock().unwrap();
+                    let report = crate::backup::import_backup(&mut conn, &envelope)?;
+                    let _ = store::audit(&conn, &format!("mcp:{actor}"), "memory.import", &serde_json::to_string(&report.applied).unwrap_or_default());
+                    Ok(serde_json::json!({ "status": "imported", "applied": report.applied, "skipped": report.skipped }))
+                })();
+                let is_error = outcome.is_err();
+                let body = outcome.unwrap_or_else(|error| serde_json::json!({ "status": "rejected", "error": error }));
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&body).unwrap_or_default() }], "isError": is_error } });
+            }
+            if name.starts_with("vault.") {                let result: Result<serde_json::Value, String> = match name {
                     "vault.list" => {
                         let limit = args["limit"].as_i64().unwrap_or(50).clamp(1, 200);
                         let offset = args["offset"].as_i64().unwrap_or(0).max(0);
@@ -1010,6 +1105,13 @@ fn handle_mcp(state: &AppState, config: &Config, actor: &str, tools: &str, paylo
                     args["scopeId"].as_str(),
                 ))
                 .unwrap_or_default(),
+                "memory.export" => match crate::backup::export_share_backup(&conn) {
+                    Ok(document) => {
+                        let _ = store::audit(&conn, &format!("mcp:{actor}"), "memory.export", "share backup");
+                        document
+                    }
+                    Err(error) => serde_json::json!({ "error": error }),
+                },
                 "memory.list" => {
                     let items: Vec<_> = MemoryService::list(
                         &conn,

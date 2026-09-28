@@ -44,6 +44,27 @@ export const api = {
     request<{ name: string; version: string; exportedAt: string; count: number; memories: Memory[] }>(
       "/api/memories/export",
     ),
+  async backupExport(): Promise<string> {
+    const response = await fetch("/api/backup/export", { headers: { "x-admin-token": getToken() } });
+    if (!response.ok) {
+      throw new Error((await response.text()) || `${response.status}`);
+    }
+    const disposition = response.headers.get("content-disposition") ?? "";
+    const match = /filename="([^"]+)"/.exec(disposition);
+    const filename = match?.[1] ?? "OneLedger-Backup.json";
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+    return filename;
+  },
+  backupImport: (body: unknown) =>
+    request<{ ok: boolean; applied: Record<string, number>; skipped: Record<string, number> }>("/api/backup/import", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   remember: (body: string, opts?: { title?: string; scopeKind?: string; scopeId?: string; expectedRev?: number }) =>
     request<{ status: string; inboxId: string; memoryId?: string; redacted: boolean; queued: boolean; currentRev?: number; hits?: Array<{ type: string; field?: string; line?: number }> }>("/api/remember", {
       method: "POST",
