@@ -12,6 +12,7 @@ import {
   type KeyRow,
   type Memory,
   type SyncReport,
+  type TrustedMcpSourceRow,
   type UpdateInfo,
   type VaultItem,
 } from "./api";
@@ -1153,12 +1154,20 @@ function mcpClientSnippet(url: string, token: string) {
 
 function KeysPanel() {
   const [keys, setKeys] = useState<KeyRow[]>([]);
+  const [trusted, setTrusted] = useState<TrustedMcpSourceRow[] | null>(null);
   const [revealed, setRevealed] = useState<{ id: string; token: string } | null>(null);
   const [busyId, setBusyId] = useState("");
   const [error, setError] = useState("");
   const [mcpUrl, setMcpUrl] = useState("http://127.0.0.1:7443/mcp");
   const refresh = () => void api.keys().then((data) => setKeys(data.keys));
+  const refreshTrusted = () => {
+    void keyApi
+      .trustedSources()
+      .then(setTrusted)
+      .catch(() => setTrusted(null));
+  };
   useEffect(() => void refresh(), []);
+  useEffect(() => refreshTrusted(), []);
   useEffect(() => {
     if (!revealed) return;
     const timer = window.setTimeout(() => setRevealed(null), 15_000);
@@ -1183,7 +1192,8 @@ function KeysPanel() {
         </p>
         <pre>{mcpClientSnippet(mcpUrl, "ol_你刚签发的密钥")}</pre>
         <p>
-          3. 每把密钥在本次启动首次连接时会弹窗确认；同意后可用这些工具：memory.search 按问题检索正文；memory.list 只列标题；memory.remember
+          3. 每把密钥在本次启动首次连接时会弹窗确认；同意时勾选「记住此设备」，以后这台电脑上该密钥从同一地址连接就不再询问（可在下方「记住的连接」撤销）。
+          确认后可用这些工具：memory.search 按问题检索正文；memory.list 只列标题；memory.remember
           写入一整段蒸馏后的记忆（同一作用域覆盖，不要一条条堆）；memory.forget 按 id 删掉。secret
           级内容不会被检索，也不会同步到远端。
         </p>
@@ -1242,6 +1252,39 @@ function KeysPanel() {
           ) : null}
         </div>
       ))}
+      {trusted ? (
+        <div className="panel list">
+          <h3>记住的连接</h3>
+          <p className="muted">
+            确认连接时勾选过「记住此设备」的密钥与来源地址，存在本机，重启 OneLedger 也有效。撤销后，该密钥下次连接会重新弹窗确认。
+          </p>
+          {trusted.length === 0 ? <p className="muted">暂无记住的连接。</p> : null}
+          {trusted.map((row) => (
+            <div className="item" key={`${row.keyId}:${row.source}`}>
+              <h4>{row.keyName || "已删除的密钥"}</h4>
+              <p>{row.source}</p>
+              <button
+                type="button"
+                disabled={Boolean(busyId)}
+                onClick={async () => {
+                  setError("");
+                  setBusyId(`trust:${row.keyId}:${row.source}`);
+                  try {
+                    await keyApi.forgetSource(row.keyId, row.source);
+                    refreshTrusted();
+                  } catch (cause) {
+                    setError(cause instanceof Error ? cause.message : String(cause));
+                  } finally {
+                    setBusyId("");
+                  }
+                }}
+              >
+                撤销记忆
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

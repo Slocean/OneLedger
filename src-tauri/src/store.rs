@@ -1,4 +1,4 @@
-use crate::models::{AgentRecord, ApiKeyRecord, InboxRecord, MemoryRecord};
+use crate::models::{AgentRecord, ApiKeyRecord, InboxRecord, MemoryRecord, TrustedMcpSourceRecord};
 use crate::util::{new_id, now_iso};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -317,6 +317,45 @@ pub fn list_keys(conn: &Connection) -> rusqlite::Result<Vec<ApiKeyRecord>> {
 pub fn touch_key(conn: &Connection, id: &str) -> rusqlite::Result<()> {
     conn.execute("UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2", params![now_iso(), id])?;
     Ok(())
+}
+
+pub fn mcp_source_trusted(conn: &Connection, key_id: &str, source: &str) -> rusqlite::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM trusted_mcp_sources WHERE key_id = ?1 AND source = ?2",
+        [key_id, source],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+pub fn trust_mcp_source(conn: &Connection, key_id: &str, source: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO trusted_mcp_sources (key_id, source, created_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key_id, source) DO NOTHING",
+        params![key_id, source, now_iso()],
+    )?;
+    Ok(())
+}
+
+pub fn list_trusted_mcp_sources(conn: &Connection) -> rusqlite::Result<Vec<TrustedMcpSourceRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.key_id, COALESCE(k.name, ''), t.source, t.created_at
+         FROM trusted_mcp_sources t LEFT JOIN api_keys k ON k.id = t.key_id
+         ORDER BY t.created_at DESC, t.key_id ASC, t.source ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(TrustedMcpSourceRecord {
+            key_id: row.get(0)?,
+            key_name: row.get(1)?,
+            source: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn delete_trusted_mcp_source(conn: &Connection, key_id: &str, source: &str) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM trusted_mcp_sources WHERE key_id = ?1 AND source = ?2", params![key_id, source])? == 1)
 }
 
 pub fn get_sync_cursor(conn: &Connection) -> rusqlite::Result<String> {

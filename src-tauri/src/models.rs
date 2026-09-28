@@ -71,6 +71,15 @@ pub struct ApiKeyRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TrustedMcpSourceRecord {
+    pub key_id: String,
+    pub key_name: String,
+    pub source: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CollectResult {
     pub source: String,
     pub scanned_files: i64,

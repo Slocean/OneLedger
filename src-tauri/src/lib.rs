@@ -121,7 +121,9 @@ pub fn run() {
             vault::vault_organize,
             vault::vault_reveal,
             vault::vault_delete,
-            vault::key_reveal
+            vault::key_reveal,
+            vault::trusted_mcp_sources_list,
+            vault::trusted_mcp_sources_forget
         ])
         .setup(|app| {
             let mut config = load_config();

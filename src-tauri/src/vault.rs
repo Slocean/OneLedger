@@ -2,6 +2,7 @@
 //! desktop approval, but only the Tauri window can reveal a stored value.
 
 use crate::http::AppState;
+use crate::models::TrustedMcpSourceRecord;
 use crate::scan::verify_redacted;
 use crate::store;
 use crate::util::{hash_token, new_id, now_iso};
@@ -263,6 +264,22 @@ pub fn vault_delete(window: WebviewWindow, state: State<'_, AppState>, id: Strin
 }
 
 #[tauri::command]
+pub fn trusted_mcp_sources_list(window: WebviewWindow, state: State<'_, AppState>) -> Result<Vec<TrustedMcpSourceRecord>, String> {
+    validate_window(&window, &state)?;
+    let conn = state.conn.lock().map_err(|_| "数据库不可用".to_string())?;
+    store::list_trusted_mcp_sources(&conn).map_err(|_| "无法读取记住的连接".to_string())
+}
+
+#[tauri::command]
+pub fn trusted_mcp_sources_forget(window: WebviewWindow, state: State<'_, AppState>, key_id: String, source: String) -> Result<(), String> {
+    validate_window(&window, &state)?;
+    let conn = state.conn.lock().map_err(|_| "数据库不可用".to_string())?;
+    store::delete_trusted_mcp_source(&conn, &key_id, &source).map_err(|_| "无法撤销记住的连接".to_string())?;
+    let _ = store::audit(&conn, "admin", "mcp.forget_source", &format!("{key_id} {source}"));
+    Ok(())
+}
+
+#[tauri::command]
 pub fn key_reveal(window: WebviewWindow, state: State<'_, AppState>, id: String) -> Result<String, String> {
     validate_window(&window, &state)?;
     if !id.starts_with("key_") || id.len() > 80 || !id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
@@ -392,6 +409,47 @@ pub(crate) fn confirm_with_title(window: &WebviewWindow, title: &str, message: &
     if answer == IDYES { Ok(()) } else { Err("操作已取消".into()) }
 }
 
+/// 原生确认弹窗，附带「记住此设备」勾选框；返回 Ok(是否勾选)。
+/// TaskDialogIndirect 需要 comctl32 v6 激活上下文，失败时退回无勾选框的 MessageBoxW。
+#[cfg(windows)]
+pub(crate) fn confirm_with_remember(window: &WebviewWindow, title: &str, message: &str, remember_text: &str) -> Result<bool, String> {
+    use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows_sys::Win32::UI::Controls::{
+        TaskDialogIndirect, TASKDIALOGCONFIG, TD_WARNING_ICON, TDCBF_NO_BUTTON, TDCBF_YES_BUTTON,
+        TDF_ALLOW_DIALOG_CANCELLATION, TDF_POSITION_RELATIVE_TO_WINDOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDNO, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO};
+    let handle = window.hwnd().map_err(|_| "无法打开确认窗口".to_string())?;
+    let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    let remember: Vec<u16> = remember_text.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let com = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        let owns_com = com == 0 || com == 1;
+        let mut button: i32 = 0;
+        let mut checked: i32 = 0;
+        let mut config: TASKDIALOGCONFIG = std::mem::zeroed();
+        config.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
+        config.hwndParent = handle.0;
+        config.pszWindowTitle = title.as_ptr();
+        config.Anonymous1.pszMainIcon = TD_WARNING_ICON;
+        config.pszContent = text.as_ptr();
+        config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+        config.dwCommonButtons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
+        config.nDefaultButton = IDNO;
+        config.pszVerificationText = remember.as_ptr();
+        let result = TaskDialogIndirect(&config, &mut button, std::ptr::null_mut(), &mut checked);
+        if owns_com {
+            CoUninitialize();
+        }
+        if result < 0 {
+            let answer = MessageBoxW(handle.0, text.as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+            return if answer == IDYES { Ok(false) } else { Err("操作已取消".into()) };
+        }
+        if button == IDYES { Ok(checked != 0) } else { Err("操作已取消".into()) }
+    }
+}
+
 #[cfg(not(windows))]
 fn confirm(_window: &WebviewWindow, _message: &str) -> Result<(), String> {
     Err("当前系统尚不支持本机凭据空间".into())
@@ -399,6 +457,11 @@ fn confirm(_window: &WebviewWindow, _message: &str) -> Result<(), String> {
 
 #[cfg(not(windows))]
 pub(crate) fn confirm_with_title(_window: &WebviewWindow, _title: &str, _message: &str) -> Result<(), String> {
+    Err("当前系统尚不支持本机确认窗口".into())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn confirm_with_remember(_window: &WebviewWindow, _title: &str, _message: &str, _remember_text: &str) -> Result<bool, String> {
     Err("当前系统尚不支持本机确认窗口".into())
 }
 

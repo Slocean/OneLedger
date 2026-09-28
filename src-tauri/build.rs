@@ -8,6 +8,8 @@ fn main() {
                 "vault_reveal",
                 "vault_delete",
                 "key_reveal",
+                "trusted_mcp_sources_list",
+                "trusted_mcp_sources_forget",
             ]),
         ),
     )

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-trusted-mcp-sources-forget"
+description = "Enables the trusted_mcp_sources_forget command without any pre-configured scope."
+commands.allow = ["trusted_mcp_sources_forget"]
+
+[[permission]]
+identifier = "deny-trusted-mcp-sources-forget"
+description = "Denies the trusted_mcp_sources_forget command without any pre-configured scope."
+commands.deny = ["trusted_mcp_sources_forget"]

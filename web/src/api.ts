@@ -117,7 +117,16 @@ function desktopInvoke<T>(command: string, args?: Record<string, unknown>): Prom
 
 export const keyApi = {
   reveal: (id: string) => desktopInvoke<string>("key_reveal", { id }),
+  trustedSources: () => desktopInvoke<TrustedMcpSourceRow[]>("trusted_mcp_sources_list"),
+  forgetSource: (keyId: string, source: string) => desktopInvoke<void>("trusted_mcp_sources_forget", { keyId, source }),
 };
+
+export interface TrustedMcpSourceRow {
+  keyId: string;
+  keyName: string;
+  source: string;
+  createdAt: string;
+}
 
 export interface VaultItem {
   id: string;

@@ -11,6 +11,8 @@
     "allow-vault-organize",
     "allow-vault-reveal",
     "allow-vault-delete",
-    "allow-key-reveal"
+    "allow-key-reveal",
+    "allow-trusted-mcp-sources-list",
+    "allow-trusted-mcp-sources-forget"
   ]
 }

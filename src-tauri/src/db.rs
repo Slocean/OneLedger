@@ -235,6 +235,22 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         tx.commit()?;
         version = 8;
     }
+    if version < 9 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS trusted_mcp_sources (
+              key_id TEXT NOT NULL,
+              source TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (key_id, source)
+            );
+            "#,
+        )?;
+        tx.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)", params![9, now_iso()])?;
+        tx.commit()?;
+        version = 9;
+    }
     if version < DATA_SCHEMA_VERSION {
         panic!("Database is behind schema {DATA_SCHEMA_VERSION}; update OneLedger.");
     }
@@ -273,6 +289,36 @@ mod tests {
             "INSERT INTO vault_items (id, label, scope_kind, scope_id, protected_value, created_at, updated_at) VALUES ('vault_test', '测试凭据', 'project', 'OneLedger', ?1, 'now', 'now')",
             [vec![1_u8, 2, 3]],
         ).expect("vault table");
+    }
+
+    #[test]
+    fn trusted_mcp_sources_upgrade_from_eight_and_roundtrip() {
+        let conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(INIT_SQL).expect("base schema");
+        migrate(&conn).expect("initial migrations");
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 9", []).expect("restore schema 8 marker");
+        conn.execute_batch("DROP TABLE trusted_mcp_sources;").expect("restore schema 8 tables");
+        migrate(&conn).expect("upgrade to nine");
+        migrate(&conn).expect("repeat upgrade");
+        let versions: i64 = conn.query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 9", [], |row| row.get(0)).expect("marker");
+        assert_eq!(versions, 1);
+        conn.execute(
+            "INSERT INTO api_keys (id, name, token_hash, token_prefix, scopes, tools, created_at) VALUES ('key_t', '测试密钥', 'hash_t', 'ol_t', 'global', 'memory.search', 'now')",
+            [],
+        ).expect("api key");
+        assert!(!crate::store::mcp_source_trusted(&conn, "key_t", "127.0.0.1").expect("trusted check"));
+        crate::store::trust_mcp_source(&conn, "key_t", "127.0.0.1").expect("trust");
+        crate::store::trust_mcp_source(&conn, "key_t", "127.0.0.1").expect("trust again is idempotent");
+        assert!(crate::store::mcp_source_trusted(&conn, "key_t", "127.0.0.1").expect("trusted check"));
+        assert!(!crate::store::mcp_source_trusted(&conn, "key_t", "127.0.0.2").expect("other source"));
+        let rows = crate::store::list_trusted_mcp_sources(&conn).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key_name, "测试密钥");
+        assert_eq!(rows[0].source, "127.0.0.1");
+        assert!(!rows[0].created_at.is_empty());
+        assert!(crate::store::delete_trusted_mcp_source(&conn, "key_t", "127.0.0.1").expect("forget"));
+        assert!(!crate::store::mcp_source_trusted(&conn, "key_t", "127.0.0.1").expect("forgotten"));
+        assert!(!crate::store::delete_trusted_mcp_source(&conn, "key_t", "127.0.0.1").expect("second forget"));
     }
 
     #[test]

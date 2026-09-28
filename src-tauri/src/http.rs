@@ -795,11 +795,28 @@ async fn mcp_post(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<
 }
 
 fn approve_mcp_connection(state: &AppState, key_id: &str, name: &str, source: IpAddr) -> Result<(), String> {
+    {
+        let conn = state.conn.lock().map_err(|_| "数据库不可用".to_string())?;
+        if store::mcp_source_trusted(&conn, key_id, &source.to_string()).map_err(|_| "无法读取记住的连接".to_string())? {
+            return Ok(());
+        }
+    }
     let identity = (key_id.to_string(), source);
     approve_once(&state.mcp_approval, &state.mcp_approved, identity, || {
         let window = vault::agent_window(state)?;
         let visible_name: String = name.chars().filter(|ch| !ch.is_control()).take(60).collect();
-        vault::confirm_with_title(&window, "OneLedger MCP 连接确认", &format!("Agent 密钥「{visible_name}」请求从 {source} 连接 OneLedger。\n同意后，这把密钥从该地址发起的请求在本次启动期间可直接连接。\n是否同意？"))
+        let remembered = vault::confirm_with_remember(
+            &window,
+            "OneLedger MCP 连接确认",
+            &format!("Agent 密钥「{visible_name}」请求从 {source} 连接 OneLedger。\n是否同意？"),
+            &format!("记住此设备：这把密钥从 {source} 连接不再询问（可在 MCP 密钥页撤销）"),
+        )?;
+        if remembered {
+            let conn = state.conn.lock().map_err(|_| "数据库不可用".to_string())?;
+            store::trust_mcp_source(&conn, key_id, &source.to_string()).map_err(|_| "无法记住此设备".to_string())?;
+            let _ = store::audit(&conn, "admin", "mcp.trust_source", &format!("{key_id} {source}"));
+        }
+        Ok(())
     })
 }
 
