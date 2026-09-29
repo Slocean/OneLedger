@@ -44,7 +44,7 @@ function groupInbox(items: Inbox[]): Array<{ key: string; items: Inbox[] }> {
 
 const NOTICE_KEY = "oneledger.noticeAck";
 
-type Tab = "memories" | "queue" | "agents" | "sync" | "keys" | "vault" | "settings";
+type Tab = "memories" | "queue" | "vault" | "settings";
 
 function flavorLabel(flavor?: string) {
   if (flavor === "setup") return "安装版";
@@ -153,6 +153,7 @@ export function App() {
   const [installBusy, setInstallBusy] = useState(false);
   const [updateError, setUpdateError] = useState("");
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [aboutRevealNonce, setAboutRevealNonce] = useState(0);
   const [notice, setNotice] = useState("");
   const [collect, setCollect] = useState<CollectStatus | null>(null);
   const [collectEpoch, setCollectEpoch] = useState(0);
@@ -171,6 +172,7 @@ export function App() {
       if (opts?.reveal) {
         setTab("settings");
         setAboutOpen(true);
+        setAboutRevealNonce((nonce) => nonce + 1);
       }
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
@@ -329,11 +331,8 @@ export function App() {
             [
               ["memories", "记忆"],
               ["queue", "蒸馏队列"],
-              ["agents", "Agent"],
-              ["sync", "同步"],
-              ["keys", "MCP 密钥"],
               ["vault", "凭据空间"],
-              ["settings", "服务器与存储"],
+              ["settings", "设置"],
             ] as const
           ).map(([id, label]) => (
             <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}>
@@ -345,7 +344,7 @@ export function App() {
         {updateInfo?.update && !updateError ? (
           <p className="banner">
             发现 {updateInfo.latest}。
-            {updateInfo.can_hot_update ? "点顶栏「一键更新」即可。" : "打开「服务器与存储 → 关于与更新」查看。"}
+            {updateInfo.can_hot_update ? "点顶栏「一键更新」即可。" : "打开「设置 → 关于与更新」查看。"}
           </p>
         ) : null}
         {collect?.running ? <CollectBanner collect={collect} /> : null}
@@ -353,9 +352,6 @@ export function App() {
       <main className="stage">
         {tab === "memories" ? <Memories refreshKey={collectEpoch} /> : null}
         {tab === "queue" ? <QueueView refreshKey={collectEpoch} /> : null}
-        {tab === "agents" ? <AgentsPanel refreshKey={collectEpoch} collecting={Boolean(collect?.running)} /> : null}
-        {tab === "sync" ? <SyncPanel /> : null}
-        {tab === "keys" ? <KeysPanel /> : null}
         {tab === "vault" ? <VaultPanel /> : null}
         {tab === "settings" ? (
           <SettingsPanel
@@ -363,6 +359,9 @@ export function App() {
             updateBusy={updateBusy}
             installBusy={installBusy}
             aboutOpen={aboutOpen}
+            aboutRevealNonce={aboutRevealNonce}
+            collectEpoch={collectEpoch}
+            collecting={Boolean(collect?.running)}
             onAboutOpenChange={setAboutOpen}
             onRefreshUpdates={() => loadUpdates({ reveal: true })}
             onInstallUpdate={installUpdate}
@@ -396,6 +395,15 @@ function CollectBanner({ collect }: { collect: CollectStatus }) {
     <p className="banner collect-banner">
       <span className="spinner" aria-hidden />
       <span>{collect.message || "正在扫描本地记忆…"}</span>
+    </p>
+  );
+}
+
+function Loading({ label = "加载中…" }: { label?: string }) {
+  return (
+    <p className="loading muted" role="status">
+      <span className="spinner" aria-hidden />
+      <span>{label}</span>
     </p>
   );
 }
@@ -434,14 +442,19 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
   const [scopeId, setScopeId] = useState("");
   const [draft, setDraft] = useState("");
   const [note, setNote] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const backupInputRef = useRef<HTMLInputElement>(null);
   const grouped = useMemo(() => kindItems(items, kind), [items, kind]);
   const selected = grouped.find((item) => (item.scopeId ?? "") === scopeId) ?? grouped[0];
   const refresh = () =>
-    void api.memories().then((data) => {
-      setItems(data.memories);
-    });
+    void api
+      .memories()
+      .then((data) => {
+        setItems(data.memories);
+      })
+      .finally(() => setLoaded(true));
   useEffect(() => {
     void refresh();
   }, [refreshKey]);
@@ -454,7 +467,7 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
     setDraft(selected?.body ?? "");
   }, [selected?.id, selected?.updatedAt]);
   const exportFile = async (format: "json" | "md") => {
-    setBusy(true);
+    setBusy(format);
     try {
       const pack = await api.exportMemories();
       const stamp = pack.exportedAt.slice(0, 10);
@@ -468,22 +481,22 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
     } catch (error) {
       setNote(error instanceof Error ? error.message : String(error));
     } finally {
-      setBusy(false);
+      setBusy("");
     }
   };
   const exportBackup = async () => {
-    setBusy(true);
+    setBusy("backup");
     try {
       const filename = await api.backupExport();
       setNote(`已导出全部数据：${filename}`);
     } catch (error) {
       setNote(error instanceof Error ? error.message : String(error));
     } finally {
-      setBusy(false);
+      setBusy("");
     }
   };
   const importBackup = async (file: File) => {
-    setBusy(true);
+    setBusy("import");
     try {
       const parsed = JSON.parse(await file.text()) as unknown;
       const result = await api.backupImport(parsed);
@@ -498,7 +511,7 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
     } catch (error) {
       setNote(error instanceof Error ? error.message : String(error));
     } finally {
-      setBusy(false);
+      setBusy("");
     }
   };
   const emptyHint =
@@ -524,11 +537,11 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
           ))}
         </nav>
         <div className="row">
-          <button disabled={busy} onClick={() => void exportBackup()}>
-            导出全部数据
+          <button disabled={Boolean(busy)} onClick={() => void exportBackup()}>
+            {busy === "backup" ? "导出中…" : "导出全部数据"}
           </button>
-          <button disabled={busy} onClick={() => backupInputRef.current?.click()}>
-            导入备份
+          <button disabled={Boolean(busy)} onClick={() => backupInputRef.current?.click()}>
+            {busy === "import" ? "导入中…" : "导入备份"}
           </button>
           <input
             ref={backupInputRef}
@@ -541,11 +554,15 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
               if (file) void importBackup(file);
             }}
           />
-          <button disabled={busy} onClick={() => void exportFile("md")}>
-            导出 Markdown
+          <button disabled={Boolean(busy)} onClick={() => void exportFile("md")}>
+            {busy === "md" ? "导出中…" : "导出 Markdown"}
           </button>
         </div>
       </div>
+      {!loaded ? (
+        <Loading />
+      ) : (
+        <>
       {grouped.length > 1 ? (
         <nav className="tabs subtabs" aria-label="蒸馏标题">
           {grouped.map((item) => (
@@ -564,7 +581,9 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
         className="form"
         onSubmit={async (event) => {
           event.preventDefault();
-          if (!draft.trim()) return;
+          if (!draft.trim() || saving) return;
+          setSaving(true);
+          try {
           const result = await api.remember(draft.trim(), {
             title: selected?.title,
             scopeKind: kind,
@@ -583,6 +602,11 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
               : `已保存。${hitSummary}`,
           );
           if (result.status === "stored" || result.status === "unchanged") refresh();
+          } catch (cause) {
+            setNote(cause instanceof Error ? cause.message : String(cause));
+          } finally {
+            setSaving(false);
+          }
         }}
       >
         <label>
@@ -596,12 +620,14 @@ function Memories({ refreshKey = 0 }: { refreshKey?: number }) {
             {selected.scopeId ? ` · ${selected.scopeId}` : ""} · rev {selected.rev} · {selected.source}
           </p>
         ) : null}
-        <button className="primary" type="submit">
-          保存
+        <button className="primary" type="submit" disabled={saving}>
+          {saving ? "保存中…" : "保存"}
         </button>
         {note ? <p className="ok">{note}</p> : null}
       </form>
       {!selected ? <p className="muted">{emptyHint}</p> : null}
+        </>
+      )}
     </div>
   );
 }
@@ -639,13 +665,17 @@ function DistillTasks({ refreshKey = 0, onHandled }: { refreshKey?: number; onHa
   const [saving, setSaving] = useState(false);
   const [visible, setVisible] = useState(20);
   const [filter, setFilter] = useState("");
+  const [loaded, setLoaded] = useState(false);
 
   const refresh = () =>
-    void api.distillTasks().then((data) => {
-      setTasks(data.tasks);
-      setProvider(data.provider);
-      setModel(data.model);
-    });
+    void api
+      .distillTasks()
+      .then((data) => {
+        setTasks(data.tasks);
+        setProvider(data.provider);
+        setModel(data.model);
+      })
+      .finally(() => setLoaded(true));
   useEffect(() => {
     void refresh();
   }, [refreshKey]);
@@ -700,6 +730,9 @@ function DistillTasks({ refreshKey = 0, onHandled }: { refreshKey?: number; onHa
   const shown = matched.slice(0, visible);
   const totalPending = tasks.reduce((sum, task) => sum + task.pending, 0);
 
+  if (!loaded) {
+    return <Loading />;
+  }
   if (!tasks.length) {
     return <p className="muted">没有待蒸馏任务。采集到新材料后会自动出现在这里。</p>;
   }
@@ -739,8 +772,22 @@ function DistillTasks({ refreshKey = 0, onHandled }: { refreshKey?: number; onHa
               <p className="muted">尚无草稿。{provider === "none" ? "可直接手工整理整篇摘要。" : "可生成模型草稿后审核。"}</p>
             )}
             <div className="row">
-              <button type="button" className={open ? "active" : ""} onClick={() => (open ? setOpenKey("") : void openEditor(task))}>
-                {open ? "收起" : "审核 / 整理"}
+              <button
+                type="button"
+                className={open ? "active" : ""}
+                disabled={Boolean(busy)}
+                onClick={() => {
+                  if (open) {
+                    setOpenKey("");
+                    return;
+                  }
+                  setBusy(`open:${key(task)}`);
+                  void openEditor(task)
+                    .catch((cause) => setNote(`打开失败：${cause instanceof Error ? cause.message : String(cause)}`))
+                    .finally(() => setBusy(""));
+                }}
+              >
+                {busy === `open:${key(task)}` ? "打开中…" : open ? "收起" : "审核 / 整理"}
               </button>
               {provider !== "none" ? (
                 <button
@@ -766,13 +813,21 @@ function DistillTasks({ refreshKey = 0, onHandled }: { refreshKey?: number; onHa
               {draft && draft.status !== "discarded" ? (
                 <button
                   type="button"
+                  disabled={Boolean(busy)}
                   onClick={async () => {
-                    await api.discardDraft(draft.id);
-                    setNote("草稿已废弃，来源材料保持待处理。");
-                    refresh();
+                    setBusy(`discard:${draft.id}`);
+                    try {
+                      await api.discardDraft(draft.id);
+                      setNote("草稿已废弃，来源材料保持待处理。");
+                      refresh();
+                    } catch (cause) {
+                      setNote(`废弃失败：${cause instanceof Error ? cause.message : String(cause)}`);
+                    } finally {
+                      setBusy("");
+                    }
                   }}
                 >
-                  废弃草稿
+                  {busy === `discard:${draft.id}` ? "废弃中…" : "废弃草稿"}
                 </button>
               ) : null}
             </div>
@@ -859,7 +914,17 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
   const [draftRev, setDraftRev] = useState(0);
   const [saving, setSaving] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const refresh = () => void api.inbox(queueStatus).then((data) => { setInbox(data.inbox); setHasMore(data.hasMore); });
+  const [loaded, setLoaded] = useState(false);
+  const [busyId, setBusyId] = useState("");
+  const [loadingMore, setLoadingMore] = useState(false);
+  const refresh = () =>
+    void api
+      .inbox(queueStatus)
+      .then((data) => {
+        setInbox(data.inbox);
+        setHasMore(data.hasMore);
+      })
+      .finally(() => setLoaded(true));
   useEffect(() => {
     void refresh();
   }, [refreshKey, queueStatus]);
@@ -873,16 +938,19 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
         <button type="button" className={queueStatus === "proposed" ? "active" : ""} onClick={() => setQueueStatus("proposed")}>待蒸馏</button>
         <button type="button" className={queueStatus === "rejected" ? "active" : ""} onClick={() => setQueueStatus("rejected")}>已拒收</button>
       </div>
-      {queueStatus === "rejected" ? <button type="button" onClick={async () => {
+      {queueStatus === "rejected" ? <button type="button" disabled={busyId === "prune"} onClick={async () => {
         if (!window.confirm("清理 90 天前的拒收记录，并将过期脱敏事件汇总归档？")) return;
+        setBusyId("prune");
         try {
           const result = await api.pruneHistory();
           setNote(`已清理 ${result.removedRejected} 条拒收记录，归档 ${result.archivedEvents} 条脱敏事件。`);
           refresh();
         } catch (error) {
           setNote(`清理失败：${String(error)}`);
+        } finally {
+          setBusyId("");
         }
-      }}>清理 90 天前记录</button> : null}
+      }}>{busyId === "prune" ? "清理中…" : "清理 90 天前记录"}</button> : null}
       {queueStatus === "proposed" ? <div className="row">
         <button type="button" onClick={() => setAdding((open) => !open)}>
           添加自定义
@@ -893,13 +961,20 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
           className="form"
           onSubmit={async (event) => {
             event.preventDefault();
-            if (!customBody.trim()) return;
-            await api.queueCustom(customBody.trim(), customTitle.trim() || undefined);
-            setCustomTitle("");
-            setCustomBody("");
-            setAdding(false);
-            setNote("已加入队列。");
-            refresh();
+            if (!customBody.trim() || saving) return;
+            setSaving(true);
+            try {
+              await api.queueCustom(customBody.trim(), customTitle.trim() || undefined);
+              setCustomTitle("");
+              setCustomBody("");
+              setAdding(false);
+              setNote("已加入队列。");
+              refresh();
+            } catch (cause) {
+              setNote(`加入失败：${cause instanceof Error ? cause.message : String(cause)}`);
+            } finally {
+              setSaving(false);
+            }
           }}
         >
           <label>
@@ -910,12 +985,13 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
             自定义原文
             <textarea rows={6} value={customBody} onChange={(event) => setCustomBody(event.target.value)} />
           </label>
-          <button className="primary" type="submit">
-            加入队列
+          <button className="primary" type="submit" disabled={saving}>
+            {saving ? "加入中…" : "加入队列"}
           </button>
         </form>
       ) : null}
       {note ? <p className="ok">{note}</p> : null}
+      {!loaded ? <Loading /> : (<>
       {inbox.length === 0 && !adding ? <p className="muted">{queueStatus === "rejected" ? "暂无拒收记录。" : "队列是空的。"}</p> : null}
       {groups.map((group) => (
         <details className="queue-group" key={group.key} open={groups.length <= 3}>
@@ -959,27 +1035,43 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
                         选入本次蒸馏
                       </label> : null}
                       {queueStatus === "proposed" ? <button
+                        disabled={Boolean(busyId)}
                         onClick={async () => {
-                          const { memories } = await api.memories({ scopeKind: item.scopeKind ?? "personal", scopeId: item.scopeId });
-                          const current = memories[0];
-                          setDraftFor(item.id);
-                          setDraftBody(current?.body ?? "");
-                          setDraftTitle(current?.title ?? item.title);
-                          setDraftRev(current?.rev ?? 0);
-                          setSelectedIds((ids) => ids.includes(item.id) ? ids : [item.id]);
-                          setNote("");
+                          setBusyId(`draft:${item.id}`);
+                          try {
+                            const { memories } = await api.memories({ scopeKind: item.scopeKind ?? "personal", scopeId: item.scopeId });
+                            const current = memories[0];
+                            setDraftFor(item.id);
+                            setDraftBody(current?.body ?? "");
+                            setDraftTitle(current?.title ?? item.title);
+                            setDraftRev(current?.rev ?? 0);
+                            setSelectedIds((ids) => ids.includes(item.id) ? ids : [item.id]);
+                            setNote("");
+                          } catch (cause) {
+                            setNote(`载入失败：${cause instanceof Error ? cause.message : String(cause)}`);
+                          } finally {
+                            setBusyId("");
+                          }
                         }}
                       >
-                        蒸馏写入
+                        {busyId === `draft:${item.id}` ? "载入中…" : "蒸馏写入"}
                       </button> : null}
                       <button
+                        disabled={busyId === `reject:${item.id}`}
                         onClick={async () => {
-                          await api.reject(item.id);
-                          setOpenId("");
-                          refresh();
+                          setBusyId(`reject:${item.id}`);
+                          try {
+                            await api.reject(item.id);
+                            setOpenId("");
+                            refresh();
+                          } catch (cause) {
+                            setNote(`丢弃失败：${cause instanceof Error ? cause.message : String(cause)}`);
+                          } finally {
+                            setBusyId("");
+                          }
                         }}
                       >
-                        丢弃
+                        {busyId === `reject:${item.id}` ? "丢弃中…" : "丢弃"}
                       </button>
                     </div>
                     {queueStatus === "proposed" && draftFor === item.id ? (
@@ -1019,11 +1111,17 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
           })}
         </details>
       ))}
-      {hasMore ? <button type="button" onClick={async () => {
-        const data = await api.inbox(queueStatus, inbox.length);
-        setInbox((items) => [...items, ...data.inbox.filter((item) => !items.some((old) => old.id === item.id))]);
-        setHasMore(data.hasMore);
-      }}>加载更多材料</button> : null}
+      {hasMore ? <button type="button" disabled={loadingMore} onClick={async () => {
+        setLoadingMore(true);
+        try {
+          const data = await api.inbox(queueStatus, inbox.length);
+          setInbox((items) => [...items, ...data.inbox.filter((item) => !items.some((old) => old.id === item.id))]);
+          setHasMore(data.hasMore);
+        } finally {
+          setLoadingMore(false);
+        }
+      }}>{loadingMore ? "加载中…" : "加载更多材料"}</button> : null}
+      </>)}
     </div>
   );
 }
@@ -1034,10 +1132,23 @@ function AgentsPanel({ refreshKey = 0, collecting = false }: { refreshKey?: numb
   const [rootPath, setRootPath] = useState("");
   const [busy, setBusy] = useState<string>("");
   const [note, setNote] = useState("");
-  const refresh = () => void api.agents().then((data) => setAgents(data.agents));
+  const [loaded, setLoaded] = useState(false);
+  const refresh = () =>
+    void api
+      .agents()
+      .then((data) => setAgents(data.agents))
+      .finally(() => setLoaded(true));
   useEffect(() => {
     void refresh();
   }, [refreshKey]);
+
+  if (!loaded) {
+    return (
+      <div className="list">
+        <Loading />
+      </div>
+    );
+  }
 
   return (
     <div className="list">
@@ -1057,7 +1168,7 @@ function AgentsPanel({ refreshKey = 0, collecting = false }: { refreshKey?: numb
             }
           }}
         >
-          收集全部已启用
+          {busy === "all" ? "收集中…" : "收集全部已启用"}
         </button>
       </div>
       {note ? <p className="ok">{note}</p> : null}
@@ -1113,7 +1224,7 @@ function AgentsPanel({ refreshKey = 0, collecting = false }: { refreshKey?: numb
                 }
               }}
             >
-              只收这个
+              {busy === agent.id ? "收集中…" : "只收这个"}
             </button>
             {agent.builtin ? null : (
               <button
@@ -1159,15 +1270,31 @@ function AgentsPanel({ refreshKey = 0, collecting = false }: { refreshKey?: numb
 
 function SyncPanel() {
   const [report, setReport] = useState<SyncReport | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
   return (
     <div className="panel">
       <p className="muted">叶子节点会把记忆推到远端中心，并拉回更新。secret 级条目不会上同步线。</p>
-      <button
-        className="primary"
-        onClick={async () => setReport(await api.sync())}
-      >
-        立即同步
-      </button>
+      <div className="row">
+        <button
+          className="primary"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            setError("");
+            try {
+              setReport(await api.sync());
+            } catch (cause) {
+              setError(cause instanceof Error ? cause.message : String(cause));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          {busy ? "同步中…" : "立即同步"}
+        </button>
+      </div>
+      {error ? <p className="error">{error}</p> : null}
       {report ? (
         <p className={report.error ? "error" : "ok"}>
           {report.skipped
@@ -1204,7 +1331,12 @@ function KeysPanel() {
   const [busyId, setBusyId] = useState("");
   const [error, setError] = useState("");
   const [mcpUrl, setMcpUrl] = useState("http://127.0.0.1:7443/mcp");
-  const refresh = () => void api.keys().then((data) => setKeys(data.keys));
+  const [loaded, setLoaded] = useState(false);
+  const refresh = () =>
+    void api
+      .keys()
+      .then((data) => setKeys(data.keys))
+      .finally(() => setLoaded(true));
   const refreshTrusted = () => {
     void keyApi
       .trustedSources()
@@ -1221,6 +1353,13 @@ function KeysPanel() {
   useEffect(() => {
     void api.config().then((config) => setMcpUrl(mcpEndpoint(config.bind, config.port)));
   }, []);
+  if (!loaded) {
+    return (
+      <div className="list">
+        <Loading />
+      </div>
+    );
+  }
   return (
     <div className="list">
       <div className="panel list">
@@ -1244,7 +1383,7 @@ function KeysPanel() {
         </p>
         <p>凭据空间另有 vault.list、vault.put、vault.organize、vault.delete：Agent 可查看目录并提出整理操作；写入、移动或删除都须在桌面窗口逐次确认，MCP 不返回已保存的原值。</p>
         <p className="muted">
-          地址来自当前监听配置。若改过端口，以「服务器与存储」里保存的为准。本说明是 HTTP MCP；源码目录下也可用
+          地址来自当前监听配置。若改过端口，以「设置 → 服务器与存储」里保存的为准。本说明是 HTTP MCP；源码目录下也可用
           oneledger mcp 走 stdio，但桌面版日常用上面这段。
         </p>
       </div>
@@ -1345,9 +1484,14 @@ function VaultPanel() {
   const [revealed, setRevealed] = useState<{ id: string; value: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
-    void vaultApi.list().then(setItems).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
+    vaultApi
+      .list()
+      .then(setItems)
+      .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))
+      .finally(() => setLoaded(true));
   }, []);
   useEffect(() => {
     if (!revealed) return;
@@ -1500,7 +1644,12 @@ function VaultPanel() {
       </div>
 
       {error ? <p className="error" role="alert">{error}</p> : null}
-      {items.map((item) => (
+      {!loaded ? (
+        <Loading />
+      ) : items.length === 0 ? (
+        <p className="muted">还没有保存的凭据。</p>
+      ) : null}
+      {loaded ? items.map((item) => (
         <div className="item list" key={item.id}>
           <div>
             <h3>{item.label}</h3>
@@ -1526,16 +1675,29 @@ function VaultPanel() {
             <pre className="vault-revealed" aria-label={`${item.label} 的原值`}>{revealed.value}</pre>
           ) : null}
         </div>
-      ))}
+      )) : null}
     </div>
   );
 }
+
+type SettingsSection = "collect" | "mcp" | "sync" | "server" | "about";
+
+const SETTINGS_SECTIONS: Array<[SettingsSection, string]> = [
+  ["server", "服务器与存储"],
+  ["collect", "采集与 Agent"],
+  ["mcp", "MCP 密钥"],
+  ["sync", "同步"],
+  ["about", "关于与更新"],
+];
 
 function SettingsPanel({
   updateInfo,
   updateBusy,
   installBusy,
   aboutOpen,
+  aboutRevealNonce,
+  collectEpoch,
+  collecting,
   onAboutOpenChange,
   onRefreshUpdates,
   onInstallUpdate,
@@ -1544,10 +1706,14 @@ function SettingsPanel({
   updateBusy: boolean;
   installBusy: boolean;
   aboutOpen: boolean;
+  aboutRevealNonce: number;
+  collectEpoch: number;
+  collecting: boolean;
   onAboutOpenChange: (open: boolean) => void;
   onRefreshUpdates: () => Promise<void>;
   onInstallUpdate: () => Promise<void>;
 }) {
+  const [section, setSection] = useState<SettingsSection>("server");
   const [form, setForm] = useState({
     bind: "127.0.0.1",
     port: 7443,
@@ -1568,224 +1734,325 @@ function SettingsPanel({
     qoder: true,
     updateUrl: "",
   });
-  const [saved, setSaved] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState<{ section: SettingsSection; text: string; failed?: boolean } | null>(null);
   useEffect(() => {
-    void api.config().then((config) => {
-      const storage = config.storage as { driver: string; sqlitePath: string; postgresUrl: string };
-      const sync = config.sync as { role: string; remoteUrl: string; nodeKey: string };
-      const collect = config.collect as {
-        cursor: boolean;
-        claude: boolean;
-        projects: boolean;
-        extraRoots: string[];
-        codex: boolean;
-        continue: boolean;
-        zcode?: boolean;
-        workbuddy?: boolean;
-        qoder?: boolean;
-      };
-      setForm({
-        bind: String(config.bind),
-        port: Number(config.port),
-        driver: storage.driver,
-        sqlitePath: storage.sqlitePath,
-        postgresUrl: storage.postgresUrl,
-        role: sync.role,
-        remoteUrl: sync.remoteUrl,
-        nodeKey: sync.nodeKey,
-        cursor: collect.cursor,
-        claude: collect.claude,
-        projects: collect.projects,
-        extraRoots: (collect.extraRoots ?? []).join("\n"),
-        codex: collect.codex,
-        continue: collect.continue,
-        zcode: collect.zcode ?? true,
-        workbuddy: collect.workbuddy ?? true,
-        qoder: collect.qoder ?? true,
-        updateUrl: String(config.updateUrl ?? ""),
-      });
-    });
+    void api
+      .config()
+      .then((config) => {
+        const storage = config.storage as { driver: string; sqlitePath: string; postgresUrl: string };
+        const sync = config.sync as { role: string; remoteUrl: string; nodeKey: string };
+        const collect = config.collect as {
+          cursor: boolean;
+          claude: boolean;
+          projects: boolean;
+          extraRoots: string[];
+          codex: boolean;
+          continue: boolean;
+          zcode?: boolean;
+          workbuddy?: boolean;
+          qoder?: boolean;
+        };
+        setForm({
+          bind: String(config.bind),
+          port: Number(config.port),
+          driver: storage.driver,
+          sqlitePath: storage.sqlitePath,
+          postgresUrl: storage.postgresUrl,
+          role: sync.role,
+          remoteUrl: sync.remoteUrl,
+          nodeKey: sync.nodeKey,
+          cursor: collect.cursor,
+          claude: collect.claude,
+          projects: collect.projects,
+          extraRoots: (collect.extraRoots ?? []).join("\n"),
+          codex: collect.codex,
+          continue: collect.continue,
+          zcode: collect.zcode ?? true,
+          workbuddy: collect.workbuddy ?? true,
+          qoder: collect.qoder ?? true,
+          updateUrl: String(config.updateUrl ?? ""),
+        });
+      })
+      .finally(() => setLoaded(true));
   }, []);
+  useEffect(() => {
+    if (aboutRevealNonce > 0) setSection("about");
+  }, [aboutRevealNonce]);
+
+  const save = async (from: SettingsSection) => {
+    setSaving(true);
+    try {
+      await api.saveConfig({
+        bind: form.bind,
+        port: form.port,
+        storage: {
+          driver: form.driver,
+          sqlitePath: form.sqlitePath,
+          postgresUrl: form.postgresUrl,
+        },
+        sync: {
+          role: form.role,
+          remoteUrl: form.remoteUrl,
+          nodeKey: form.nodeKey,
+        },
+        collect: {
+          cursor: form.cursor,
+          claude: form.claude,
+          projects: form.projects,
+          extraRoots: form.extraRoots
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean),
+          codex: form.codex,
+          continue: form.continue,
+          zcode: form.zcode,
+          workbuddy: form.workbuddy,
+          qoder: form.qoder,
+        },
+        updateUrl: form.updateUrl,
+      });
+      setSaved({ section: from, text: "已写入本机配置。改了监听地址或存储驱动时，请重启 oneledger serve。" });
+    } catch (cause) {
+      setSaved({ section: from, failed: true, text: cause instanceof Error ? cause.message : String(cause) });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const savedNote = (from: SettingsSection) =>
+    saved && saved.section === from ? (
+      <p className={saved.failed ? "error" : "ok"}>{saved.text}</p>
+    ) : null;
 
   return (
-    <form
-      className="form"
-      onSubmit={async (event) => {
-        event.preventDefault();
-        await api.saveConfig({
-          bind: form.bind,
-          port: form.port,
-          storage: {
-            driver: form.driver,
-            sqlitePath: form.sqlitePath,
-            postgresUrl: form.postgresUrl,
-          },
-          sync: {
-            role: form.role,
-            remoteUrl: form.remoteUrl,
-            nodeKey: form.nodeKey,
-          },
-          collect: {
-            cursor: form.cursor,
-            claude: form.claude,
-            projects: form.projects,
-            extraRoots: form.extraRoots
-              .split(/\r?\n/)
-              .map((line) => line.trim())
-              .filter(Boolean),
-            codex: form.codex,
-            continue: form.continue,
-            zcode: form.zcode,
-            workbuddy: form.workbuddy,
-            qoder: form.qoder,
-          },
-          updateUrl: form.updateUrl,
-        });
-        setSaved("已写入本机配置。改了监听地址或存储驱动时，请重启 oneledger serve。");
-      }}
-    >
-      <label>
-        监听地址
-        <input value={form.bind} onChange={(event) => setForm({ ...form, bind: event.target.value })} />
-      </label>
-      <label>
-        端口
-        <input
-          type="number"
-          value={form.port}
-          onChange={(event) => setForm({ ...form, port: Number(event.target.value) })}
-        />
-      </label>
-      <label>
-        存储
-        <select value={form.driver} onChange={(event) => setForm({ ...form, driver: event.target.value })}>
-          <option value="sqlite">本机 SQLite</option>
-          <option value="postgres">Postgres</option>
-        </select>
-      </label>
-      <label>
-        SQLite 路径
-        <input value={form.sqlitePath} onChange={(event) => setForm({ ...form, sqlitePath: event.target.value })} />
-      </label>
-      <label>
-        Postgres URL
-        <input
-          value={form.postgresUrl}
-          onChange={(event) => setForm({ ...form, postgresUrl: event.target.value })}
-          placeholder="postgres://user:pass@host:5432/oneledger"
-        />
-      </label>
-      <div className="check-grid">
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={form.cursor}
-          onChange={(event) => setForm({ ...form, cursor: event.target.checked })}
-        />
-        收集 Cursor Agent Store
-      </label>
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={form.claude}
-          onChange={(event) => setForm({ ...form, claude: event.target.checked })}
-        />
-        收集 Claude Code memory
-      </label>
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={form.codex}
-          onChange={(event) => setForm({ ...form, codex: event.target.checked })}
-        />
-        收集 Codex ~/.codex
-      </label>
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={form.continue}
-          onChange={(event) => setForm({ ...form, continue: event.target.checked })}
-        />
-        收集 Continue ~/.continue
-      </label>
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={form.zcode}
-          onChange={(event) => setForm({ ...form, zcode: event.target.checked })}
-        />
-        收集 ZCode ~/.zcode
-      </label>
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={form.workbuddy}
-          onChange={(event) => setForm({ ...form, workbuddy: event.target.checked })}
-        />
-        收集 WorkBuddy ~/.workbuddy
-      </label>
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={form.qoder}
-          onChange={(event) => setForm({ ...form, qoder: event.target.checked })}
-        />
-        收集 Qoder ~/.qoder
-      </label>
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={form.projects}
-          onChange={(event) => setForm({ ...form, projects: event.target.checked })}
-        />
-        收集项目约定（AGENTS.md / CLAUDE.md / .cursor/rules）
-      </label>
-      </div>
-      <details className="advanced">
-        <summary>高级：同步、扫描根目录、版本检查</summary>
-        <label>
-          同步角色
-          <select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}>
-            <option value="local">仅本地</option>
-            <option value="leaf">叶子（连远端）</option>
-            <option value="hub">中心</option>
-          </select>
-        </label>
-        <label>
-          远端中心 URL
-          <input value={form.remoteUrl} onChange={(event) => setForm({ ...form, remoteUrl: event.target.value })} />
-        </label>
-        <label>
-          节点密钥
-          <input value={form.nodeKey} onChange={(event) => setForm({ ...form, nodeKey: event.target.value })} />
-        </label>
-        <label>
-          扫描根目录（每行一个；留空则扫当前工作目录）
-          <textarea
-            rows={3}
-            value={form.extraRoots}
-            onChange={(event) => setForm({ ...form, extraRoots: event.target.value })}
-            placeholder="E:\Project"
+    <div className="list">
+      <nav className="tabs subtabs" aria-label="设置分区">
+        {SETTINGS_SECTIONS.map(([id, label]) => (
+          <button key={id} type="button" className={section === id ? "active" : ""} onClick={() => setSection(id)}>
+            {label}
+          </button>
+        ))}
+      </nav>
+      {section === "server" ? (
+        loaded ? (
+          <form
+            className="form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void save("server");
+            }}
+          >
+            <label>
+              监听地址
+              <input value={form.bind} onChange={(event) => setForm({ ...form, bind: event.target.value })} />
+            </label>
+            <label>
+              端口
+              <input
+                type="number"
+                value={form.port}
+                onChange={(event) => setForm({ ...form, port: Number(event.target.value) })}
+              />
+            </label>
+            <label>
+              存储
+              <select value={form.driver} onChange={(event) => setForm({ ...form, driver: event.target.value })}>
+                <option value="sqlite">本机 SQLite</option>
+                <option value="postgres">Postgres</option>
+              </select>
+            </label>
+            <label>
+              SQLite 路径
+              <input value={form.sqlitePath} onChange={(event) => setForm({ ...form, sqlitePath: event.target.value })} />
+            </label>
+            <label>
+              Postgres URL
+              <input
+                value={form.postgresUrl}
+                onChange={(event) => setForm({ ...form, postgresUrl: event.target.value })}
+                placeholder="postgres://user:pass@host:5432/oneledger"
+              />
+            </label>
+            <button className="primary" type="submit" disabled={saving}>
+              {saving ? "保存中…" : "保存"}
+            </button>
+            {savedNote("server")}
+          </form>
+        ) : (
+          <Loading />
+        )
+      ) : null}
+      {section === "collect" ? (
+        <>
+          <AgentsPanel refreshKey={collectEpoch} collecting={collecting} />
+          {loaded ? (
+            <form
+              className="form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void save("collect");
+              }}
+            >
+              <h3>采集来源</h3>
+              <div className="check-grid">
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={form.cursor}
+                    onChange={(event) => setForm({ ...form, cursor: event.target.checked })}
+                  />
+                  收集 Cursor Agent Store
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={form.claude}
+                    onChange={(event) => setForm({ ...form, claude: event.target.checked })}
+                  />
+                  收集 Claude Code memory
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={form.codex}
+                    onChange={(event) => setForm({ ...form, codex: event.target.checked })}
+                  />
+                  收集 Codex ~/.codex
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={form.continue}
+                    onChange={(event) => setForm({ ...form, continue: event.target.checked })}
+                  />
+                  收集 Continue ~/.continue
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={form.zcode}
+                    onChange={(event) => setForm({ ...form, zcode: event.target.checked })}
+                  />
+                  收集 ZCode ~/.zcode
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={form.workbuddy}
+                    onChange={(event) => setForm({ ...form, workbuddy: event.target.checked })}
+                  />
+                  收集 WorkBuddy ~/.workbuddy
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={form.qoder}
+                    onChange={(event) => setForm({ ...form, qoder: event.target.checked })}
+                  />
+                  收集 Qoder ~/.qoder
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={form.projects}
+                    onChange={(event) => setForm({ ...form, projects: event.target.checked })}
+                  />
+                  收集项目约定（AGENTS.md / CLAUDE.md / .cursor/rules）
+                </label>
+              </div>
+              <label>
+                扫描根目录（每行一个；留空则扫当前工作目录）
+                <textarea
+                  rows={3}
+                  value={form.extraRoots}
+                  onChange={(event) => setForm({ ...form, extraRoots: event.target.value })}
+                  placeholder="E:\Project"
+                />
+              </label>
+              <button className="primary" type="submit" disabled={saving}>
+                {saving ? "保存中…" : "保存"}
+              </button>
+              {savedNote("collect")}
+            </form>
+          ) : (
+            <Loading />
+          )}
+        </>
+      ) : null}
+      {section === "mcp" ? <KeysPanel /> : null}
+      {section === "sync" ? (
+        <>
+          <SyncPanel />
+          {loaded ? (
+            <form
+              className="form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void save("sync");
+              }}
+            >
+              <h3>同步配置</h3>
+              <label>
+                同步角色
+                <select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}>
+                  <option value="local">仅本地</option>
+                  <option value="leaf">叶子（连远端）</option>
+                  <option value="hub">中心</option>
+                </select>
+              </label>
+              <label>
+                远端中心 URL
+                <input value={form.remoteUrl} onChange={(event) => setForm({ ...form, remoteUrl: event.target.value })} />
+              </label>
+              <label>
+                节点密钥
+                <input value={form.nodeKey} onChange={(event) => setForm({ ...form, nodeKey: event.target.value })} />
+              </label>
+              <button className="primary" type="submit" disabled={saving}>
+                {saving ? "保存中…" : "保存"}
+              </button>
+              {savedNote("sync")}
+            </form>
+          ) : (
+            <Loading />
+          )}
+        </>
+      ) : null}
+      {section === "about" ? (
+        <div className="list">
+          <UpdateBox
+            info={updateInfo}
+            checking={updateBusy}
+            installing={installBusy}
+            open={aboutOpen}
+            onOpenChange={onAboutOpenChange}
+            onRefresh={onRefreshUpdates}
+            onInstall={onInstallUpdate}
           />
-        </label>
-        <label>
-          版本检查 URL（latest.json，可留空）
-          <input value={form.updateUrl} onChange={(event) => setForm({ ...form, updateUrl: event.target.value })} />
-        </label>
-      </details>
-      <UpdateBox
-        info={updateInfo}
-        checking={updateBusy}
-        installing={installBusy}
-        open={aboutOpen}
-        onOpenChange={onAboutOpenChange}
-        onRefresh={onRefreshUpdates}
-        onInstall={onInstallUpdate}
-      />
-      <button className="primary" type="submit">
-        保存
-      </button>
-      {saved ? <p className="ok">{saved}</p> : null}
-    </form>
+          {loaded ? (
+            <form
+              className="form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void save("about");
+              }}
+            >
+              <label>
+                版本检查 URL（latest.json，可留空）
+                <input value={form.updateUrl} onChange={(event) => setForm({ ...form, updateUrl: event.target.value })} />
+              </label>
+              <button className="primary" type="submit" disabled={saving}>
+                {saving ? "保存中…" : "保存"}
+              </button>
+              {savedNote("about")}
+            </form>
+          ) : (
+            <Loading />
+          )}
+        </div>
+      ) : null}
+    </div>
   );
 }

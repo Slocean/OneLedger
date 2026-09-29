@@ -366,6 +366,12 @@ label.check {
   margin: 0 0 12px;
 }
 
+.loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .spinner {
   width: 12px;
   height: 12px;
