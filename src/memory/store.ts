@@ -60,6 +60,7 @@ interface InboxRow {
   queue_status?: QueueStatus;
   conflict_ids?: string;
   created_at: string;
+  source_key?: string;
 }
 
 interface DraftRow {
@@ -170,6 +171,7 @@ function mapInbox(row: InboxRow): InboxRecord {
     queueStatus: row.queue_status ?? "proposed",
     conflictIds: row.conflict_ids ? row.conflict_ids.split(",").filter(Boolean) : [],
     createdAt: row.created_at,
+    sourceKey: row.source_key ?? "",
   };
 }
 
@@ -187,11 +189,58 @@ function scopeWhere(base: string, filter?: ScopeFilter): { sql: string; params: 
   return { sql: `SELECT * FROM memories WHERE ${clauses.join(" AND ")}`, params };
 }
 
+export interface MergeOperationRecord {
+  id: string;
+  fromScopeKind: string;
+  fromScopeId: string;
+  toScopeKind: string;
+  toScopeId: string;
+  movedIds: string[];
+  movedCount: number;
+  sourceBreakdown: Record<string, number>;
+  status: string;
+  createdAt: string;
+  revertedAt: string | null;
+}
+
+/** 列表只读概要（不含 movedIds 大字段）。 */
+export interface MergeOperationSummary {
+  id: string;
+  fromScopeKind: string;
+  fromScopeId: string;
+  toScopeKind: string;
+  toScopeId: string;
+  movedCount: number;
+  sourceBreakdown: Record<string, number>;
+  status: string;
+  createdAt: string;
+  revertedAt: string | null;
+}
+
 export class Store {
   constructor(private readonly db: Db) {}
 
+  /** 存储驱动名，供治理功能在 PostgreSQL 上显式返回 unsupported。 */
+  get driver(): "sqlite" | "postgres" {
+    return this.db.driver;
+  }
+
   async transaction<T>(work: (store: Store) => Promise<T>): Promise<T> {
     return this.db.transaction((db) => work(new Store(db)));
+  }
+
+  /** 底层只读查询（供 scopeMerge 等服务在事务内复用同一连接）。 */
+  dbGet<T>(sql: string, params: unknown[] = []): Promise<T | undefined> {
+    return this.db.get<T>(sql, params);
+  }
+
+  dbAll<T>(sql: string, params: unknown[] = []): Promise<T[]> {
+    return this.db.all<T>(sql, params);
+  }
+
+  /** 执行写语句，返回受影响行数。 */
+  dbRun(sql: string, params: unknown[] = []): Promise<number> {
+    return this.db.run(sql, params);
   }
 
   async lockScope(scopeKind: string, scopeId: string): Promise<void> {
@@ -207,8 +256,8 @@ export class Store {
       ...record,
     };
     await this.db.run(
-      `INSERT INTO inbox (id, title, body, source, scope_kind, scope_id, sensitivity, redacted, created_at, queue_status, conflict_ids)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO inbox (id, title, body, source, scope_kind, scope_id, sensitivity, redacted, created_at, queue_status, conflict_ids, source_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         row.id,
         row.title,
@@ -221,6 +270,7 @@ export class Store {
         row.createdAt,
         row.queueStatus,
         row.conflictIds.join(","),
+        row.sourceKey,
       ],
     );
     return row;
@@ -231,10 +281,13 @@ export class Store {
     return row ? mapInbox(row) : undefined;
   }
 
-  async findCollectedInbox(source: string, scopeKind: InboxRecord["scopeKind"], scopeId: string, body: string): Promise<InboxRecord | undefined> {
+  async findCollectedInbox(source: string, scopeKind: InboxRecord["scopeKind"], scopeId: string, body: string, sourceKey: string): Promise<InboxRecord | undefined> {
+    // 材料级查重限定作用域（P0-04），且必须同一来源键（B-05）：
+    // 同仓库两个不同文件（不同 source_key）同文时各自成一条。
+    // 人工/历史行键为空串，只在键同为空串时互相匹配（保守，不擅自合并）。
     const row = await this.db.get<InboxRow>(
-      "SELECT * FROM inbox WHERE source = ? AND scope_kind = ? AND scope_id = ? AND substr(body, 1, 128) = substr(?, 1, 128) AND body = ? LIMIT 1",
-      [source, scopeKind, scopeId, body, body],
+      "SELECT * FROM inbox WHERE source = ? AND scope_kind = ? AND scope_id = ? AND substr(body, 1, 128) = substr(?, 1, 128) AND body = ? AND source_key = ? ORDER BY id LIMIT 1",
+      [source, scopeKind, scopeId, body, body, sourceKey],
     );
     return row ? mapInbox(row) : undefined;
   }
@@ -247,58 +300,183 @@ export class Store {
     return rows.map(mapInbox);
   }
 
-  /** 按作用域聚合待蒸馏材料：计数与最旧/最新时间在一次查询内完成。 */
-  async inboxScopeSummary(): Promise<Array<{ scopeKind: string; scopeId: string; pending: number; highSignal: number; oldestAt?: string }>> {
-    const rows = await this.db.all<{ scope_kind: string; scope_id: string; pending: number; high_signal: number; oldest_at: string | null }>(
+  /** project 作用域里像路径而不是仓库名的 scopeId。这只是待审标记，归并目标必须人工确认。 */
+  scopeIdLooksLikePath(scopeId: string): boolean {
+    return scopeId.includes("/") || scopeId.includes("\\") || scopeId.includes(":") || scopeId === "." || scopeId === "..";
+  }
+
+  /** 服务端分页的作用域聚合列表：SQL 内筛选与计数，不把全部作用域传给前端。 */
+  async inboxScopePage(query: string, onlyAbnormal: boolean, limit: number, offset: number): Promise<{ rows: Array<{ scopeKind: string; scopeId: string; pending: number; workbuddy: number; oldestAt?: string }>; total: number }> {
+    const abnormalClause = onlyAbnormal
+      ? "HAVING scope_kind = 'project' AND (scope_id LIKE '%/%' OR scope_id LIKE '%\\%' OR scope_id LIKE '%:%' OR scope_id = '.' OR scope_id = '..')"
+      : "HAVING scope_kind = scope_kind";
+    const base = `FROM inbox WHERE queue_status = 'proposed'
+        AND (?1 = '' OR scope_id LIKE '%' || ?1 || '%')
+      GROUP BY scope_kind, scope_id
+      ${abnormalClause}`;
+    const totalRow = await this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM (SELECT scope_kind ${base})`, [query]);
+    const rows = await this.db.all<{ scope_kind: string; scope_id: string; pending: number; workbuddy: number; oldest_at: string | null }>(
       `SELECT scope_kind, scope_id,
               COUNT(*) AS pending,
-              SUM(CASE WHEN lower(source) LIKE '%workbuddy%' THEN 1 ELSE 0 END) AS high_signal,
-              MIN(created_at) AS oldest_at,
-              MAX(created_at) AS newest_at
-       FROM inbox WHERE queue_status = 'proposed'
-       GROUP BY scope_kind, scope_id
-       ORDER BY high_signal DESC, newest_at DESC`,
+              SUM(CASE WHEN lower(source) LIKE '%workbuddy%' THEN 1 ELSE 0 END) AS workbuddy,
+              MIN(created_at) AS oldest_at
+       ${base}
+       ORDER BY MAX(created_at) DESC, scope_id ASC
+       LIMIT ?2 OFFSET ?3`,
+      [query, limit, offset],
     );
-    return rows.map((row) => ({
-      scopeKind: row.scope_kind,
-      scopeId: row.scope_id,
-      pending: Number(row.pending ?? 0),
-      highSignal: Number(row.high_signal ?? 0),
-      oldestAt: row.oldest_at ?? undefined,
-    }));
+    return {
+      rows: rows.map((row) => ({
+        scopeKind: row.scope_kind,
+        scopeId: row.scope_id,
+        pending: Number(row.pending ?? 0),
+        workbuddy: Number(row.workbuddy ?? 0),
+        oldestAt: row.oldest_at ?? undefined,
+      })),
+      total: Number(totalRow?.n ?? 0),
+    };
   }
 
-  /** 一次取出全部作用域的材料样本（每作用域最多 limit 条），避免逐作用域查询。 */
-  async inboxSamplesByScope(limit = 40): Promise<InboxRecord[]> {
+  /** 服务端分页+筛选的材料明细。稳定次序 created_at DESC, id DESC。 */
+  async inboxPage(status: QueueStatus, scopeKind: string, scopeId: string, source: string, limit: number, offset: number): Promise<{ rows: InboxRecord[]; total: number }> {
+    const where = "WHERE queue_status = ?1 AND (?2 = '' OR scope_kind = ?2) AND (?3 = '' OR scope_id = ?3) AND (?4 = '' OR source = ?4)";
+    const totalRow = await this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM inbox ${where}`, [status, scopeKind, scopeId, source]);
     const rows = await this.db.all<InboxRow>(
-      `SELECT * FROM (
-         SELECT *, ROW_NUMBER() OVER (
-           PARTITION BY scope_kind, scope_id
-           ORDER BY CASE WHEN lower(source) LIKE '%workbuddy%' THEN 0 WHEN lower(source) LIKE '%project%' THEN 1 ELSE 2 END,
-                    created_at DESC
-         ) AS scope_rank
-         FROM inbox WHERE queue_status = 'proposed'
-       ) WHERE scope_rank <= ?`,
-      [limit],
+      `SELECT * FROM inbox ${where} ORDER BY created_at DESC, id DESC LIMIT ?5 OFFSET ?6`,
+      [status, scopeKind, scopeId, source, limit, offset],
     );
-    return rows.map(mapInbox);
+    return { rows: rows.map(mapInbox), total: Number(totalRow?.n ?? 0) };
   }
 
-  /** 一次取回每个作用域的最新草稿。 */
-  async allLatestDrafts(): Promise<Map<string, DistillDraft>> {
-    const rows = await this.db.all<DraftRow>(
-      `SELECT * FROM (
+  /** 按精确 ID 集合取材料（供草稿审核展示草稿来源元数据）；顺序按传入次序。 */
+  async inboxByIds(ids: string[]): Promise<InboxRecord[]> {
+    if (!ids.length) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = await this.db.all<InboxRow>(`SELECT * FROM inbox WHERE id IN (${placeholders})`, ids);
+    const byId = new Map(rows.map((row) => [row.id, mapInbox(row)]));
+    return ids.flatMap((id) => {
+      const found = byId.get(id);
+      byId.delete(id);
+      return found ? [found] : [];
+    });
+  }
+
+  /** 一次取回给定作用域集合各自的最新草稿。 */
+  async latestDraftsForScopes(keys: Array<{ scopeKind: string; scopeId: string }>): Promise<Map<string, DistillDraft>> {
+    const out = new Map<string, DistillDraft>();
+    if (!keys.length) return out;
+    let sql = `SELECT * FROM (
          SELECT distill_drafts.*,
                 ROW_NUMBER() OVER (PARTITION BY scope_kind, scope_id ORDER BY updated_at DESC) AS scope_rank
          FROM distill_drafts
-       ) WHERE scope_rank = 1`,
-    );
-    const out = new Map<string, DistillDraft>();
+         WHERE (scope_kind, scope_id) IN (VALUES `;
+    const params: string[] = [];
+    keys.forEach((key, index) => {
+      if (index > 0) sql += ",";
+      sql += "(?, ?)";
+      params.push(key.scopeKind, key.scopeId);
+    });
+    sql += ")) WHERE scope_rank = 1";
+    const rows = await this.db.all<DraftRow>(sql, params);
     for (const row of rows) {
       const draft = mapDraft(row);
       out.set(`${draft.scopeKind}\u0000${draft.scopeId}`, draft);
     }
     return out;
+  }
+
+  async insertMergeOperation(record: MergeOperationRecord): Promise<void> {
+    await this.db.run(
+      `INSERT INTO scope_merge_operations
+         (id, from_scope_kind, from_scope_id, to_scope_kind, to_scope_id, moved_ids, moved_count, source_breakdown, status, created_at, reverted_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        record.id,
+        record.fromScopeKind,
+        record.fromScopeId,
+        record.toScopeKind,
+        record.toScopeId,
+        // 新操作不再把 ID 列表塞进单个 TEXT；批次明细在 scope_merge_operation_items。
+        "",
+        record.movedCount,
+        JSON.stringify(record.sourceBreakdown),
+        record.status,
+        record.createdAt,
+        record.revertedAt,
+      ],
+    );
+    await this.insertMergeOperationItems(record.id, record.movedIds);
+  }
+
+  async insertMergeOperationItems(operationId: string, inboxIds: string[]): Promise<void> {
+    for (const inboxId of inboxIds) {
+      await this.db.run(
+        "INSERT OR IGNORE INTO scope_merge_operation_items (operation_id, inbox_id) VALUES (?, ?)",
+        [operationId, inboxId],
+      );
+    }
+  }
+
+  /** 撤销/详情用的完整操作（含 item 表批次 ID；旧记录回退到 moved_ids 文本）。 */
+  async getMergeOperation(id: string): Promise<{ id: string; fromScopeKind: string; fromScopeId: string; toScopeKind: string; toScopeId: string; movedIds: string[]; movedCount: number; sourceBreakdown: Record<string, number>; status: string; createdAt: string; revertedAt: string | null } | undefined> {
+    const row = await this.db.get<{ id: string; from_scope_kind: string; from_scope_id: string; to_scope_kind: string; to_scope_id: string; moved_ids: string; moved_count: number; source_breakdown: string; status: string; created_at: string; reverted_at: string | null }>(
+      "SELECT * FROM scope_merge_operations WHERE id = ?",
+      [id],
+    );
+    if (!row) return undefined;
+    const items = await this.db.all<{ inbox_id: string }>(
+      "SELECT inbox_id FROM scope_merge_operation_items WHERE operation_id = ?",
+      [id],
+    );
+    return {
+      id: row.id,
+      fromScopeKind: row.from_scope_kind,
+      fromScopeId: row.from_scope_id,
+      toScopeKind: row.to_scope_kind,
+      toScopeId: row.to_scope_id,
+      movedIds: items.length ? items.map((item) => item.inbox_id) : (row.moved_ids ?? "").split("\u001f").filter(Boolean),
+      movedCount: Number(row.moved_count ?? 0),
+      sourceBreakdown: JSON.parse(row.source_breakdown || "{}") as Record<string, number>,
+      status: row.status,
+      createdAt: row.created_at,
+      revertedAt: row.reverted_at,
+    };
+  }
+
+  /** 列表只读概要字段：单次分页 SQL，不读 moved_ids 大字段，避免 N+1 与反序列化巨量 ID（M-03）。 */
+  async listMergeOperations(limit: number, offset: number): Promise<{ rows: MergeOperationSummary[]; total: number }> {
+    const totalRow = await this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM scope_merge_operations");
+    const rows = await this.db.all<{
+      id: string;
+      from_scope_kind: string;
+      from_scope_id: string;
+      to_scope_kind: string;
+      to_scope_id: string;
+      moved_count: number;
+      source_breakdown: string;
+      status: string;
+      created_at: string;
+      reverted_at: string | null;
+    }>(
+      `SELECT id, from_scope_kind, from_scope_id, to_scope_kind, to_scope_id, moved_count, source_breakdown, status, created_at, reverted_at
+       FROM scope_merge_operations ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+      [limit, offset],
+    );
+    return {
+      rows: rows.map((row) => ({
+        id: row.id,
+        fromScopeKind: row.from_scope_kind,
+        fromScopeId: row.from_scope_id,
+        toScopeKind: row.to_scope_kind,
+        toScopeId: row.to_scope_id,
+        movedCount: Number(row.moved_count ?? 0),
+        sourceBreakdown: JSON.parse(row.source_breakdown || "{}") as Record<string, number>,
+        status: row.status,
+        createdAt: row.created_at,
+        revertedAt: row.reverted_at,
+      })),
+      total: Number(totalRow?.n ?? 0),
+    };
   }
 
   /** 仍待审核的草稿，供接口在返回任务前刷新过期状态。 */
@@ -307,21 +485,29 @@ export class Store {
     return rows.map(mapDraft);
   }
 
-  /** 某个作用域的材料样本，高信号优先、其次新的在前。 */
-  async inboxScopeSample(scopeKind: string, scopeId: string, limit = 40): Promise<InboxRecord[]> {
-    const rows = await this.db.all<InboxRow>(
-      `SELECT * FROM inbox WHERE queue_status = 'proposed' AND scope_kind = ? AND scope_id = ?
-       ORDER BY CASE WHEN lower(source) LIKE '%workbuddy%' THEN 0 WHEN lower(source) LIKE '%project%' THEN 1 ELSE 2 END,
-                created_at DESC
-       LIMIT ?`,
-      [scopeKind, scopeId, limit],
-    );
-    return rows.map(mapInbox);
-  }
-
   async inboxHitTypes(id: string): Promise<string[]> {
     const rows = await this.db.all<{ hit_type: string }>("SELECT DISTINCT hit_type FROM redaction_events WHERE inbox_id = ? ORDER BY hit_type", [id]);
     return rows.map((row) => row.hit_type);
+  }
+
+  /** 一次批量取回本页材料的命中规则（消除 N+1）。IN 分块避免 SQLite 变量上限。 */
+  async inboxHitTypesBatch(ids: string[]): Promise<Map<string, string[]>> {
+    const out = new Map<string, string[]>();
+    if (!ids.length) return out;
+    for (let start = 0; start < ids.length; start += 400) {
+      const chunk = ids.slice(start, start + 400);
+      const placeholders = chunk.map(() => "?").join(",");
+      const rows = await this.db.all<{ inbox_id: string; hit_type: string }>(
+        `SELECT inbox_id, hit_type FROM redaction_events WHERE inbox_id IN (${placeholders}) ORDER BY inbox_id, hit_type`,
+        chunk,
+      );
+      for (const row of rows) {
+        const list = out.get(row.inbox_id) ?? [];
+        list.push(row.hit_type);
+        out.set(row.inbox_id, list);
+      }
+    }
+    return out;
   }
 
   async rejectInbox(id: string): Promise<void> {
@@ -586,6 +772,17 @@ export class Store {
     await this.db.run("DELETE FROM agents WHERE id = ? AND builtin = 0", [id]);
   }
 
+  /** 指纹触碰的单调序号：同毫秒时间戳并列时（C-02）取序号最大者为最新。 */
+  private async nextFingerprintSeq(): Promise<number> {
+    const row = await this.dbGet<{ v: string }>("SELECT value AS v FROM sync_meta WHERE key = 'fp_seq'");
+    const next = Number(row?.v ?? 0) + 1;
+    await this.dbRun(
+      "INSERT INTO sync_meta (key, value) VALUES ('fp_seq', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      [String(next)],
+    );
+    return next;
+  }
+
   async latestFingerprint(
     collector: string,
     sourceKey: string,
@@ -596,16 +793,33 @@ export class Store {
     const row = await this.db.get<{ id: string; content_hash: string; last_status: string }>(
       `SELECT id, content_hash, last_status FROM collect_fingerprints
        WHERE collector = ? AND source_key = ? AND scope_kind = ? AND scope_id = ? AND rules_version = ?
-       ORDER BY last_seen_at DESC LIMIT 1`,
+       ORDER BY touched_seq DESC, rowid DESC LIMIT 1`,
       [collector, sourceKey, scopeKind, scopeId, rulesVersion],
     );
     return row ? { id: row.id, contentHash: row.content_hash, lastStatus: row.last_status } : undefined;
   }
 
+  /** 跨作用域查最近指纹：只用于可证明跨作用域唯一的来源键（规范化后的绝对路径）。 */
+  async latestFingerprintGlobal(
+    collector: string,
+    sourceKey: string,
+    rulesVersion: number,
+  ): Promise<{ id: string; contentHash: string; lastStatus: string } | undefined> {
+    const row = await this.db.get<{ id: string; content_hash: string; last_status: string }>(
+      `SELECT id, content_hash, last_status FROM collect_fingerprints
+       WHERE collector = ? AND source_key = ? AND rules_version = ?
+       ORDER BY touched_seq DESC, rowid DESC LIMIT 1`,
+      [collector, sourceKey, rulesVersion],
+    );
+    return row ? { id: row.id, contentHash: row.content_hash, lastStatus: row.last_status } : undefined;
+  }
+
   async touchFingerprint(id: string, lastStatus: string): Promise<void> {
-    await this.db.run("UPDATE collect_fingerprints SET last_seen_at = ?, last_status = ? WHERE id = ?", [
+    const seq = await this.nextFingerprintSeq();
+    await this.db.run("UPDATE collect_fingerprints SET last_seen_at = ?, last_status = ?, touched_seq = ? WHERE id = ?", [
       nowIso(),
       lastStatus,
+      seq,
       id,
     ]);
   }
@@ -620,12 +834,13 @@ export class Store {
     lastStatus: string;
   }): Promise<void> {
     const now = nowIso();
+    const seq = await this.nextFingerprintSeq();
     await this.db.run(
       `INSERT INTO collect_fingerprints
-         (id, collector, source_key, scope_kind, scope_id, content_hash, rules_version, last_status, first_seen_at, last_seen_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (id, collector, source_key, scope_kind, scope_id, content_hash, rules_version, last_status, first_seen_at, last_seen_at, touched_seq)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (collector, source_key, scope_kind, scope_id, content_hash, rules_version)
-       DO UPDATE SET last_seen_at = excluded.last_seen_at, last_status = excluded.last_status`,
+       DO UPDATE SET last_seen_at = excluded.last_seen_at, last_status = excluded.last_status, touched_seq = excluded.touched_seq`,
       [
         newId("fp"),
         record.collector,
@@ -637,6 +852,7 @@ export class Store {
         record.lastStatus,
         now,
         now,
+        seq,
       ],
     );
   }

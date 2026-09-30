@@ -44,20 +44,23 @@ describe("DistillJobService", () => {
     await queue(service, "第一条采集材料");
     await queue(service, "第二条采集材料");
     await service.remember({ body: "WorkBuddy 摘要材料", source: "workbuddy", actor: "collector:workbuddy", scopeKind: "project", scopeId: "OneLedger" });
-    const tasks = await job.tasks();
+    const { tasks, total } = await job.tasksPage("", false, 50, 0);
+    expect(total).toBe(1);
     expect(tasks).toHaveLength(1);
     expect(tasks[0]?.scopeId).toBe("OneLedger");
     expect(tasks[0]?.pending).toBe(3);
-    expect(tasks[0]?.highSignal).toBe(1);
-    // 高信号来源排在首位
-    expect(tasks[0]?.sources[0]?.source).toBe("workbuddy");
+    expect(tasks[0]?.workbuddy).toBe(1);
+    expect(tasks[0]?.abnormal).toBe(false);
     expect(tasks[0]?.oldestWaitingAt).toBeTruthy();
+    // 归属待修正筛选：正常作用域不出现
+    const abnormal = await job.tasksPage("", true, 50, 0);
+    expect(abnormal.total).toBe(0);
     await db.close();
   });
 
   // 造 300 个作用域 × 3 条材料；逐作用域查询会明显变慢甚至拖死连接。
   // 种子数据在一个事务内写入，避免把写入耗时算进被测的聚合耗时。
-  it("aggregates many scopes without one query per scope", async () => {
+  it("aggregates many scopes with server-side paging, not one query per scope", async () => {
     const { db, job } = await setup();
     const now = new Date().toISOString();
     await db.transaction(async (tx) => {
@@ -79,11 +82,15 @@ describe("DistillJobService", () => {
       }
     });
     const startedAt = Date.now();
-    const tasks = await job.tasks();
+    const page = await job.tasksPage("", false, 50, 0);
     const elapsed = Date.now() - startedAt;
-    expect(tasks).toHaveLength(300);
-    expect(tasks.every((task) => task.pending === 3)).toBe(true);
-    expect(tasks.every((task) => task.sources.length === 3)).toBe(true);
+    expect(page.total).toBe(300);
+    expect(page.tasks).toHaveLength(50);
+    expect(page.tasks.every((task) => task.pending === 3)).toBe(true);
+    // 第二页继续
+    const second = await job.tasksPage("", false, 50, 50);
+    expect(second.tasks).toHaveLength(50);
+    expect(second.tasks[0]?.scopeId).not.toBe(page.tasks[0]?.scopeId);
     // 逐作用域查询（600 次往返）在 CI 机器上会慢一个数量级
     expect(elapsed).toBeLessThan(5_000);
     await db.close();
@@ -91,11 +98,14 @@ describe("DistillJobService", () => {
 
   it("stays usable with distill.provider=none and never auto-promotes", async () => {
     const { db, job, store, service } = await setup();
-    await queue(service, "没有模型时也要能手工整理");
-    const result = await job.generateDraft("project", "OneLedger", "admin");
+    const queued = await queue(service, "没有模型时也要能手工整理");
+    const result = await job.generateDraft("project", "OneLedger", [queued.inboxId], "admin");
     expect(result.status).toBe("error");
     expect(String(result.error)).toContain("手工整理");
     expect(await store.listActive()).toHaveLength(0);
+    // 未选中时禁止生成
+    const refused = await job.generateDraft("project", "OneLedger", [], "admin");
+    expect(refused.status).toBe("error");
     // 手工路径仍可用第 2 步的原子确认
     const inbox = await store.listInbox();
     const done = await service.confirmSources({ ids: [inbox[0]!.id], body: "手工整理的整篇", actor: "admin", expectedRev: 0 });
@@ -108,8 +118,8 @@ describe("DistillJobService", () => {
     config.distill.provider = "openai-compatible";
     config.distill.baseUrl = "http://127.0.0.1:9/never";
     config.distill.model = "test-model";
-    await queue(service, "模型失败时来源不能丢");
-    const result = await job.generateDraft("project", "OneLedger", "admin");
+    const queued = await queue(service, "模型失败时来源不能丢");
+    const result = await job.generateDraft("project", "OneLedger", [queued.inboxId], "admin");
     expect(result.status).toBe("failed");
     expect(String(result.error)).toBeTruthy();
     // 来源仍在队列
@@ -118,6 +128,25 @@ describe("DistillJobService", () => {
     expect(draft?.status).toBe("failed");
     expect(draft?.error).toBeTruthy();
     expect(draft?.attempts).toBe(1);
+    await db.close();
+  });
+
+  it("refuses draft generation with sources outside the scope or over the batch limit", async () => {
+    const { db, job, service, config } = await setup();
+    config.distill.provider = "openai-compatible";
+    config.distill.baseUrl = "http://127.0.0.1:9/never";
+    config.distill.model = "test-model";
+    await queue(service, "归属正确的一条材料");
+    const other = await queue(service, "别的作用域的材料", "Elsewhere");
+    const mismatch = await job.generateDraft("project", "OneLedger", [other.inboxId], "admin");
+    expect(mismatch.status).toBe("error");
+    const many = [];
+    for (let index = 0; index < 13; index += 1) {
+      const item = await queue(service, `批量材料第${index}条，内容足够长以通过最短限制`);
+      many.push(item.inboxId);
+    }
+    const over = await job.generateDraft("project", "OneLedger", many, "admin");
+    expect(over.status).toBe("error");
     await db.close();
   });
 
@@ -140,8 +169,8 @@ describe("DistillJobService", () => {
     config.distill.model = "stub-model";
 
     try {
-      await queue(service, "生成草稿用的材料");
-      const result = await job.generateDraft("project", "OneLedger", "admin");
+      const queued = await queue(service, "生成草稿用的材料");
+      const result = await job.generateDraft("project", "OneLedger", [queued.inboxId], "admin");
       expect(result.status).toBe("pending");
       const draft = await store.latestDraft("project", "OneLedger");
       expect(draft?.status).toBe("pending");
@@ -153,10 +182,12 @@ describe("DistillJobService", () => {
       expect(await store.listActive()).toHaveLength(0);
       expect(await service.search("模型整理", "agent")).toHaveLength(0);
       expect(await service.get("agent", { scopeKind: "project", scopeId: "OneLedger" })).toHaveLength(0);
-      // 审核提交复用原子确认
-      const done = await service.confirmSources({ ids: draft!.sourceIds, body: draft!.body, title: draft!.title, actor: "admin", expectedRev: draft!.expectedRev });
+      // 审核提交带草稿 ID 复核来源集合
+      const done = await service.confirmSources({ ids: draft!.sourceIds, body: draft!.body, title: draft!.title, actor: "admin", expectedRev: draft!.expectedRev, draftId: draft!.id });
       expect(done.status).toBe("stored");
       expect(await store.listInbox()).toHaveLength(0);
+      const applied = await store.latestDraft("project", "OneLedger");
+      expect(applied?.status).toBe("applied");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await db.close();
@@ -178,8 +209,8 @@ describe("DistillJobService", () => {
     config.distill.model = "stub-model";
 
     try {
-      await queue(service, "生成草稿的材料");
-      const generated = await job.generateDraft("project", "OneLedger", "admin");
+      const queued = await queue(service, "生成草稿的材料");
+      const generated = await job.generateDraft("project", "OneLedger", [queued.inboxId], "admin");
       expect(generated.status).toBe("pending");
       const draft = await store.latestDraft("project", "OneLedger");
       // 另一个 Agent 推进了作用域
@@ -232,7 +263,7 @@ describe("DistillJobService", () => {
         queueStatus: "proposed",
         conflictIds: [],
       });
-      await store.insertInbox({
+      const safeQueued = await store.insertInbox({
         title: "安全材料",
         body: "普通公开材料",
         source: "cursor",
@@ -243,7 +274,7 @@ describe("DistillJobService", () => {
         queueStatus: "proposed",
         conflictIds: [],
       });
-      const result = await job.generateDraft("project", "OneLedger", "admin");
+      const result = await job.generateDraft("project", "OneLedger", [secret.id, safeQueued.id], "admin");
       expect(result.status).toBe("pending");
       expect(result.blocked).toContain(secret.id);
       expect(received).not.toContain("BEGIN PRIVATE KEY");

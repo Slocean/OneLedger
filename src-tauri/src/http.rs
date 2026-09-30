@@ -13,16 +13,77 @@ use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use rusqlite::Connection;
 use serde::Deserialize;
+#[cfg(feature = "devui")]
+use std::collections::{HashMap, VecDeque};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
-use tower_http::cors::CorsLayer;
 
 #[derive(RustEmbed)]
 #[folder = "web-assets/"]
 struct WebAssets; // rebuilt with memory category tabs
+
+/// 开发验收通道：MCP/测试把 DOM 级命令（点击/输入/读取）排队，WebView 内的
+/// dev driver 轮询执行后回传结果。仅当 config.devUi = true 且二进制以 `--features devui`
+/// 编译时才存在（B-08：正式构建完全不含该通道与路由）；全部端点要求 admin token。
+/// 队列有容量上限、命令 TTL 与结果 TTL：窗口未打开时命令过期作废而不是积压，
+/// exec 超时会撤销自己排队的命令，结果取走即清，多个调用者互不串扰。
+#[cfg(feature = "devui")]
+#[derive(Default)]
+pub struct DevUiChannel {
+    next_id: u64,
+    commands: VecDeque<(u64, serde_json::Value, std::time::Instant)>,
+    results: HashMap<u64, (serde_json::Value, std::time::Instant)>,
+}
+
+#[cfg(feature = "devui")]
+impl DevUiChannel {
+    const QUEUE_LIMIT: usize = 32;
+    const COMMAND_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+    const RESULT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn sweep_expired(&mut self) {
+        self.commands
+            .retain(|(_, _, enqueued)| enqueued.elapsed() < Self::COMMAND_TTL);
+        self.results
+            .retain(|_id, (_result, at)| at.elapsed() < Self::RESULT_TTL);
+    }
+
+    /// 入队一条命令；队列满时返回 None（exec 拒绝而不是无限积压）。
+    fn push_command(&mut self, command: serde_json::Value) -> Option<u64> {
+        self.sweep_expired();
+        if self.commands.len() >= Self::QUEUE_LIMIT {
+            return None;
+        }
+        self.next_id += 1;
+        let id = self.next_id;
+        self.commands.push_back((id, command, std::time::Instant::now()));
+        Some(id)
+    }
+
+    fn poll_command(&mut self) -> Option<(u64, serde_json::Value)> {
+        self.sweep_expired();
+        let (id, command, _) = self.commands.pop_front()?;
+        Some((id, command))
+    }
+
+    fn cancel_command(&mut self, id: u64) {
+        self.commands.retain(|(queued, _, _)| *queued != id);
+        self.results.remove(&id);
+    }
+
+    fn put_result(&mut self, id: u64, result: serde_json::Value) {
+        self.sweep_expired();
+        self.results.insert(id, (result, std::time::Instant::now()));
+    }
+
+    fn take_result(&mut self, id: u64) -> Option<serde_json::Value> {
+        self.sweep_expired();
+        self.results.remove(&id).map(|(value, _)| value)
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,6 +95,8 @@ pub struct AppState {
     pub vault_approval: Arc<Mutex<()>>,
     pub mcp_approval: Arc<Mutex<()>>,
     pub mcp_approved: Arc<Mutex<HashSet<(String, IpAddr)>>>,
+    #[cfg(feature = "devui")]
+    pub dev_ui: Arc<Mutex<DevUiChannel>>,
 }
 
 pub fn start_collect(state: &AppState) {
@@ -84,42 +147,58 @@ fn unauthorized() -> Response {
 
 pub fn router(state: AppState) -> Router {
     let web_dir = state.web_dir.clone();
-    let api = Router::new()
-        .route("/api/health", get(health))
-        .route("/api/status", get(status))
-        .route("/api/config", get(get_config).put(put_config))
-        .route("/api/memories", get(memories))
-        .route("/api/memories/export", get(export_memories))
-        .route("/api/backup/export", get(backup_export))
-        .route("/api/backup/import", post(backup_import))
-        .route("/api/remember", post(remember))
-        .route("/api/inbox/:id/reject", post(reject))
-        .route("/api/inbox/resolve", post(resolve_inbox))
-        .route("/api/version", get(version))
-        .route("/api/updates", get(updates))
-        .route("/api/updates/download", post(download_update))
-        .route("/api/updates/apply", post(apply_update))
-        .route("/api/updates/install", post(install_update))
-        .route("/api/inbox", get(inbox).post(create_inbox))
-        .route("/api/distill/tasks", get(distill_tasks))
-        .route("/api/distill/draft", post(distill_draft))
-        .route("/api/distill/draft/:id/discard", post(discard_draft))
-        .route("/api/audit", get(audit))
-        .route("/api/history/prune", post(prune_history))
-        .route("/api/agents", get(agents).post(create_agent))
-        .route("/api/agents/:id", put(update_agent).delete(delete_agent))
-        .route("/api/agents/:id/collect", post(collect_one))
-        .route("/api/collect", post(collect_all))
-        .route("/api/sync", post(sync_now))
-        .route("/api/keys", get(keys).post(create_key))
-        .route("/api/sync/pull", get(sync_pull))
-        .route("/api/sync/push", post(sync_push))
-        .route("/mcp", get(mcp_get).post(mcp_post))
-        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
-        .layer(CorsLayer::permissive())
-        .with_state(state)
-        .route("/", get(serve_root))
-        .fallback(serve_embedded);
+    let api = {
+        let api = Router::new()
+            .route("/api/health", get(health))
+            .route("/api/status", get(status))
+            .route("/api/config", get(get_config).put(put_config))
+            .route("/api/memories", get(memories))
+            .route("/api/memories/export", get(export_memories))
+            .route("/api/backup/export", get(backup_export))
+            .route("/api/backup/import", post(backup_import))
+            .route("/api/remember", post(remember))
+            .route("/api/inbox/:id/reject", post(reject))
+            .route("/api/inbox/resolve", post(resolve_inbox))
+            .route("/api/version", get(version))
+            .route("/api/updates", get(updates))
+            .route("/api/updates/download", post(download_update))
+            .route("/api/updates/apply", post(apply_update))
+            .route("/api/updates/install", post(install_update))
+            .route("/api/inbox", get(inbox).post(create_inbox))
+            .route("/api/distill/tasks", get(distill_tasks))
+            .route("/api/distill/draft", post(distill_draft))
+            .route("/api/distill/draft/:id/discard", post(discard_draft))
+            .route("/api/scopes/merge/preview", post(scope_merge_preview))
+            .route("/api/scopes/merge/confirm", post(scope_merge_confirm))
+            .route("/api/scopes/merge/revert", post(scope_merge_revert))
+            .route("/api/scopes/merge/operations", get(scope_merge_operations))
+            .route("/api/scopes/merge/fingerprint-report", get(scope_merge_fingerprint_report))
+            .route("/api/audit", get(audit))
+            .route("/api/history/prune", post(prune_history))
+            .route("/api/agents", get(agents).post(create_agent))
+            .route("/api/agents/:id", put(update_agent).delete(delete_agent))
+            .route("/api/agents/:id/collect", post(collect_one))
+            .route("/api/collect", post(collect_all))
+            .route("/api/sync", post(sync_now))
+            .route("/api/keys", get(keys).post(create_key))
+            .route("/api/sync/pull", get(sync_pull))
+            .route("/api/sync/push", post(sync_push))
+            .route("/mcp", get(mcp_get).post(mcp_post));
+        // B-08：dev 验收通道只在 `--features devui` 下编入路由；
+        // 正式 exe 中这些端点不存在（404 由 axum fallback 处理），不受任何 config 开关影响。
+        #[cfg(feature = "devui")]
+        let api = api
+            .route("/api/dev/ui/poll", get(dev_ui_poll))
+            .route("/api/dev/ui/result", post(dev_ui_result))
+            .route("/api/dev/ui/exec", post(dev_ui_exec));
+        api
+    }
+    .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+    // B-08：不再使用 permissive CORS。管理台窗口与 API 同源（http://127.0.0.1:port），
+    // MCP 客户端与同步节点都不是浏览器，跨站浏览器调用没有合法场景。
+    .with_state(state)
+    .route("/", get(serve_root))
+    .fallback(serve_embedded);
     let _ = web_dir;
     api
 }
@@ -376,6 +455,18 @@ struct ResolveInboxBody {
     body: String,
     title: Option<String>,
     expected_rev: Option<i64>,
+    draft_id: Option<String>,
+}
+
+/// 结构化 5xx：带 request ID，管理员看到的不是“队列为空”而是明确失败（P1-04）。
+fn internal_error(error: String) -> Response {
+    let request_id = new_id("req");
+    eprintln!("oneledger api error [{request_id}]: {error}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": "数据读取失败，请重试；若持续出现请把请求 ID 提供给支持", "requestId": request_id })),
+    )
+        .into_response()
 }
 
 async fn resolve_inbox(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<ResolveInboxBody>) -> Response {
@@ -395,6 +486,7 @@ async fn resolve_inbox(State(state): State<AppState>, headers: HeaderMap, Json(b
         body.title.as_deref(),
         "admin",
         body.expected_rev,
+        body.draft_id.as_deref(),
     );
     Json(result).into_response()
 }
@@ -494,8 +586,16 @@ async fn create_inbox(State(state): State<AppState>, headers: HeaderMap, Json(bo
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct InboxParams {
     status: Option<String>,
+    scope_kind: Option<String>,
+    scope_id: Option<String>,
+    source: Option<String>,
+    ids: Option<String>,
+    /// B-04：按 ID 查询必须携带草稿 ID 以证明关联；缺失或对不上时不返回任何正文。
+    draft_id: Option<String>,
+    limit: Option<i64>,
     offset: Option<i64>,
 }
 
@@ -505,20 +605,126 @@ async fn inbox(State(state): State<AppState>, headers: HeaderMap, Query(params):
         return unauthorized();
     }
     let rejected = params.status.as_deref() == Some("rejected");
+    let status = if rejected { "rejected" } else { "proposed" };
+    let limit = params.limit.unwrap_or(50).clamp(1, 100);
+    let offset = params.offset.unwrap_or(0).max(0);
     let conn = state.conn.lock().unwrap();
-    let items = store::list_inbox_status(&conn, if rejected { "rejected" } else { "proposed" }, 200, params.offset.unwrap_or(0).max(0)).unwrap_or_default();
-    let has_more = items.len() == 200;
-    let safe_items: Vec<serde_json::Value> = items.into_iter().map(|mut item| {
-        let hits = store::inbox_hit_types(&conn, &item.id).unwrap_or_default();
-        if rejected {
-            item.title = "已拒收材料".into();
-            item.body = "[REDACTED:rejected]".into();
+    // 按精确 ID 集合取材料：只服务草稿审核（B-04）。
+    // 请求必须携带能证明关联的 draftId，且每个 ID 都登记在该待审草稿的来源清单里；
+    // 任何对不上（草稿不存在/已不可审核/ID 不在草稿里/作用域漂移）都返回错误，绝不回退到
+    // 返回行正文。脱敏一律按实际 queue_status 判定，不信任客户端传来的 status 参数。
+    if let Some(ids_raw) = params.ids.as_deref().filter(|item| !item.is_empty()) {
+        let Some(draft_id) = params.draft_id.as_deref().filter(|item| !item.is_empty()) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "按 ID 查询材料仅供草稿审核使用：缺少 draftId" })),
+            )
+                .into_response();
+        };
+        let ids: Vec<String> = ids_raw.split(',').map(str::trim).filter(|item| !item.is_empty()).map(str::to_string).collect();
+        if ids.is_empty() || ids.len() > 100 {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "ids 一次最多 100 条" }))).into_response();
         }
-        let mut value = serde_json::to_value(item).unwrap_or_default();
-        value["hits"] = serde_json::json!(hits);
-        value
-    }).collect();
-    Json(serde_json::json!({ "inbox": safe_items, "hasMore": has_more })).into_response()
+        let Some(draft) = crate::distill_job::get_draft(&conn, draft_id).ok().flatten() else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "草稿不存在或已删除" }))).into_response();
+        };
+        if draft.status != "pending" {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": format!("草稿状态为 {}，已不可审核", draft.status) })),
+            )
+                .into_response();
+        }
+        let draft_set: std::collections::HashSet<&String> = draft.source_ids.iter().collect();
+        if ids.iter().any(|id| !draft_set.contains(id)) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "请求的材料不在该草稿的来源清单中，请重新打开草稿审核" })),
+            )
+                .into_response();
+        }
+        let items = match store::inbox_by_ids(&conn, &ids) {
+            Ok(items) => items,
+            Err(error) => return internal_error(format!("inbox_by_ids: {error}")),
+        };
+        if items
+            .iter()
+            .any(|item| item.scope_kind != draft.scope_kind || item.scope_id != draft.scope_id)
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "材料作用域与草稿不一致（可能已被移动或处理），请重新核对草稿" })),
+            )
+                .into_response();
+        }
+        let safe_items: Vec<serde_json::Value> = items
+            .into_iter()
+            .map(|mut item| {
+                if item.queue_status == "rejected" {
+                    item.title = "已拒收材料".into();
+                    item.body = "[REDACTED:rejected]".into();
+                }
+                serde_json::to_value(item).unwrap_or_default()
+            })
+            .collect();
+        return Json(serde_json::json!({ "inbox": safe_items, "total": safe_items.len(), "limit": safe_items.len(), "offset": 0, "hasMore": false }))
+            .into_response();
+    }
+    let (items, total) = match store::inbox_page(
+        &conn,
+        status,
+        params.scope_kind.as_deref(),
+        params.scope_id.as_deref(),
+        params.source.as_deref(),
+        limit,
+        offset,
+    ) {
+        Ok(page) => page,
+        Err(error) => return internal_error(format!("inbox_page: {error}")),
+    };
+    let safe_items: Vec<serde_json::Value> = {
+        // 一次批量取回本页材料的命中规则，避免每行一次 redaction_events 查询（N+1）。
+        // 命中规则是审核的安全状态，读取失败必须显式失败，不能伪装成“无命中”。
+        let ids_json = serde_json::to_string(&items.iter().map(|item| item.id.clone()).collect::<Vec<_>>())
+            .unwrap_or_else(|_| "[]".into());
+        let hits_result: Result<std::collections::HashMap<String, Vec<String>>, rusqlite::Error> = (|| {
+            let mut stmt = conn.prepare(
+                "SELECT inbox_id, hit_type FROM redaction_events WHERE inbox_id IN (SELECT value FROM json_each(?1)) ORDER BY inbox_id, hit_type",
+            )?;
+            let rows = stmt.query_map([&ids_json], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+            for row in rows {
+                let (inbox_id, hit_type) = row?;
+                map.entry(inbox_id).or_default().push(hit_type);
+            }
+            Ok(map)
+        })();
+        let mut hits_map = match hits_result {
+            Ok(map) => map,
+            Err(error) => return internal_error(format!("redaction hits: {error}")),
+        };
+        items.into_iter().map(|mut item| {
+            let hits = hits_map.remove(&item.id).unwrap_or_default();
+            if rejected {
+                item.title = "已拒收材料".into();
+                item.body = "[REDACTED:rejected]".into();
+            }
+            let mut value = serde_json::to_value(item).unwrap_or_default();
+            value["hits"] = serde_json::json!(hits);
+            value
+        }).collect()
+    };
+    let has_more = offset + (safe_items.len() as i64) < total;
+    Json(serde_json::json!({
+        "inbox": safe_items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "hasMore": has_more,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -526,22 +732,48 @@ async fn inbox(State(state): State<AppState>, headers: HeaderMap, Query(params):
 struct DistillScopeBody {
     scope_kind: String,
     scope_id: Option<String>,
+    source_ids: Option<Vec<String>>,
 }
 
-async fn distill_tasks(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+struct DistillTasksParams {
+    query: Option<String>,
+    abnormal: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+async fn distill_tasks(State(state): State<AppState>, headers: HeaderMap, Query(params): Query<DistillTasksParams>) -> Response {
     let config = state.config.lock().unwrap().clone();
     if !admin_ok(&headers, &config) {
         return unauthorized();
     }
     let conn = state.conn.lock().unwrap();
-    // 审核前刷新草稿过期状态：只检查已有草稿的作用域，且限定次数
-    let drafts = crate::distill_job::pending_drafts(&conn).unwrap_or_default();
+    // 审核前刷新草稿过期状态：这是审核安全状态，刷新失败必须显式失败，
+    // 不能把“草稿是否过期未知”伪装成正常返回（P1-04）。
+    let drafts = match crate::distill_job::pending_drafts(&conn) {
+        Ok(drafts) => drafts,
+        Err(error) => return internal_error(format!("pending_drafts: {error}")),
+    };
     for draft in drafts.iter().take(50) {
-        let _ = crate::distill_job::mark_stale_if_changed(&conn, draft);
+        if let Err(error) = crate::distill_job::mark_stale_if_changed(&conn, draft) {
+            return internal_error(format!("mark_stale_if_changed: {error}"));
+        }
     }
-    let items = crate::distill_job::tasks(&conn).unwrap_or_default();
+    let limit = params.limit.unwrap_or(30).clamp(1, 100);
+    let offset = params.offset.unwrap_or(0).max(0);
+    let only_abnormal = matches!(params.abnormal.as_deref(), Some("1") | Some("true"));
+    let (items, total) = match crate::distill_job::tasks_page(&conn, params.query.as_deref().unwrap_or(""), only_abnormal, limit, offset) {
+        Ok(page) => page,
+        Err(error) => return internal_error(format!("tasks_page: {error}")),
+    };
+    let has_more = offset + (items.len() as i64) < total;
     Json(serde_json::json!({
         "tasks": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "hasMore": has_more,
         "provider": config.distill.provider,
         "model": config.distill.model,
     }))
@@ -554,8 +786,9 @@ async fn distill_draft(State(state): State<AppState>, headers: HeaderMap, Json(b
         return unauthorized();
     }
     let scope_id = body.scope_id.unwrap_or_default();
+    let source_ids = body.source_ids.unwrap_or_default();
     let conn = state.conn.lock().unwrap();
-    let result = crate::distill_job::generate_draft(&conn, &config, &body.scope_kind, &scope_id, "admin");
+    let result = crate::distill_job::generate_draft(&conn, &config, &body.scope_kind, &scope_id, &source_ids, "admin");
     Json(result).into_response()
 }
 
@@ -566,6 +799,191 @@ async fn discard_draft(State(state): State<AppState>, headers: HeaderMap, Path(i
     }
     let ok = crate::distill_job::discard_draft(&state.conn.lock().unwrap(), &id, "admin");
     (if ok { StatusCode::OK } else { StatusCode::NOT_FOUND }, Json(serde_json::json!({ "ok": ok }))).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeMergeBody {
+    from_scope_kind: String,
+    from_scope_id: String,
+    to_scope_id: String,
+    digest: Option<String>,
+    /// B-07：管理员显式勾选、经核对的精确 ID 子集；确认只移动这批 ID。
+    ids: Option<Vec<String>>,
+}
+
+async fn scope_merge_preview(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<ScopeMergeBody>) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let conn = state.conn.lock().unwrap();
+    match crate::scope_merge::preview(&conn, &body.from_scope_kind, &body.from_scope_id, &body.to_scope_id) {
+        Ok(preview) => Json(preview).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "status": "error", "error": error }))).into_response(),
+    }
+}
+
+async fn scope_merge_confirm(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<ScopeMergeBody>) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let Some(digest) = body.digest.as_deref().filter(|item| !item.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "status": "error", "error": "缺少预览摘要 digest，请先预览" }))).into_response();
+    };
+    let empty: Vec<String> = Vec::new();
+    let selected = body.ids.as_deref().unwrap_or(&empty);
+    let conn = state.conn.lock().unwrap();
+    let result = crate::scope_merge::confirm(&conn, &body.from_scope_kind, &body.from_scope_id, &body.to_scope_id, digest, selected, "admin");
+    let status = result["status"].as_str().unwrap_or("error");
+    let code = match status {
+        "applied" | "conflict" | "blocked" => StatusCode::OK,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (code, Json(result)).into_response()
+}
+
+async fn scope_merge_revert(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<serde_json::Value>) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let Some(operation_id) = body.get("operationId").and_then(|v| v.as_str()).filter(|item| !item.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "status": "error", "error": "operationId required" }))).into_response();
+    };
+    let conn = state.conn.lock().unwrap();
+    let result = crate::scope_merge::revert(&conn, operation_id, "admin");
+    let status = result["status"].as_str().unwrap_or("error");
+    let code = match status {
+        "reverted" | "already-reverted" | "conflict" => StatusCode::OK,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (code, Json(result)).into_response()
+}
+
+async fn scope_merge_operations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let limit = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20).clamp(1, 100);
+    let offset = params.get("offset").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0).max(0);
+    let conn = state.conn.lock().unwrap();
+    let result = crate::scope_merge::list_operations(&conn, limit, offset);
+    if result.get("error").is_some() {
+        return internal_error(result["error"].as_str().unwrap_or("list operations failed").to_string());
+    }
+    Json(result).into_response()
+}
+
+async fn scope_merge_fingerprint_report(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    let conn = state.conn.lock().unwrap();
+    match crate::scope_merge::fingerprint_damage_report(&conn) {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => internal_error(format!("fingerprint report: {error}")),
+    }
+}
+
+#[cfg(feature = "devui")]
+fn dev_ui_enabled(config: &Config) -> bool {
+    config.dev_ui
+}
+
+/// WebView 内 dev driver 轮询取命令。dev 关闭时 404，前端据此静默停用。
+#[cfg(feature = "devui")]
+async fn dev_ui_poll(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    if !dev_ui_enabled(&config) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let command = state
+        .dev_ui
+        .lock()
+        .unwrap()
+        .poll_command()
+        .map(|(id, command)| serde_json::json!({ "commandId": id, "command": command }))
+        .unwrap_or(serde_json::json!({}));
+    Json(command).into_response()
+}
+
+#[cfg(feature = "devui")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DevUiResultBody {
+    command_id: u64,
+    #[serde(flatten)]
+    result: serde_json::Value,
+}
+
+#[cfg(feature = "devui")]
+async fn dev_ui_result(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<DevUiResultBody>) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    if !dev_ui_enabled(&config) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    state.dev_ui.lock().unwrap().put_result(body.command_id, body.result);
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+/// 同步执行一条 DOM 命令：入队 → 等待 WebView 内 dev driver 回传结果（最多 6 秒）。
+/// 超时会撤销自己排队的命令（B-08）：命令不会在调用方已收到超时之后才被执行，
+/// 结果也不会滞留在内存里。
+#[cfg(feature = "devui")]
+async fn dev_ui_exec(State(state): State<AppState>, headers: HeaderMap, Json(command): Json<serde_json::Value>) -> Response {
+    let config = state.config.lock().unwrap().clone();
+    if !admin_ok(&headers, &config) {
+        return unauthorized();
+    }
+    if !dev_ui_enabled(&config) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "devUi 未启用：隔离验收需在 config.json 设置 devUi=true，且二进制须以 --features devui 编译" })),
+        )
+            .into_response();
+    }
+    let command_id = match state.dev_ui.lock().unwrap().push_command(command) {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "dev 命令队列已满（窗口可能未打开），请稍后重试" })),
+            )
+                .into_response()
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    loop {
+        {
+            let mut channel = state.dev_ui.lock().unwrap();
+            if let Some(result) = channel.take_result(command_id) {
+                return Json(serde_json::json!({ "commandId": command_id, "result": result })).into_response();
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            state.dev_ui.lock().unwrap().cancel_command(command_id);
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({ "commandId": command_id, "error": "dev driver 未在 6 秒内回传结果（窗口可能未打开或未登录）；命令已撤销" })),
+            )
+                .into_response();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 async fn audit(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -900,6 +1318,37 @@ mod vault_permission_tests {
     use super::{approve_once, tool_allowed};
     use std::collections::HashSet;
     use std::sync::Mutex;
+
+    #[cfg(feature = "devui")]
+    #[test]
+    fn dev_ui_channel_queues_commands_and_returns_results() {
+        use super::DevUiChannel;
+        let mut channel = DevUiChannel::default();
+        let id = channel.push_command(serde_json::json!({ "kind": "click", "text": "审核" })).expect("queue not full");
+        assert_eq!(id, 1);
+        assert!(channel.poll_command().is_some());
+        assert!(channel.poll_command().is_none(), "queue must drain");
+        channel.put_result(id, serde_json::json!({ "ok": true }));
+        let result = channel.take_result(id).expect("result");
+        assert_eq!(result["ok"], true);
+        assert!(channel.take_result(id).is_none(), "result must be consumed once");
+    }
+
+    /// B-08：命令队列有容量上限；exec 超时撤销后，队列里的命令不能再被执行。
+    #[cfg(feature = "devui")]
+    #[test]
+    fn dev_ui_channel_has_capacity_limit_and_cancel() {
+        use super::DevUiChannel;
+        let mut channel = DevUiChannel::default();
+        for index in 0..DevUiChannel::QUEUE_LIMIT {
+            assert!(channel.push_command(serde_json::json!({ "n": index })).is_some());
+        }
+        assert!(channel.push_command(serde_json::json!({ "n": "overflow" })).is_none(), "queue must refuse when full");
+        let first_id = 1;
+        channel.cancel_command(first_id);
+        let polled = channel.poll_command().expect("remaining command");
+        assert_ne!(polled.0, first_id, "cancelled command must not be delivered");
+    }
 
     #[test]
     fn vault_permissions_follow_existing_key_scopes_and_never_expose_reveal() {

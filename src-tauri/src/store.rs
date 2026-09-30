@@ -4,8 +4,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 pub fn insert_inbox(conn: &Connection, record: InboxRecord) -> rusqlite::Result<InboxRecord> {
     conn.execute(
-        "INSERT INTO inbox (id, title, body, source, scope_kind, scope_id, sensitivity, redacted, created_at, queue_status, conflict_ids)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO inbox (id, title, body, source, scope_kind, scope_id, sensitivity, redacted, created_at, queue_status, conflict_ids, source_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             record.id,
             record.title,
@@ -17,7 +17,8 @@ pub fn insert_inbox(conn: &Connection, record: InboxRecord) -> rusqlite::Result<
             record.redacted,
             record.created_at,
             record.queue_status,
-            record.conflict_ids.join(",")
+            record.conflict_ids.join(","),
+            record.source_key,
         ],
     )?;
     Ok(record)
@@ -28,10 +29,14 @@ pub fn get_inbox(conn: &Connection, id: &str) -> rusqlite::Result<Option<InboxRe
         .optional()
 }
 
-pub fn find_collected_inbox(conn: &Connection, source: &str, scope_kind: &str, scope_id: &str, body: &str) -> rusqlite::Result<Option<InboxRecord>> {
+pub fn find_collected_inbox(conn: &Connection, source: &str, scope_kind: &str, scope_id: &str, body: &str, source_key: &str) -> rusqlite::Result<Option<InboxRecord>> {
+    // 材料级查重必须限定作用域：不同仓库同文不是同一材料（P0-04）。
+    // B-05：查重身份再收紧到同一来源键——同仓库两个不同文件（不同 source_key）同文时
+    // 各自成一条，不能再用其他文件的相同正文当唯一依据。
+    // 人工创建与 v12 之前的历史行 source_key 为空串，只在键同为空串时互相匹配（保守，不擅自合并）。
     conn.query_row(
-        "SELECT * FROM inbox WHERE source = ?1 AND scope_kind = ?2 AND scope_id = ?3 AND substr(body, 1, 128) = substr(?4, 1, 128) AND body = ?4 LIMIT 1",
-        params![source, scope_kind, scope_id, body],
+        "SELECT * FROM inbox WHERE source = ?1 AND scope_kind = ?2 AND scope_id = ?3 AND substr(body, 1, 128) = substr(?4, 1, 128) AND body = ?4 AND source_key = ?5 ORDER BY id LIMIT 1",
+        params![source, scope_kind, scope_id, body, source_key],
         map_inbox,
     ).optional()
 }
@@ -41,6 +46,7 @@ pub fn list_inbox(conn: &Connection) -> rusqlite::Result<Vec<InboxRecord>> {
     list_inbox_status(conn, "proposed", 20000, 0)
 }
 
+#[cfg(test)]
 pub fn list_inbox_status(conn: &Connection, status: &str, limit: i64, offset: i64) -> rusqlite::Result<Vec<InboxRecord>> {
     let mut stmt = conn.prepare(
         "SELECT * FROM inbox WHERE queue_status = ?1
@@ -48,12 +54,6 @@ pub fn list_inbox_status(conn: &Connection, status: &str, limit: i64, offset: i6
          LIMIT ?2 OFFSET ?3",
     )?;
     let rows = stmt.query_map(params![status, limit, offset], map_inbox)?;
-    rows.collect()
-}
-
-pub fn inbox_hit_types(conn: &Connection, inbox_id: &str) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT DISTINCT hit_type FROM redaction_events WHERE inbox_id = ?1 ORDER BY hit_type")?;
-    let rows = stmt.query_map([inbox_id], |row| row.get(0))?;
     rows.collect()
 }
 
@@ -420,7 +420,8 @@ pub fn delete_agent(conn: &Connection, id: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// 按作用域聚合待蒸馏材料：计数、最旧/最新时间、高信号数都在一次查询内完成。
+/// 按作用域聚合待蒸馏材料（旧全量接口，仅测试与迁移兼容保留）。
+#[cfg(test)]
 pub fn inbox_scope_summary(
     conn: &Connection,
 ) -> rusqlite::Result<Vec<(String, String, i64, i64, Option<String>, Option<String>)>> {
@@ -447,37 +448,124 @@ pub fn inbox_scope_summary(
     rows.collect()
 }
 
-/// 某个作用域的材料样本，高信号优先、其次新的在前。
-pub fn inbox_scope_sample(
-    conn: &Connection,
-    scope_kind: &str,
-    scope_id: &str,
-    limit: i64,
-) -> rusqlite::Result<Vec<InboxRecord>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM inbox WHERE queue_status = 'proposed' AND scope_kind = ?1 AND scope_id = ?2
-         ORDER BY CASE WHEN lower(source) LIKE '%workbuddy%' THEN 0 WHEN lower(source) LIKE '%project%' THEN 1 ELSE 2 END,
-                  created_at DESC
-         LIMIT ?3",
-    )?;
-    let rows = stmt.query_map(params![scope_kind, scope_id, limit], map_inbox)?;
-    rows.collect()
+/// project 作用域里像路径而不是仓库名的 scopeId。这只是待审标记，
+/// 不能凭字符串推断真实仓库名，归并目标必须由管理员人工确认。
+pub fn scope_id_looks_like_path(scope_id: &str) -> bool {
+    scope_id.contains('/')
+        || scope_id.contains('\\')
+        || scope_id.contains(':')
+        || scope_id == "."
+        || scope_id == ".."
 }
 
-/// 一次取出全部作用域的材料样本（每作用域最多 limit 条），避免逐作用域查询。
-pub fn inbox_samples_by_scope(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<InboxRecord>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM (
-           SELECT *, ROW_NUMBER() OVER (
-             PARTITION BY scope_kind, scope_id
-             ORDER BY CASE WHEN lower(source) LIKE '%workbuddy%' THEN 0 WHEN lower(source) LIKE '%project%' THEN 1 ELSE 2 END,
-                      created_at DESC
-           ) AS scope_rank
-           FROM inbox WHERE queue_status = 'proposed'
-         ) WHERE scope_rank <= ?1",
+pub struct InboxScopeRow {
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub pending: i64,
+    pub workbuddy: i64,
+    pub oldest_at: Option<String>,
+    #[allow(dead_code)]
+    pub newest_at: Option<String>,
+}
+
+/// 服务端分页的作用域聚合列表：SQL 内筛选与计数，不把全部作用域传给前端。
+/// query 按子串匹配 scope_id；only_abnormal 只保留归属待修正的 project 作用域
+/// （scopeId 含路径分隔符、盘符迹象或 . / .. 片段）。
+pub fn inbox_scope_page(
+    conn: &Connection,
+    query: &str,
+    only_abnormal: bool,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<(Vec<InboxScopeRow>, i64)> {
+    let having = if only_abnormal {
+        "HAVING scope_kind = 'project'
+            AND (scope_id LIKE '%/%' OR scope_id LIKE '%\\%'
+                 OR scope_id LIKE '%:%' OR scope_id = '.' OR scope_id = '..')"
+    } else {
+        "HAVING scope_kind = scope_kind"
+    };
+    let base = format!(
+        "FROM inbox WHERE queue_status = 'proposed'
+           AND (?1 = '' OR scope_id LIKE '%' || ?1 || '%')
+         GROUP BY scope_kind, scope_id
+         {having}"
+    );
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM (SELECT scope_kind {base})"),
+        params![query],
+        |row| row.get(0),
     )?;
-    let rows = stmt.query_map(params![limit], map_inbox)?;
-    rows.collect()
+    let mut stmt = conn.prepare(&format!(
+        "SELECT scope_kind, scope_id,
+                COUNT(*) AS pending,
+                SUM(CASE WHEN lower(source) LIKE '%workbuddy%' THEN 1 ELSE 0 END) AS workbuddy,
+                MIN(created_at) AS oldest_at,
+                MAX(created_at) AS newest_at
+         {base}
+         ORDER BY newest_at DESC, scope_id ASC
+         LIMIT ?2 OFFSET ?3"
+    ))?;
+    let rows = stmt
+        .query_map(params![query, limit, offset], |row| {
+            Ok(InboxScopeRow {
+                scope_kind: row.get(0)?,
+                scope_id: row.get(1)?,
+                pending: row.get(2)?,
+                workbuddy: row.get(3)?,
+                oldest_at: row.get(4)?,
+                newest_at: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((rows, total))
+}
+
+/// 服务端分页+筛选的材料明细。稳定次序为 created_at DESC, id DESC；
+/// scope/source 过滤在 SQL 内完成，任何一次调用都不返回全量正文。
+pub fn inbox_page(
+    conn: &Connection,
+    status: &str,
+    scope_kind: Option<&str>,
+    scope_id: Option<&str>,
+    source: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<(Vec<InboxRecord>, i64)> {
+    let kind = scope_kind.filter(|item| !item.is_empty()).unwrap_or("");
+    let id = scope_id.filter(|item| !item.is_empty()).unwrap_or("");
+    let src = source.filter(|item| !item.is_empty()).unwrap_or("");
+    let where_sql =
+        "WHERE queue_status = ?1 AND (?2 = '' OR scope_kind = ?2) AND (?3 = '' OR scope_id = ?3) AND (?4 = '' OR source = ?4)";
+    let total: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM inbox {where_sql}"), params![status, kind, id, src], |row| row.get(0))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT * FROM inbox {where_sql} ORDER BY created_at DESC, id DESC LIMIT ?5 OFFSET ?6"
+    ))?;
+    let rows = stmt
+        .query_map(params![status, kind, id, src, limit, offset], map_inbox)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((rows, total))
+}
+
+/// 按精确 ID 集合取材料（供草稿审核展示草稿来源元数据）；顺序按传入次序。
+pub fn inbox_by_ids(conn: &Connection, ids: &[String]) -> rusqlite::Result<Vec<InboxRecord>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids_json = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
+    let mut by_id = std::collections::HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT * FROM inbox WHERE id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let rows = stmt
+            .query_map([&ids_json], map_inbox)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for row in rows {
+            by_id.insert(row.id.clone(), row);
+        }
+    }
+    Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
 pub struct FingerprintRow {
@@ -485,6 +573,20 @@ pub struct FingerprintRow {
     pub content_hash: String,
     #[allow(dead_code)]
     pub last_status: String,
+}
+
+/// 指纹触碰的单调序号：同毫秒时间戳并列时（C-02）按最近触碰排序，取序号最大者为最新。
+fn next_fingerprint_seq(conn: &Connection) -> rusqlite::Result<i64> {
+    let current: i64 = conn
+        .query_row("SELECT CAST(value AS INTEGER) FROM sync_meta WHERE key = 'fp_seq'", [], |row| row.get(0))
+        .optional()?
+        .unwrap_or(0);
+    let next = current + 1;
+    conn.execute(
+        "INSERT INTO sync_meta (key, value) VALUES ('fp_seq', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![next.to_string()],
+    )?;
+    Ok(next)
 }
 
 pub fn latest_fingerprint(
@@ -498,7 +600,7 @@ pub fn latest_fingerprint(
     conn.query_row(
         "SELECT id, content_hash, last_status FROM collect_fingerprints
          WHERE collector = ?1 AND source_key = ?2 AND scope_kind = ?3 AND scope_id = ?4 AND rules_version = ?5
-         ORDER BY last_seen_at DESC LIMIT 1",
+         ORDER BY touched_seq DESC, rowid DESC LIMIT 1",
         params![collector, source_key, scope_kind, scope_id, rules_version],
         |row| Ok(FingerprintRow { id: row.get(0)?, content_hash: row.get(1)?, last_status: row.get(2)? }),
     )
@@ -506,11 +608,30 @@ pub fn latest_fingerprint(
 }
 
 pub fn touch_fingerprint(conn: &Connection, id: &str, last_status: &str) -> rusqlite::Result<()> {
+    let seq = next_fingerprint_seq(conn)?;
     conn.execute(
-        "UPDATE collect_fingerprints SET last_seen_at = ?1, last_status = ?2 WHERE id = ?3",
-        params![now_iso(), last_status, id],
+        "UPDATE collect_fingerprints SET last_seen_at = ?1, last_status = ?2, touched_seq = ?3 WHERE id = ?4",
+        params![now_iso(), last_status, seq, id],
     )?;
     Ok(())
+}
+
+/// 跨作用域查最近指纹：只用于可证明跨作用域唯一的来源键（规范化后的绝对路径）。
+/// 指纹保留其原作用域作为历史归属，这里只读不改。
+pub fn latest_fingerprint_global(
+    conn: &Connection,
+    collector: &str,
+    source_key: &str,
+    rules_version: i64,
+) -> rusqlite::Result<Option<FingerprintRow>> {
+    conn.query_row(
+        "SELECT id, content_hash, last_status FROM collect_fingerprints
+         WHERE collector = ?1 AND source_key = ?2 AND rules_version = ?3
+         ORDER BY touched_seq DESC, rowid DESC LIMIT 1",
+        params![collector, source_key, rules_version],
+        |row| Ok(FingerprintRow { id: row.get(0)?, content_hash: row.get(1)?, last_status: row.get(2)? }),
+    )
+    .optional()
 }
 
 pub fn insert_fingerprint(
@@ -524,15 +645,158 @@ pub fn insert_fingerprint(
     last_status: &str,
 ) -> rusqlite::Result<()> {
     let now = now_iso();
+    let seq = next_fingerprint_seq(conn)?;
     conn.execute(
         "INSERT INTO collect_fingerprints
-           (id, collector, source_key, scope_kind, scope_id, content_hash, rules_version, last_status, first_seen_at, last_seen_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+           (id, collector, source_key, scope_kind, scope_id, content_hash, rules_version, last_status, first_seen_at, last_seen_at, touched_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT (collector, source_key, scope_kind, scope_id, content_hash, rules_version)
-         DO UPDATE SET last_seen_at = excluded.last_seen_at, last_status = excluded.last_status",
-        params![new_id("fp"), collector, source_key, scope_kind, scope_id, content_hash, rules_version, last_status, now, now],
+         DO UPDATE SET last_seen_at = excluded.last_seen_at, last_status = excluded.last_status, touched_seq = excluded.touched_seq",
+        params![new_id("fp"), collector, source_key, scope_kind, scope_id, content_hash, rules_version, last_status, now, now, seq],
     )?;
     Ok(())
+}
+
+pub struct ScopeMergeOperation {
+    pub id: String,
+    pub from_scope_kind: String,
+    pub from_scope_id: String,
+    pub to_scope_kind: String,
+    pub to_scope_id: String,
+    /// v10 遗留文本字段；新操作不再写入（空串），批次精确 ID 在 scope_merge_operation_items。
+    pub moved_ids: Vec<String>,
+    pub moved_count: i64,
+    pub source_breakdown: serde_json::Value,
+    pub status: String,
+    pub created_at: String,
+    pub reverted_at: Option<String>,
+}
+
+impl ScopeMergeOperation {
+    /// 本批精确 ID：优先读 item 表；旧记录的 moved_ids 文本仅作只读兼容回退。
+    pub fn batch_ids(&self) -> Vec<String> {
+        self.moved_ids.clone()
+    }
+}
+
+pub fn insert_merge_operation(conn: &Connection, op: &ScopeMergeOperation) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO scope_merge_operations
+           (id, from_scope_kind, from_scope_id, to_scope_kind, to_scope_id, moved_ids, moved_count, source_breakdown, status, created_at, reverted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            op.id,
+            op.from_scope_kind,
+            op.from_scope_id,
+            op.to_scope_kind,
+            op.to_scope_id,
+            // 新操作不再把 ID 列表塞进单个 TEXT；批次明细在 scope_merge_operation_items。
+            String::new(),
+            op.moved_count,
+            op.source_breakdown.to_string(),
+            op.status,
+            op.created_at,
+            op.reverted_at
+        ],
+    )?;
+    insert_merge_operation_items(conn, &op.id, &op.moved_ids)
+}
+
+pub fn insert_merge_operation_items(conn: &Connection, operation_id: &str, inbox_ids: &[String]) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO scope_merge_operation_items (operation_id, inbox_id) VALUES (?1, ?2)",
+    )?;
+    for inbox_id in inbox_ids {
+        stmt.execute(params![operation_id, inbox_id])?;
+    }
+    Ok(())
+}
+
+/// 本批精确 ID（按入库次序）。
+pub fn get_merge_operation_batch(conn: &Connection, operation_id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT inbox_id FROM scope_merge_operation_items WHERE operation_id = ?1",
+    )?;
+    let rows = stmt
+        .query_map([operation_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn get_merge_operation(conn: &Connection, id: &str) -> rusqlite::Result<Option<ScopeMergeOperation>> {
+    conn.query_row("SELECT * FROM scope_merge_operations WHERE id = ?1", [id], map_merge_operation).optional()
+}
+
+/// 撤销/详情用的完整操作（含 item 表批次 ID）。
+pub fn load_merge_operation(conn: &Connection, id: &str) -> rusqlite::Result<Option<ScopeMergeOperation>> {
+    let Some(mut op) = get_merge_operation(conn, id)? else { return Ok(None) };
+    let items = get_merge_operation_batch(conn, id)?;
+    if !items.is_empty() {
+        op.moved_ids = items;
+    }
+    Ok(Some(op))
+}
+
+pub struct ScopeMergeOperationSummary {
+    pub id: String,
+    pub from_scope_kind: String,
+    pub from_scope_id: String,
+    pub to_scope_kind: String,
+    pub to_scope_id: String,
+    pub moved_count: i64,
+    pub source_breakdown: serde_json::Value,
+    pub status: String,
+    pub created_at: String,
+    pub reverted_at: Option<String>,
+}
+
+/// 列表只读概要字段：单次分页 SQL，不读 moved_ids 大字段，避免反序列化巨量 ID（M-03）。
+pub fn list_merge_operation_summaries(
+    conn: &Connection,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<(Vec<ScopeMergeOperationSummary>, i64)> {
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM scope_merge_operations", [], |row| row.get(0))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, from_scope_kind, from_scope_id, to_scope_kind, to_scope_id, moved_count, source_breakdown, status, created_at, reverted_at
+         FROM scope_merge_operations ORDER BY created_at DESC, id DESC LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![limit, offset], |row| {
+            let breakdown: String = row.get("source_breakdown")?;
+            Ok(ScopeMergeOperationSummary {
+                id: row.get("id")?,
+                from_scope_kind: row.get("from_scope_kind")?,
+                from_scope_id: row.get("from_scope_id")?,
+                to_scope_kind: row.get("to_scope_kind")?,
+                to_scope_id: row.get("to_scope_id")?,
+                moved_count: row.get("moved_count")?,
+                source_breakdown: serde_json::from_str(&breakdown).unwrap_or(serde_json::json!({})),
+                status: row.get("status")?,
+                created_at: row.get("created_at")?,
+                reverted_at: row.get("reverted_at")?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((rows, total))
+}
+
+fn map_merge_operation(row: &rusqlite::Row) -> rusqlite::Result<ScopeMergeOperation> {
+    let moved: String = row.get("moved_ids")?;
+    let breakdown: String = row.get("source_breakdown")?;
+    Ok(ScopeMergeOperation {
+        id: row.get("id")?,
+        from_scope_kind: row.get("from_scope_kind")?,
+        from_scope_id: row.get("from_scope_id")?,
+        to_scope_kind: row.get("to_scope_kind")?,
+        to_scope_id: row.get("to_scope_id")?,
+        moved_ids: moved.split('\u{1f}').filter(|item| !item.is_empty()).map(str::to_string).collect(),
+        moved_count: row.get("moved_count")?,
+        source_breakdown: serde_json::from_str(&breakdown).unwrap_or(serde_json::json!({})),
+        status: row.get("status")?,
+        created_at: row.get("created_at")?,
+        reverted_at: row.get("reverted_at")?,
+    })
 }
 
 fn map_memory(row: &rusqlite::Row) -> rusqlite::Result<MemoryRecord> {
@@ -569,6 +833,7 @@ fn map_inbox(row: &rusqlite::Row) -> rusqlite::Result<InboxRecord> {
         queue_status: row.get("queue_status").unwrap_or_else(|_| "proposed".into()),
         conflict_ids: conflict.split(',').filter(|item| !item.is_empty()).map(str::to_string).collect(),
         created_at: row.get("created_at")?,
+        source_key: row.get("source_key").unwrap_or_default(),
     })
 }
 

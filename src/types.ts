@@ -1,8 +1,10 @@
-export const APP_VERSION = "0.4.13";
+export const APP_VERSION = "0.4.14";
 export const CONFIG_SCHEMA_VERSION = 1;
-export const DATA_SCHEMA_VERSION = 7;
+export const DATA_SCHEMA_VERSION = 12;
 export const SCAN_RULES_VERSION = 1;
 export const PROTOCOL_VERSION = 1;
+/** 一次归并确认最多移动的材料条数；更多材料需要管理员分批确认。 */
+export const MERGE_BATCH_LIMIT = 1000;
 
 export type StorageDriver = "sqlite" | "postgres";
 export type SyncRole = "local" | "leaf" | "hub";
@@ -105,6 +107,8 @@ export interface InboxRecord {
   queueStatus: QueueStatus;
   conflictIds: string[];
   createdAt: string;
+  /** 稳定来源键（canonical 绝对路径或采集上报路径）；空串=人工创建或 v12 前历史行（B-05）。 */
+  sourceKey: string;
 }
 
 export interface ApiKeyRecord {
@@ -137,4 +141,6 @@ export interface CollectResult {
   queued: number;
   skipped: number;
   redacted: number;
+  /** 事务失败（含采集指纹登记失败）而本轮未处理的文件数；失败文件不写指纹，下一轮重扫重试。 */
+  errors?: number;
 }

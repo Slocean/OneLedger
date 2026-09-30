@@ -66,3 +66,10 @@
 | Vite 只做一次性 `build`，立刻结束 | `vite` 开发服务器、`tsx serve`、挂着不关 |
 | Agent 自己调 MCP | 让用户去连 MCP、去开 vite/tsx |
 | 改完全量 `npm run check`，红了先修 | 只改一点就推、不看失败检查 |
+
+## ZCode 主动召回（OneLedger 项目记忆）
+
+- 当执行环境是 ZCode 且当前工作区为 OneLedger，**任何项目任务（包括只读分析、问答、列清单）开始时**，先在做实质分析或修改之前用 OneLedger MCP 的 `memory.get` 读取 `scopeKind=project`、`scopeId=OneLedger`。不准以「本次只读、不涉及写入」为由跳过。
+- 项目名固定为仓库名；不要用当前目录、worktree 名或文件路径作 `scopeId`。
+- 返回空数组时继续任务；任务涉及本机环境、跨项目工具链、部署面板通道或用户工作偏好时，再读取一次 `global`（`memory.get` 只传 `scopeKind=global`），并优先使用其内容而不是凭空另编。同一任务已取得相同版本时不重复读取。记忆与当前核实结果冲突时，以核实后的代码、实测结果和用户指令为准，并指出冲突。
+- MCP 不可用时继续可独立完成的工作，并在结果中简短说明未取到记忆。不要把 inbox、草稿或 ZCode 自带 Memory 当作 OneLedger 正式记忆。

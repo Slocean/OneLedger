@@ -8,6 +8,7 @@ mod http;
 mod instance;
 mod models;
 mod scan;
+mod scope_merge;
 mod service;
 mod store;
 mod sync;
@@ -145,6 +146,8 @@ pub fn run() {
                 vault_approval: Arc::new(Mutex::new(())),
                 mcp_approval: Arc::new(Mutex::new(())),
                 mcp_approved: Arc::new(Mutex::new(HashSet::new())),
+                #[cfg(feature = "devui")]
+                dev_ui: Arc::new(Mutex::new(crate::http::DevUiChannel::default())),
             };
             app.manage(state.clone());
             {

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -18,6 +19,7 @@ import { applyRemoteMemories } from "../sync/apply.js";
 import { authorizeNode, syncWithRemote } from "../sync/engine.js";
 import { allowedTools, createMcpServer } from "../mcp/create.js";
 import { checkForUpdate } from "../update.js";
+import { confirmMerge, fingerprintDamageReport, listMergeOperations, previewMerge, revertMerge } from "../memory/scopeMerge.js";
 
 export interface AppContext {
   config: AppConfig;
@@ -57,6 +59,13 @@ function adminOk(c: { req: { header: (name: string) => string | undefined } }, c
 
 function bearer(header: string | undefined): string | undefined {
   return header?.startsWith("Bearer ") ? header.slice(7) : undefined;
+}
+
+/** 结构化 5xx：带 request ID，管理员看到的不是“队列为空”而是明确失败（P1-04）。 */
+function internalError(c: Context, error: string) {
+  const requestId = `req_${crypto.randomUUID().replaceAll("-", "").slice(0, 24)}`;
+  c.env.error(new Error(`oneledger api error [${requestId}]: ${error}`));
+  return c.json({ error: "数据读取失败，请重试；若持续出现请把请求 ID 提供给支持", requestId }, 500);
 }
 
 export function createApp(ctx: AppContext): Hono {
@@ -174,13 +183,14 @@ export function createApp(ctx: AppContext): Hono {
 
   app.post("/api/inbox/resolve", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
-    const body = (await c.req.json()) as { ids?: string[]; body?: string; title?: string; expectedRev?: number };
+    const body = (await c.req.json()) as { ids?: string[]; body?: string; title?: string; expectedRev?: number; draftId?: string };
     if (!body.ids?.length || !body.body?.trim()) return c.json({ error: "ids and body required" }, 400);
     const result = await ctx.service.confirmSources({
       ids: body.ids,
       body: body.body,
       title: body.title,
       expectedRev: body.expectedRev,
+      draftId: body.draftId,
       actor: "admin",
     });
     return c.json(result);
@@ -231,15 +241,66 @@ export function createApp(ctx: AppContext): Hono {
   app.get("/api/inbox", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
     const rejected = c.req.query("status") === "rejected";
+    const status = rejected ? "rejected" : "proposed";
+    // 按精确 ID 集合取材料：只服务草稿审核（B-04）。请求必须携带能证明关联的 draftId，
+    // 且每个 ID 都登记在该待审草稿的来源清单里；任何对不上都返回错误，绝不回退到返回行正文。
+    // 脱敏一律按实际 queue_status 判定，不信任客户端传来的 status 参数。
+    const idsParam = c.req.query("ids") ?? "";
+    if (idsParam) {
+      const draftId = c.req.query("draftId") ?? "";
+      if (!draftId) return c.json({ error: "按 ID 查询材料仅供草稿审核使用：缺少 draftId" }, 400);
+      const ids = idsParam.split(",").map((id) => id.trim()).filter(Boolean).slice(0, 100);
+      if (!ids.length) return c.json({ error: "ids 一次最多 100 条" }, 400);
+      const draft = await ctx.store.getDraft(draftId);
+      if (!draft) return c.json({ error: "草稿不存在或已删除" }, 404);
+      if (draft.status !== "pending") return c.json({ error: `草稿状态为 ${draft.status}，已不可审核` }, 409);
+      const draftSet = new Set(draft.sourceIds);
+      if (ids.some((id) => !draftSet.has(id))) {
+        return c.json({ error: "请求的材料不在该草稿的来源清单中，请重新打开草稿审核" }, 409);
+      }
+      let items;
+      try {
+        items = await ctx.store.inboxByIds(ids);
+      } catch (error) {
+        return internalError(c, `inboxByIds: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (items.some((item) => item.scopeKind !== draft.scopeKind || item.scopeId !== draft.scopeId)) {
+        return c.json({ error: "材料作用域与草稿不一致（可能已被移动或处理），请重新核对草稿" }, 409);
+      }
+      const inbox = items.map((item) => ({
+        ...item,
+        title: item.queueStatus === "rejected" ? "已拒收材料" : item.title,
+        body: item.queueStatus === "rejected" ? "[REDACTED:rejected]" : item.body,
+      }));
+      return c.json({ inbox, total: inbox.length, limit: inbox.length, offset: 0, hasMore: false });
+    }
+    const scopeKind = c.req.query("scopeKind") ?? "";
+    const scopeId = c.req.query("scopeId") ?? "";
+    const source = c.req.query("source") ?? "";
+    const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") ?? 50) || 50));
     const offset = Math.max(0, Number(c.req.query("offset") ?? 0) || 0);
-    const items = await ctx.store.listInbox(200, rejected ? "rejected" : "proposed", offset);
-    const inbox = await Promise.all(items.map(async (item) => ({
+    let rows: Awaited<ReturnType<typeof ctx.store.inboxPage>>["rows"];
+    let total: number;
+    try {
+      ({ rows, total } = await ctx.store.inboxPage(status, scopeKind, scopeId, source, limit, offset));
+    } catch (error) {
+      return internalError(c, `inboxPage: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    // 一次批量取回本页材料的命中规则，避免每行一次 redaction_events 查询（N+1）。
+    // 命中规则是审核安全状态，读取失败必须显式失败，不能伪装成“无命中”。
+    let hitsMap: Map<string, string[]>;
+    try {
+      hitsMap = await ctx.store.inboxHitTypesBatch(rows.map((item) => item.id));
+    } catch (error) {
+      return internalError(c, `redaction hits: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const inbox = rows.map((item) => ({
       ...item,
       title: rejected ? "已拒收材料" : item.title,
       body: rejected ? "[REDACTED:rejected]" : item.body,
-      hits: await ctx.store.inboxHitTypes(item.id),
-    })));
-    return c.json({ inbox, hasMore: items.length === 200 });
+      hits: hitsMap.get(item.id) ?? [],
+    }));
+    return c.json({ inbox, total, limit, offset, hasMore: offset + rows.length < total });
   });
 
   app.post("/api/history/prune", async (c) => {
@@ -249,11 +310,36 @@ export function createApp(ctx: AppContext): Hono {
 
   app.get("/api/distill/tasks", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
-    // 审核前刷新草稿过期状态：只检查已有草稿的作用域，且限定次数
-    const drafts = await ctx.store.pendingDrafts();
-    for (const draft of drafts.slice(0, 50)) await ctx.distillJob.markStaleIfChanged(draft);
+    // 审核前刷新草稿过期状态：这是审核安全状态，刷新失败必须显式失败，不能伪装成功（P1-04）。
+    let drafts;
+    try {
+      drafts = await ctx.store.pendingDrafts();
+    } catch (error) {
+      return internalError(c, `pendingDrafts: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    for (const draft of drafts.slice(0, 50)) {
+      try {
+        await ctx.distillJob.markStaleIfChanged(draft);
+      } catch (error) {
+        return internalError(c, `markStaleIfChanged: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const query = c.req.query("query") ?? "";
+    const onlyAbnormal = c.req.query("abnormal") === "1" || c.req.query("abnormal") === "true";
+    const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") ?? 30) || 30));
+    const offset = Math.max(0, Number(c.req.query("offset") ?? 0) || 0);
+    let tasks, total;
+    try {
+      ({ tasks, total } = await ctx.distillJob.tasksPage(query, onlyAbnormal, limit, offset));
+    } catch (error) {
+      return internalError(c, `tasksPage: ${error instanceof Error ? error.message : String(error)}`);
+    }
     return c.json({
-      tasks: await ctx.distillJob.tasks(),
+      tasks,
+      total,
+      limit,
+      offset,
+      hasMore: offset + tasks.length < total,
       provider: ctx.config.distill.provider,
       model: ctx.config.distill.model,
     });
@@ -261,15 +347,50 @@ export function createApp(ctx: AppContext): Hono {
 
   app.post("/api/distill/draft", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
-    const body = (await c.req.json()) as { scopeKind?: string; scopeId?: string };
+    const body = (await c.req.json()) as { scopeKind?: string; scopeId?: string; sourceIds?: string[] };
     if (!body.scopeKind) return c.json({ error: "scopeKind required" }, 400);
-    return c.json(await ctx.distillJob.generateDraft(body.scopeKind, body.scopeId ?? "", "admin"));
+    return c.json(await ctx.distillJob.generateDraft(body.scopeKind, body.scopeId ?? "", body.sourceIds ?? [], "admin"));
   });
 
   app.post("/api/distill/draft/:id/discard", async (c) => {
     if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
     const ok = await ctx.distillJob.discardDraft(c.req.param("id"), "admin");
     return c.json({ ok }, ok ? 200 : 404);
+  });
+
+  app.post("/api/scopes/merge/preview", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json()) as { fromScopeKind?: string; fromScopeId?: string; toScopeId?: string };
+    const result = await previewMerge(ctx.store, body.fromScopeKind ?? "project", body.fromScopeId ?? "", body.toScopeId ?? "");
+    return c.json(result, result.status === "ok" ? 200 : 400);
+  });
+
+  app.post("/api/scopes/merge/confirm", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json()) as { fromScopeKind?: string; fromScopeId?: string; toScopeId?: string; digest?: string; ids?: string[] };
+    // B-07：确认只移动管理员显式勾选、经核对的精确 ID 子集
+    const result = await confirmMerge(ctx.store, body.fromScopeKind ?? "project", body.fromScopeId ?? "", body.toScopeId ?? "", body.digest ?? "", body.ids ?? [], "admin");
+    return c.json(result, result.status === "error" ? 400 : 200);
+  });
+
+  app.post("/api/scopes/merge/revert", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json()) as { operationId?: string };
+    if (!body.operationId) return c.json({ status: "error", error: "operationId required" }, 400);
+    const result = await revertMerge(ctx.store, body.operationId, "admin");
+    return c.json(result, result.status === "error" ? 400 : 200);
+  });
+
+  app.get("/api/scopes/merge/operations", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") ?? 20) || 20));
+    const offset = Math.max(0, Number(c.req.query("offset") ?? 0) || 0);
+    return c.json(await listMergeOperations(ctx.store, limit, offset));
+  });
+
+  app.get("/api/scopes/merge/fingerprint-report", async (c) => {
+    if (!adminOk(c, ctx.config)) return c.json({ error: "unauthorized" }, 401);
+    return c.json(await fingerprintDamageReport(ctx.store));
   });
 
   app.post("/api/inbox", async (c) => {

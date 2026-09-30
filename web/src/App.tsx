@@ -11,11 +11,20 @@ import {
   type Inbox,
   type KeyRow,
   type Memory,
+  type ScopeMergeOperationRow,
+  type ScopeMergePreview,
   type SyncReport,
   type TrustedMcpSourceRow,
   type UpdateInfo,
   type VaultItem,
 } from "./api";
+
+// B-08：dev 验收 driver 只在 ONELEDGER_DEV_DRIVER=1 的构建里存在；
+// 正式构建该常量为 false，整段代码（含动态导入）会被编译期消除。
+declare const __ONELEDGER_DEV_DRIVER__: boolean;
+if (__ONELEDGER_DEV_DRIVER__) {
+  void import("./devDriver").then((m) => m.startDevDriver());
+}
 
 function queueGroupKey(item: Inbox): string {
   if (item.scopeKind === "project" && item.scopeId?.trim()) return item.scopeId.trim();
@@ -648,128 +657,769 @@ function draftStatusLabel(status: string): string {
   if (status === "stale") return "已过期，需重审";
   if (status === "failed") return "生成失败";
   if (status === "discarded") return "已废弃";
+  if (status === "applied") return "已审核应用";
   return status;
+}
+
+function scopeKey(task: { scopeKind: string; scopeId: string }): string {
+  return `${task.scopeKind}\u0000${task.scopeId}`;
+}
+
+function scopeDisplayName(task: { scopeKind: string; scopeId: string }): string {
+  return task.scopeKind === "project" && task.scopeId ? task.scopeId : task.scopeKind === "personal" ? "个人" : "全局";
+}
+
+/** 归并操作记录 + 撤销（P1-03：offset 驱动分页，请求代次防旧响应覆盖新页）。 */
+function MergeOperations({ refreshNonce, onReverted }: { refreshNonce: number; onReverted?: () => void }) {
+  const PAGE_SIZE = 20;
+  const [rows, setRows] = useState<ScopeMergeOperationRow[] | null>(null);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [busyId, setBusyId] = useState("");
+  const [note, setNote] = useState("");
+  const [error, setError] = useState("");
+  const requestGen = useRef(0);
+  const load = (nextOffset: number) => {
+    const gen = ++requestGen.current;
+    setError("");
+    api
+      .mergeOperations(nextOffset)
+      .then((data) => {
+        if (gen !== requestGen.current) return; // 只有最新请求可更新列表（M-04）
+        setRows(data.operations);
+        setTotal(data.total);
+        setOffset(nextOffset);
+      })
+      .catch((cause) => {
+        if (gen !== requestGen.current) return;
+        setError(`读取归并记录失败：${cause instanceof Error ? cause.message : String(cause)}`);
+      });
+  };
+  useEffect(() => {
+    load(offset);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshNonce]);
+  if (!rows) return <Loading label="读取归并记录…" />;
+  const hasMore = offset + rows.length < total;
+  return (
+    <div className="list">
+      <h3>归并操作记录</h3>
+      {error ? <p className="error">{error}</p> : null}
+      {note ? <p className="ok">{note}</p> : null}
+      {!rows.length ? <p className="muted">还没有归并操作。</p> : null}
+      {rows.map((row) => (
+        <article className="item" key={row.id}>
+          <h3>
+            {row.fromScopeId} → {row.toScopeId}
+            <span className="muted"> · 移动 {row.movedCount} 条 · {row.status === "reverted" ? "已撤销" : "已生效"}</span>
+          </h3>
+          <p className="muted">
+            {row.createdAt}
+            {row.revertedAt ? ` · 撤销于 ${row.revertedAt}` : ""}
+            {Object.keys(row.sourceBreakdown || {}).length
+              ? ` · 来源 ${Object.entries(row.sourceBreakdown).map(([source, count]) => `${source} ${count}`).join("、")}`
+              : ""}
+          </p>
+          {row.status === "applied" ? (
+            <button
+              type="button"
+              disabled={Boolean(busyId)}
+              onClick={async () => {
+                if (!window.confirm(`撤销归并会把这 ${row.movedCount} 条材料移回「${row.fromScopeId}」，仅限仍处于待处理状态的记录。继续？`)) return;
+                setBusyId(row.id);
+                setNote("");
+                try {
+                  const result = await api.mergeRevert(row.id);
+                  if (result.status === "reverted") {
+                    setNote(`已撤销：${result.reverted} 条材料移回原作用域。`);
+                    onReverted?.();
+                  } else if (result.status === "already-reverted") setNote("该操作已撤销过。");
+                  else setNote(`撤销未执行：${result.error ?? result.status}`);
+                  load(offset);
+                } catch (cause) {
+                  setNote(`撤销失败：${cause instanceof Error ? cause.message : String(cause)}`);
+                } finally {
+                  setBusyId("");
+                }
+              }}
+            >
+              {busyId === row.id ? "撤销中…" : "撤销这次归并"}
+            </button>
+          ) : null}
+        </article>
+      ))}
+      {total > PAGE_SIZE ? (
+        <div className="row">
+          <button type="button" disabled={offset === 0} onClick={() => load(Math.max(0, offset - PAGE_SIZE))}>
+            上一页
+          </button>
+          <span className="muted">
+            第 {Math.floor(offset / PAGE_SIZE) + 1} 页 · 共 {total} 条
+          </span>
+          <button type="button" disabled={!hasMore} onClick={() => load(offset + PAGE_SIZE)}>
+            下一页
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** 单个作用域的归并预览与确认（B-07 全批勾选 + P0-06 批次 + M-02 分布截断）。
+ *  本批全部条目（≤1000）以脱敏元数据分页展示，默认全不勾选；确认只提交显式勾选的 ID 子集。
+ *  成功后通过 onApplied 把结果交给上层提示（面板本身会关闭，局部提示会随之消失）。 */
+function MergePanel({ task, onApplied }: { task: DistillTask; onApplied: (result: { moved: number; toScopeId: string; remaining: number }) => void }) {
+  const MERGE_PAGE_SIZE = 50;
+  const [target, setTarget] = useState("");
+  const [preview, setPreview] = useState<ScopeMergePreview | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [sourceFilter, setSourceFilter] = useState("");
+  const [pageOffset, setPageOffset] = useState(0);
+  const runPreview = async () => {
+    setBusy(true);
+    setNote("");
+    setPreview(null);
+    setPicked(new Set());
+    setPageOffset(0);
+    setSourceFilter("");
+    try {
+      const data = await api.mergePreview(task.scopeId, target.trim());
+      if (data.status === "ok") setPreview(data);
+      else setNote(data.error ?? "预览失败");
+    } catch (cause) {
+      setNote(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const confirm = async () => {
+    if (!preview?.digest) return;
+    const ids = [...picked];
+    if (!ids.length) {
+      setNote("默认不选择：请先勾选经核对属于该仓库的条目，再确认归并。");
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await api.mergeConfirm(task.scopeId, target.trim(), preview.digest, ids);
+      if (result.status === "applied") {
+        const remaining = typeof result.remaining === "number" ? result.remaining : 0;
+        setPreview(null);
+        setPicked(new Set());
+        onApplied({ moved: result.moved ?? 0, toScopeId: result.toScopeId ?? target.trim(), remaining });
+      } else if (result.status === "conflict") {
+        setNote(`作用域状态已变化：${result.error ?? "请重新预览"}`);
+        setPreview(null);
+        setPicked(new Set());
+      } else if (result.status === "unsupported") {
+        setNote(result.error ?? "当前存储不支持归并功能");
+      } else {
+        setNote(result.error ?? `未归并：${result.status}`);
+      }
+    } catch (cause) {
+      setNote(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const items = preview?.batchItems ?? [];
+  const filtered = sourceFilter.trim() ? items.filter((item) => item.source.toLowerCase().includes(sourceFilter.trim().toLowerCase())) : items;
+  const pageItems = filtered.slice(pageOffset, pageOffset + MERGE_PAGE_SIZE);
+  return (
+    <div className="form">
+      <p className="muted">
+        「{task.scopeId}」看起来是路径而不是仓库名（{task.pending} 条待处理材料）。输入确切的仓库名，先预览再确认；
+        软件不会按路径末段自动猜项目。只有待蒸馏材料会移动，正式记忆、拒收记录与凭据不受影响；
+        每批最多 {preview?.batchLimit ?? 1000} 条，归并/撤销不会移动采集指纹。
+      </p>
+      <label>
+        目标仓库名
+        <input
+          value={target}
+          onChange={(event) => setTarget(event.target.value)}
+          placeholder="例如：OneLedger"
+          disabled={busy}
+        />
+      </label>
+      <div className="row">
+        <button type="button" disabled={busy || !target.trim()} onClick={() => void runPreview()}>
+          {busy ? "处理中…" : "预览归并"}
+        </button>
+        {preview ? (
+          <button className="primary" type="button" disabled={busy || picked.size === 0} onClick={() => void confirm()}>
+            {busy ? "归并中…" : `确认归并勾选的 ${picked.size} 条`}
+          </button>
+        ) : null}
+      </div>
+      {note ? <p className={note.startsWith("本批已归并") || note.startsWith("已归并") ? "ok" : "error"}>{note}</p> : null}
+      {preview ? (
+        <div>
+          <p>
+            将审核 <b>本批 {preview.batch}</b> 条（共 {preview.pending} 条，本批之后来源还剩 {preview.remaining} 条）；
+            目标「{preview.toScopeId}」现有待处理 {preview.toPending} 条
+            {preview.toMemory ? `、正式记忆 rev ${preview.toMemory.rev}` : "、尚无正式记忆"}。
+            默认全部不勾选，确认只移动你显式勾选并核对过的条目。
+          </p>
+          {preview.sourceBreakdown?.length ? (
+            <p className="muted">
+              来源分布（前 20 种）：{preview.sourceBreakdown.map((item) => `${item.source} ${item.count}`).join("、")}
+              {preview.otherCount ? `；其余 ${preview.otherKinds ?? 0} 种共 ${preview.otherCount} 条` : ""}
+            </p>
+          ) : null}
+          {preview.blocked?.length ? (
+            <ul className="error">{preview.blocked.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+          ) : null}
+          <div className="row">
+            <label>
+              按来源筛选
+              <input
+                value={sourceFilter}
+                onChange={(event) => { setSourceFilter(event.target.value); setPageOffset(0); }}
+                placeholder="来源包含…（用于核对仓库证据）"
+              />
+            </label>
+            <button type="button" disabled={picked.size === filtered.length} onClick={() => setPicked(new Set(filtered.map((item) => item.id)))}>
+              全选当前筛选结果（{filtered.length}）
+            </button>
+            <button type="button" disabled={picked.size === 0} onClick={() => setPicked(new Set())}>
+              清空勾选
+            </button>
+          </div>
+          <table className="sample-table">
+            <thead>
+              <tr>
+                <th>勾选</th>
+                <th>ID</th>
+                <th>标题</th>
+                <th>来源</th>
+                <th>创建时间</th>
+                <th>安全状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pageItems.map((item) => (
+                <tr key={item.id}>
+                  <td>
+                    <input
+                      type="checkbox"
+                      checked={picked.has(item.id)}
+                      onChange={() => {
+                        setPicked((current) => {
+                          const next = new Set(current);
+                          if (next.has(item.id)) next.delete(item.id);
+                          else next.add(item.id);
+                          return next;
+                        });
+                      }}
+                      aria-label={`勾选 ${item.title}`}
+                    />
+                  </td>
+                  <td className="mono">{item.id}</td>
+                  <td>{item.title}</td>
+                  <td>{item.source}</td>
+                  <td className="mono">{item.createdAt}</td>
+                  <td>{item.sensitivity}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {filtered.length > MERGE_PAGE_SIZE || pageOffset > 0 ? (
+            <div className="row">
+              <button type="button" disabled={pageOffset === 0} onClick={() => setPageOffset(Math.max(0, pageOffset - MERGE_PAGE_SIZE))}>
+                上一页
+              </button>
+              <span className="muted">
+                第 {Math.floor(pageOffset / MERGE_PAGE_SIZE) + 1} 页 · 本页 {pageItems.length} 条 / 筛选后 {filtered.length} 条
+              </span>
+              <button type="button" disabled={pageOffset + MERGE_PAGE_SIZE >= filtered.length} onClick={() => setPageOffset(pageOffset + MERGE_PAGE_SIZE)}>
+                下一页
+              </button>
+            </div>
+          ) : null}
+          <p className="muted">
+            确认前请再次核对目标仓库名与已勾选的 {picked.size} 条 ID；无法证明属于同一仓库的条目留在队列即可，
+            不勾选就不会移动。归并后可按操作记录撤销（仅限仍待处理的材料）。
+          </p>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** 已选来源元数据：跨页保留，提交前完整呈现（P1-02）。 */
+interface SelectedSource {
+  id: string;
+  title: string;
+  source: string;
+  createdAt: string;
+  sensitivity: string;
+}
+
+const TASK_PAGE_SIZE = 30;
+const MATERIAL_PAGE_SIZE = 20;
+
+/** 完整已选清单：ID、仓库、来源、标题、创建时间、安全状态，可逐条取消。 */
+function SelectionReview({
+  items,
+  fixed,
+  onCancel,
+}: {
+  items: SelectedSource[];
+  fixed?: boolean;
+  onCancel?: (id: string) => void;
+}) {
+  if (!items.length) return null;
+  return (
+    <details className="selection-review" open>
+      <summary>将处理 {items.length} 条来源（提交前请逐条核对）</summary>
+      <table className="sample-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>标题</th>
+            <th>来源</th>
+            <th>创建时间</th>
+            <th>安全状态</th>
+            {fixed ? null : <th />}
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((item) => (
+            <tr key={item.id}>
+              <td className="mono">{item.id}</td>
+              <td>{item.title}</td>
+              <td>{item.source}</td>
+              <td className="mono">{item.createdAt}</td>
+              <td>{item.sensitivity === "public" ? "公开" : item.sensitivity}</td>
+              {fixed ? null : (
+                <td>
+                  <button type="button" onClick={() => onCancel?.(item.id)}>
+                    取消
+                  </button>
+                </td>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </details>
+  );
+}
+
+function toSelectedSource(item: Inbox): SelectedSource {
+  return {
+    id: item.id,
+    title: item.title,
+    source: item.source,
+    createdAt: item.createdAt,
+    sensitivity: item.sensitivity,
+  };
 }
 
 function DistillTasks({ refreshKey = 0, onHandled }: { refreshKey?: number; onHandled?: () => void }) {
   const [tasks, setTasks] = useState<DistillTask[]>([]);
+  const [total, setTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [page, setPage] = useState(0);
+  const [filter, setFilter] = useState("");
+  const [abnormalOnly, setAbnormalOnly] = useState(false);
   const [provider, setProvider] = useState("none");
   const [model, setModel] = useState("");
   const [note, setNote] = useState("");
+  const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
   const [openKey, setOpenKey] = useState("");
-  const [editing, setEditing] = useState("");
+  // abnormal 作用域展开时的面板选择："review"=材料审核（P1-02 统一入口），默认/空=归属修正
+  const [openPanel, setOpenPanel] = useState<"" | "review" | "merge">("");
+  const [materials, setMaterials] = useState<Inbox[]>([]);
+  const [materialTotal, setMaterialTotal] = useState(0);
+  const [materialPage, setMaterialPage] = useState(0);
+  const [materialLoading, setMaterialLoading] = useState(false);
+  const materialGen = useRef(0);
+  // P1-02：勾选保存完整元数据，跨页保留；切换作用域/筛选即清空
+  const [selected, setSelected] = useState<SelectedSource[]>([]);
+  // P0-01：编辑入口二选一——manual 只用显式勾选，draft 完整装入草稿与来源集合
+  const [editing, setEditing] = useState<"" | "manual" | "draft">("");
   const [editTitle, setEditTitle] = useState("");
   const [editBody, setEditBody] = useState("");
   const [editRev, setEditRev] = useState(0);
+  const [editLoaded, setEditLoaded] = useState("");
+  const [draftSources, setDraftSources] = useState<SelectedSource[]>([]);
+  const [currentMemory, setCurrentMemory] = useState<{ title: string; body: string; rev: number } | null>(null);
+  // P0-02：rev 冲突阻断状态——不自动推进 rev，需管理员核对合并后显式确认
+  const [conflict, setConflict] = useState<{ serverTitle: string; serverBody: string; serverRev: number } | null>(null);
+  // B-02：冲突期间提交按钮禁用；「我已合并服务器最新内容」确认后进入二次确认（手工模式）
+  const [mergeConfirmed, setMergeConfirmed] = useState(false);
+  // B-12：当前正式记忆读取失败——非空时禁止提交，只允许重试
+  const [memoryLoadError, setMemoryLoadError] = useState("");
+  // P0-01：整篇正文与当前正式记忆完全相同时，消费来源需要单独显式批准
+  const [confirmUnchanged, setConfirmUnchanged] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [visible, setVisible] = useState(20);
-  const [filter, setFilter] = useState("");
-  const [loaded, setLoaded] = useState(false);
+  const [mergeNonce, setMergeNonce] = useState(0);
+  const [showMerges, setShowMerges] = useState(false);
+  const [report, setReport] = useState<{ note: string; operations: Array<Record<string, unknown>> } | null>(null);
 
-  const refresh = () =>
-    void api
-      .distillTasks()
+  const taskGen = useRef(0);
+  const refresh = (nextPage = page, nextFilter = filter, nextAbnormal = abnormalOnly) => {
+    const gen = ++taskGen.current;
+    api
+      .distillTasks({ query: nextFilter, abnormal: nextAbnormal, offset: nextPage * TASK_PAGE_SIZE })
       .then((data) => {
+        if (gen !== taskGen.current) return; // 慢的旧请求不得覆盖新筛选（M-04）
         setTasks(data.tasks);
+        setTotal(data.total);
+        setHasMore(data.hasMore);
         setProvider(data.provider);
         setModel(data.model);
+        setError("");
       })
-      .finally(() => setLoaded(true));
+      .catch((cause) => {
+        if (gen !== taskGen.current) return;
+        setError(`加载任务失败：${cause instanceof Error ? cause.message : String(cause)}`);
+      })
+      .finally(() => {
+        // C-07：旧请求的 finally 不得清除新操作的 busy 状态
+        if (gen === taskGen.current) setBusy("");
+      });
+  };
   useEffect(() => {
-    void refresh();
-  }, [refreshKey]);
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey, page, filter, abnormalOnly]);
 
-  const key = (task: DistillTask) => `${task.scopeKind}\u0000${task.scopeId}`;
-  const scopeLabel = (task: DistillTask) =>
-    task.scopeKind === "project" && task.scopeId ? task.scopeId : task.scopeKind === "personal" ? "个人" : "全局";
+  const openTask = tasks.find((task) => scopeKey(task) === openKey);
+
+  const loadMaterials = (task: DistillTask, nextPage = 0) => {
+    const gen = ++materialGen.current;
+    setMaterialLoading(true);
+    return api
+      .inbox("proposed", { scopeKind: task.scopeKind, scopeId: task.scopeId, limit: MATERIAL_PAGE_SIZE, offset: nextPage * MATERIAL_PAGE_SIZE })
+      .then((data) => {
+        if (gen !== materialGen.current) return; // 翻页竞态防护（M-04）
+        setMaterials(data.inbox);
+        setMaterialTotal(data.total);
+        setMaterialPage(nextPage);
+      })
+      .catch((cause) => {
+        // C-07：失败分支同样要带代次检查——旧页请求晚失败不得覆盖新页的错误状态
+        if (gen !== materialGen.current) return;
+        setError(`加载材料失败：${cause instanceof Error ? cause.message : String(cause)}`);
+      })
+      .finally(() => {
+        if (gen === materialGen.current) setMaterialLoading(false);
+      });
+  };
+
+  /** B-12：区分「成功但为空」与「读取失败」——失败时编辑器不能进入可提交状态。 */
+  const fetchCurrentMemory = async (
+    task: DistillTask,
+  ): Promise<{ ok: true; memory: { title: string; body: string; rev: number } | null } | { ok: false; message: string }> => {
+    try {
+      const { memories } = await api.memories({ scopeKind: task.scopeKind, scopeId: task.scopeId });
+      const current = memories[0];
+      return { ok: true, memory: current ? { title: current.title, body: current.body, rev: current.rev ?? 0 } : null };
+    } catch (cause) {
+      return { ok: false, message: cause instanceof Error ? cause.message : String(cause) };
+    }
+  };
+
+  const resetEditor = () => {
+    setEditing("");
+    setEditLoaded("");
+    setDraftSources([]);
+    setCurrentMemory(null);
+    setConflict(null);
+    setConfirmUnchanged(false);
+    setMemoryLoadError("");
+  };
 
   const openEditor = async (task: DistillTask) => {
-    setOpenKey(key(task));
-    setEditing(key(task));
+    setOpenKey(scopeKey(task));
     setNote("");
-    if (task.draft && task.draft.status !== "stale" && task.draft.status !== "discarded") {
-      setEditTitle(task.draft.title);
-      setEditBody(task.draft.body);
-      setEditRev(task.draft.expectedRev);
+    setError("");
+    setSelected([]);
+    resetEditor();
+    await loadMaterials(task, 0);
+  };
+
+  const openManual = async (task: DistillTask) => {
+    // 保留已勾选：手工入口处理的就是用户显式勾选的集合（跨页保留，P1-02）
+    resetEditor();
+    const result = await fetchCurrentMemory(task);
+    if (!result.ok) {
+      // B-12：读取失败不得当作「尚无记忆」继续进入可提交审核态
+      setCurrentMemory(null);
+      setMemoryLoadError(result.message);
+      setEditLoaded("载入当前正式记忆失败：在成功取得当前 rev 与正文前无法提交。可点击「重试读取」恢复。");
+      setEditing("manual");
       return;
     }
-    const { memories } = await api.memories({ scopeKind: task.scopeKind, scopeId: task.scopeId });
-    const current = memories[0];
+    const current = result.memory;
+    setCurrentMemory(current);
     setEditTitle(current?.title ?? "");
     setEditBody(current?.body ?? "");
     setEditRev(current?.rev ?? 0);
+    setEditLoaded(current ? `已载入当前正式记忆（rev ${current.rev}）。只处理你显式勾选的材料。` : "该项目还没有正式记忆，保存后创建 rev 1。");
+    setEditing("manual");
   };
 
-  const submitEdit = async (task: DistillTask) => {
-    setSaving(true);
+  /** B-12：重试读取当前正式记忆；不清除用户已输入的正文。 */
+  const retryLoadMemory = async (task: DistillTask) => {
+    const result = await fetchCurrentMemory(task);
+    if (!result.ok) {
+      setMemoryLoadError(result.message);
+      return;
+    }
+    setMemoryLoadError("");
+    setCurrentMemory(result.memory);
+    if (result.memory) {
+      setEditTitle((prev) => (prev.trim() ? prev : result.memory!.title));
+      setEditBody((prev) => (prev.trim() ? prev : result.memory!.body));
+      setEditRev(result.memory.rev);
+      setEditLoaded(`已载入当前正式记忆（rev ${result.memory.rev}）。只处理你显式勾选的材料。`);
+    } else {
+      setEditRev(0);
+      setEditLoaded("该项目还没有正式记忆，保存后创建 rev 1。");
+    }
+  };
+
+  /** 草稿审核（P0-01）：完整装入草稿 title/body/expectedRev 与草稿来源元数据，正文差异同屏展示。 */
+  const openDraftReview = async (task: DistillTask) => {
+    const draft = task.draft;
+    if (!draft || draft.status !== "pending") {
+      setNote("草稿已过期或已处理，不能直接提交；请重新生成或手工整理。");
+      return;
+    }
+    resetEditor();
     try {
-      const ids = task.draft && task.draft.status === "pending" ? task.draft.sourceIds : task.sources.map((item) => item.id);
-      const result = await api.resolveInbox(ids, editBody.trim(), editTitle.trim(), editRev);
-      if (result.status === "stored" || result.status === "unchanged") {
-        setEditing("");
-        setOpenKey("");
-        setNote(`${scopeLabel(task)} 已写入正式记忆，材料已处理。`);
-        refresh();
-        onHandled?.();
-      } else if (result.status === "conflict") {
-        setNote(`作用域已更新到 rev ${result.currentRev}，请重新生成草稿或核对后再写入。`);
-        refresh();
-      } else {
-        setNote(`写入未成功：${result.status}。`);
+      const data = await api.inbox("proposed", { ids: draft.sourceIds, draftId: draft.id });
+      const rows = data.inbox.map(toSelectedSource);
+      setDraftSources(rows);
+      const result = await fetchCurrentMemory(task);
+      if (!result.ok) {
+        setCurrentMemory(null);
+        setMemoryLoadError(result.message);
+        setEditLoaded(`已载入待审草稿（expectedRev ${draft.expectedRev}）与草稿来源 ${rows.length} 条。载入当前正式记忆失败：在成功取得当前 rev 与正文前无法提交。`);
+        setEditing("draft");
+        return;
       }
-    } catch (error) {
-      setNote(`写入失败：${String(error)}`);
+      const current = result.memory;
+      setCurrentMemory(current);
+      setEditTitle(draft.title);
+      setEditBody(draft.body);
+      setEditRev(draft.expectedRev);
+      setEditLoaded(
+        `已载入待审草稿（expectedRev ${draft.expectedRev}）与草稿来源 ${rows.length} 条。` +
+          (current ? `当前正式记忆为 rev ${current.rev}。` : "该项目还没有正式记忆。"),
+      );
+      setEditing("draft");
+    } catch (cause) {
+      setError(`载入草稿来源失败：${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  };
+
+  const toggleSelected = (item: Inbox) => {
+    setSelected((items) =>
+      items.some((row) => row.id === item.id)
+        ? items.filter((row) => row.id !== item.id)
+        : [...items, toSelectedSource(item)],
+    );
+  };
+
+  const afterResolved = (task: DistillTask, ids: number) => {
+    setEditing("");
+    setOpenKey("");
+    setSelected([]);
+    setEditBody("");
+    setEditRev(0);
+    resetEditor();
+    setNote(`${scopeDisplayName(task)} 已写入正式记忆，处理了 ${ids} 条来源。`);
+    refresh();
+    onHandled?.();
+  };
+
+  /** 提交（P0-01/B-02）：draft 模式带 draftId 与草稿来源集合；conflict 进入阻断合并，
+   *  绝不自动推进 rev——rev 只能在「我已合并服务器最新内容」显式步骤中更新（且仅限手工模式）。 */
+  const submitEdit = async (task: DistillTask, mode: "manual" | "draft") => {
+    const ids = mode === "draft" ? draftSources.map((item) => item.id) : selected.map((item) => item.id);
+    if (!ids.length) {
+      setNote(mode === "manual" ? "请先勾选本次要处理的材料；未勾选的材料不会离开队列。" : "草稿来源为空，请先废弃草稿并重新整理。");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      const result = await api.resolveInbox(ids, editBody.trim(), editTitle.trim(), editRev, mode === "draft" ? { draftId: task.draft?.id } : undefined);
+      if (result.status === "stored" || result.status === "unchanged") {
+        afterResolved(task, ids.length);
+      } else if (result.status === "conflict") {
+        // B-02：冲突进入阻断状态。重新获取服务器最新内容；绝不把本端 rev 推进到 currentRev。
+        const server = await fetchCurrentMemory(task);
+        if (server.ok && server.memory) {
+          setConflict({ serverTitle: server.memory.title, serverBody: server.memory.body, serverRev: server.memory.rev });
+        } else if (!server.ok) {
+          setConflict(null);
+          setError(`冲突后读取服务器最新内容失败：${server.message}。再次提交仍会冲突，请稍后重试。`);
+          setSaving(false);
+          refresh();
+          return;
+        } else {
+          // 服务器记忆已消失（如被删除）：以 rev 0 为准阻断
+          setConflict({ serverTitle: "", serverBody: "", serverRev: 0 });
+        }
+        setMergeConfirmed(false);
+        setNote(
+          mode === "draft"
+            ? "草稿提交时正式记忆已被他人更新：草稿已标记过期，不能给旧草稿换新 rev。请废弃草稿后重新生成，或从最新正文手工整理。"
+            : "正式记忆已被其他人更新：请核对服务器最新内容，手动合并后通过「我已合并服务器最新内容」确认；在你确认前不会写入。",
+        );
+        refresh();
+      } else if (result.status === "rejected") {
+        setNote(`敏感内容被拒收，未写入。${result.hits?.length ? ` 命中：${result.hits.map((hit) => hit.type).join("、")}` : ""}`);
+      } else {
+        setNote(`写入未成功：${result.error ?? result.status}。编辑内容与勾选保留。`);
+      }
+    } catch (cause) {
+      setError(`写入失败：${cause instanceof Error ? cause.message : String(cause)}`);
     } finally {
       setSaving(false);
     }
   };
 
-  const needle = filter.trim().toLowerCase();
-  const matched = needle ? tasks.filter((task) => scopeLabel(task).toLowerCase().includes(needle)) : tasks;
-  const shown = matched.slice(0, visible);
-  const totalPending = tasks.reduce((sum, task) => sum + task.pending, 0);
+  /** B-02：手工模式专用——管理员声明已合并服务器最新版本，二次确认后携带新 rev 提交。 */
+  const applyMergedRevision = () => {
+    if (!conflict) return;
+    setEditRev(conflict.serverRev);
+    setConflict(null);
+    setMergeConfirmed(false);
+    setNote(`已采用服务器 rev ${conflict.serverRev}：请再次核对完整来源清单后提交。`);
+  };
 
-  if (!loaded) {
-    return <Loading />;
-  }
-  if (!tasks.length) {
+  const generateDraft = async (task: DistillTask) => {
+    if (!selected.length) {
+      setNote("生成草稿前请先勾选材料（一次最多 12 条）；未勾选时不会向模型发送任何内容。");
+      return;
+    }
+    setBusy(`draft:${scopeKey(task)}`);
+    setNote("");
+    try {
+      const result = await api.distillDraft(task.scopeKind, task.scopeId, selected.map((item) => item.id));
+      if (result.status === "pending") setNote(`草稿已基于你勾选的 ${selected.length} 条材料生成，请通过「审核草稿」入口核对后再写入。`);
+      else if (result.status === "failed") setNote(`草稿生成失败：${result.error ?? ""}`);
+      else setNote(`未生成草稿：${result.error ?? result.status}`);
+      refresh();
+    } catch (cause) {
+      setError(`生成草稿失败：${cause instanceof Error ? cause.message : String(cause)}`);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const loadReport = async () => {
+    try {
+      const data = await api.fingerprintReport();
+      setReport({ note: data.note, operations: data.operations });
+    } catch (cause) {
+      setError(`读取指纹检测报告失败：${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  };
+
+  if (tasks.length === 0 && total === 0 && !filter && !abnormalOnly) {
     return <p className="muted">没有待蒸馏任务。采集到新材料后会自动出现在这里。</p>;
   }
+  const activeSources = editing === "draft" ? draftSources : selected;
   return (
     <div className="list">
       <p className="muted">
-        {tasks.length} 个作用域、共 {totalPending} 条待蒸馏材料。模型提供方：
+        共 {total} 个作用域。模型提供方：
         <b>{provider === "none" ? " 未配置（手工整理正文）" : ` ${provider}${model ? ` · ${model}` : ""}`}</b>
       </p>
-      {note ? <p className="ok">{note}</p> : null}
-      {tasks.length > 20 ? (
+      {note ? <p className={note.includes("已写入") || note.includes("已归并") || note.startsWith("本批已归并") ? "ok" : "error"}>{note}</p> : null}
+      {error ? <p className="error" role="alert">{error}</p> : null}
+      <div className="row">
         <label>
           筛选作用域
-          <input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="输入仓库名片段" />
+          <input value={filter} onChange={(event) => { setPage(0); setFilter(event.target.value); setOpenKey(""); setSelected([]); resetEditor(); }} placeholder="输入仓库名片段" />
         </label>
+        <button type="button" className={abnormalOnly ? "active" : ""} onClick={() => { setPage(0); setAbnormalOnly((value) => !value); setOpenKey(""); setSelected([]); resetEditor(); }}>
+          {abnormalOnly ? "✓ 只看归属待修正" : "只看归属待修正"}
+        </button>
+        <button type="button" onClick={() => setShowMerges((value) => !value)}>
+          {showMerges ? "收起归并记录" : "归并操作记录"}
+        </button>
+        <button type="button" onClick={() => void loadReport()}>
+          指纹检测报告
+        </button>
+      </div>
+      {showMerges ? (
+        <MergeOperations
+          refreshNonce={mergeNonce}
+          onReverted={() => {
+            setMergeNonce((value) => value + 1);
+            refresh();
+          }}
+        />
       ) : null}
-      {shown.map((task) => {
-        const open = openKey === key(task);
+      {report ? (
+        <details className="advanced">
+          <summary>v10 归并指纹核查报告（只读，{report.operations.length} 条操作记录）</summary>
+          <p className="muted">{report.note}</p>
+          {report.operations.length ? (
+            <table className="sample-table">
+              <thead>
+                <tr>
+                  <th>操作</th>
+                  <th>来源作用域</th>
+                  <th>目标作用域</th>
+                  <th>移动</th>
+                  <th>状态</th>
+                  <th>现指纹（来源/目标）</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.operations.map((op) => (
+                  <tr key={String(op.operationId)}>
+                    <td className="mono">{String(op.operationId)}</td>
+                    <td>{String(op.fromScope)}</td>
+                    <td>{String(op.toScope)}</td>
+                    <td>{String(op.movedCount)}</td>
+                    <td>{String(op.status)}</td>
+                    <td>
+                      {String(op.fingerprintsNowInFromScope)} / {String(op.fingerprintsNowInToScope)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p className="muted">没有归并操作记录，无需核查。</p>
+          )}
+        </details>
+      ) : null}
+      {tasks.map((task) => {
+        const open = openKey === scopeKey(task);
         const draft = task.draft;
+        const isAbnormal = task.abnormal;
         return (
-          <article className={`item queue-item${open ? " is-open" : ""}`} key={key(task)}>
+          <article className={`item queue-item${open ? " is-open" : ""}`} key={scopeKey(task)}>
             <h3>
-              {scopeLabel(task)}
+              {scopeDisplayName(task)}
+              {isAbnormal ? <span className="error"> · 归属待修正</span> : null}
               <span className="muted">
-                {" "}
-                · 待处理 {task.pending} 条 · 最旧等待 {ageLabel(task.oldestWaitingAt)}
-                {task.highSignal ? ` · 高信号 ${task.highSignal} 条` : ""}
+                {" "}· 待处理 {task.pending} 条 · 最旧等待 {ageLabel(task.oldestWaitingAt)}
+                {task.workbuddy ? ` · WorkBuddy 来源 ${task.workbuddy} 条` : ""}
               </span>
             </h3>
             {draft ? (
               <p className="muted">
-                草稿 {draftStatusLabel(draft.status)} · 生成于 {draft.updatedAt} · 尝试 {draft.attempts} 次
+                草稿 {draftStatusLabel(draft.status)} · 生成于 {draft.updatedAt} · 尝试 {draft.attempts} 次 · 覆盖来源 {draft.sourceIds.length} 条
                 {draft.staleReason ? ` · ${draft.staleReason}` : ""}
                 {draft.error ? ` · ${draft.error}` : ""}
               </p>
             ) : (
-              <p className="muted">尚无草稿。{provider === "none" ? "可直接手工整理整篇摘要。" : "可生成模型草稿后审核。"}</p>
+              <p className="muted">尚无草稿。{provider === "none" ? "可直接手工整理整篇摘要。" : "勾选材料后可生成模型草稿。"}</p>
             )}
             <div className="row">
               <button
@@ -779,35 +1429,21 @@ function DistillTasks({ refreshKey = 0, onHandled }: { refreshKey?: number; onHa
                 onClick={() => {
                   if (open) {
                     setOpenKey("");
+                    setOpenPanel("");
                     return;
                   }
-                  setBusy(`open:${key(task)}`);
+                  setBusy(`open:${scopeKey(task)}`);
+                  setOpenPanel("review");
                   void openEditor(task)
-                    .catch((cause) => setNote(`打开失败：${cause instanceof Error ? cause.message : String(cause)}`))
+                    .catch((cause) => setError(`打开失败：${cause instanceof Error ? cause.message : String(cause)}`))
                     .finally(() => setBusy(""));
                 }}
               >
-                {busy === `open:${key(task)}` ? "打开中…" : open ? "收起" : "审核 / 整理"}
+                {busy === `open:${scopeKey(task)}` ? "打开中…" : open ? "收起" : "审核 / 整理"}
               </button>
-              {provider !== "none" ? (
-                <button
-                  type="button"
-                  disabled={busy === key(task)}
-                  onClick={async () => {
-                    setBusy(key(task));
-                    setNote("");
-                    try {
-                      const result = await api.distillDraft(task.scopeKind, task.scopeId);
-                      if (result.status === "pending") setNote(`${scopeLabel(task)} 草稿已生成，请审核后再写入。`);
-                      else if (result.status === "failed") setNote(`草稿生成失败：${result.error ?? ""}`);
-                      else setNote(`未生成草稿：${result.error ?? result.status}`);
-                      refresh();
-                    } finally {
-                      setBusy("");
-                    }
-                  }}
-                >
-                  {busy === key(task) ? "生成中…" : draft ? "重新生成草稿" : "生成草稿"}
+              {isAbnormal ? (
+                <button type="button" onClick={() => { setOpenKey(open && openPanel === "merge" ? "" : scopeKey(task)); setOpenPanel("merge"); setEditing(""); resetEditor(); }}>
+                  修正归属
                 </button>
               ) : null}
               {draft && draft.status !== "discarded" ? (
@@ -819,9 +1455,10 @@ function DistillTasks({ refreshKey = 0, onHandled }: { refreshKey?: number; onHa
                     try {
                       await api.discardDraft(draft.id);
                       setNote("草稿已废弃，来源材料保持待处理。");
+                      resetEditor();
                       refresh();
                     } catch (cause) {
-                      setNote(`废弃失败：${cause instanceof Error ? cause.message : String(cause)}`);
+                      setError(`废弃失败：${cause instanceof Error ? cause.message : String(cause)}`);
                     } finally {
                       setBusy("");
                     }
@@ -831,48 +1468,223 @@ function DistillTasks({ refreshKey = 0, onHandled }: { refreshKey?: number; onHa
                 </button>
               ) : null}
             </div>
-            {open ? (
-              <div className="form">
-                <p className="muted">来源材料 {task.sources.length} 条（已按高信号优先排列）；写入成功后这些材料会从队列移除。</p>
-                <ul className="muted">
-                  {task.sources.slice(0, 8).map((item) => (
-                    <li key={item.id}>
-                      {item.source} · {item.title}
-                      {item.redacted ? " · 已脱敏" : ""}
-                    </li>
-                  ))}
-                </ul>
-                {draft?.status === "stale" ? <p className="error">草稿已过期：{draft.staleReason}。请重新生成或手工整理。</p> : null}
-                {editing === key(task) ? (
-                  <>
-                    <label>
-                      标题
-                      <input value={editTitle} onChange={(event) => setEditTitle(event.target.value)} />
-                    </label>
-                    <label>
-                      蒸馏后的整篇正文
-                      <textarea rows={12} value={editBody} onChange={(event) => setEditBody(event.target.value)} />
-                    </label>
-                    <button className="primary" disabled={saving || !editBody.trim()} onClick={() => void submitEdit(task)}>
-                      {saving ? "写入中…" : "确认写入"}
-                    </button>
-                  </>
-                ) : (
-                  <button type="button" onClick={() => void openEditor(task)}>
-                    打开编辑
-                  </button>
-                )}
-              </div>
+            {open && openTask ? (
+              isAbnormal && !editing && openPanel !== "review" ? (
+                <MergePanel
+                  task={openTask}
+                  onApplied={(mergeResult) => {
+                    setMergeNonce((value) => value + 1);
+                    setOpenKey("");
+                    setNote(
+                      mergeResult.remaining > 0
+                        ? `本批已归并 ${mergeResult.moved} 条材料到「${mergeResult.toScopeId}」，来源作用域还剩 ${mergeResult.remaining} 条；请再次预览并确认下一批。`
+                        : `已归并 ${mergeResult.moved} 条材料到「${mergeResult.toScopeId}」。可在操作记录中撤销（材料未被处理时）。`,
+                    );
+                    refresh();
+                    onHandled?.();
+                  }}
+                />
+              ) : (
+                <div className="form">
+                  {materialLoading ? (
+                    <Loading label="加载材料…" />
+                  ) : (
+                    <>
+                      <p className="muted">
+                        本作用域共 {materialTotal} 条待处理材料，当前显示第 {materialPage * MATERIAL_PAGE_SIZE + 1}–
+                        {materialPage * MATERIAL_PAGE_SIZE + materials.length} 条。默认全部不勾选；只有勾选的材料会被处理。
+                        单次提交最多 100 条（C-05），更多请分批。
+                      </p>
+                      <ul>
+                        {materials.map((item) => (
+                          <li key={item.id}>
+                            <label className="check">
+                              <input
+                                type="checkbox"
+                                checked={selected.some((row) => row.id === item.id)}
+                                onChange={() => toggleSelected(item)}
+                              />
+                              <span>
+                                {item.source} · {item.title}
+                                {item.redacted ? " · 已脱敏" : ""}
+                                {item.sensitivity && item.sensitivity !== "public" ? ` · ${item.sensitivity}` : ""}
+                                <span className="mono muted"> · {item.id} · {item.createdAt}</span>
+                              </span>
+                            </label>
+                            <details>
+                              <summary className="muted">预览</summary>
+                              <pre className="notes">{item.body.length > 2000 ? `${item.body.slice(0, 2000)}…（已截断）` : item.body}</pre>
+                            </details>
+                          </li>
+                        ))}
+                      </ul>
+                      {materialTotal > MATERIAL_PAGE_SIZE || materialPage > 0 ? (
+                        <div className="row">
+                          <button type="button" disabled={materialPage === 0 || materialLoading} onClick={() => void loadMaterials(task, materialPage - 1)}>
+                            上一页
+                          </button>
+                          <span className="muted">第 {materialPage + 1} 页</span>
+                          <button
+                            type="button"
+                            disabled={(materialPage + 1) * MATERIAL_PAGE_SIZE >= materialTotal || materialLoading}
+                            onClick={() => void loadMaterials(task, materialPage + 1)}
+                          >
+                            下一页
+                          </button>
+                        </div>
+                      ) : null}
+                    </>
+                  )}
+                  {/* 筛选之外仍选中的条目必须可见（P1-02）：勾选清单跨页保留并完整呈现 */}
+                  {editing === "" && selected.length ? (
+                    <SelectionReview items={selected} onCancel={(id) => setSelected((items) => items.filter((row) => row.id !== id))} />
+                  ) : null}
+                  {draft?.status === "stale" ? <p className="error">草稿已过期：{draft.staleReason}。过期草稿禁止直接提交；请重新勾选并生成或手工整理。</p> : null}
+                  {provider !== "none" && !editing ? (
+                    <div className="row">
+                      <button type="button" disabled={Boolean(busy) || !selected.length} onClick={() => void generateDraft(task)}>
+                        {busy === `draft:${scopeKey(task)}` ? "生成中…" : `基于勾选 ${selected.length} 条生成草稿`}
+                      </button>
+                      <span className="muted">草稿仍需通过审核入口确认后才写入。</span>
+                    </div>
+                  ) : null}
+                  {editing !== "" ? (
+                    <>
+                      <p className="muted">{editLoaded}</p>
+                      {editing === "draft" ? (
+                        <SelectionReview items={draftSources} fixed />
+                      ) : (
+                        <SelectionReview items={selected} onCancel={(id) => setSelected((items) => items.filter((row) => row.id !== id))} />
+                      )}
+                      {currentMemory ? (
+                        <details>
+                          <summary className="muted">与当前正式记忆（rev {currentMemory.rev}）对照（完整正文）</summary>
+                          <p className="muted">标题：{currentMemory.title}</p>
+                          {/* B-02：审核需要完整正文，不再截断 */}
+                          <pre className="notes">{currentMemory.body}</pre>
+                        </details>
+                      ) : null}
+                      {conflict ? (
+                        <div className="banner error" role="alert">
+                          <p>
+                            版本冲突：服务器最新为 rev {conflict.serverRev}
+                            {conflict.serverTitle ? `（${conflict.serverTitle}）` : ""}。你正在编辑的内容保留在下方编辑框；
+                            在你核对并合并前提交按钮保持禁用，不会写入任何内容。
+                          </p>
+                          <details open>
+                            <summary>服务器最新正文（rev {conflict.serverRev}，完整展示）</summary>
+                            <pre className="notes">{conflict.serverBody}</pre>
+                          </details>
+                          {editing === "draft" ? (
+                            <p>
+                              草稿不能换新 rev 提交：请废弃该草稿后重新生成，或取消编辑改用「手工整理」从服务器最新正文出发。
+                            </p>
+                          ) : mergeConfirmed ? (
+                            <div className="row">
+                              <button type="button" className="primary" onClick={applyMergedRevision}>
+                                二次确认：以服务器 rev {conflict.serverRev} 为准提交（{activeSources.length} 条来源）
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="row">
+                              <button type="button" onClick={() => setMergeConfirmed(true)}>
+                                我已合并服务器最新内容（rev {conflict.serverRev}）
+                              </button>
+                              <button type="button" onClick={() => { setEditTitle(conflict.serverTitle); setEditBody(conflict.serverBody); setMergeConfirmed(true); }}>
+                                以服务器版本为底稿重新编辑
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      ) : null}
+                      {memoryLoadError ? (
+                        <div className="banner error" role="alert">
+                          <p>B-12：读取当前正式记忆失败：{memoryLoadError}。未取得当前 rev 与正文前不能提交。</p>
+                          <button type="button" onClick={() => void retryLoadMemory(task)}>重试读取</button>
+                        </div>
+                      ) : null}
+                      <label>
+                        标题
+                        <input value={editTitle} onChange={(event) => setEditTitle(event.target.value)} />
+                      </label>
+                      <label>
+                        {editing === "draft" ? "草稿正文（可修订）" : "蒸馏后的整篇正文"}
+                        <textarea rows={12} value={editBody} onChange={(event) => setEditBody(event.target.value)} />
+                      </label>
+                      <p className="muted">
+                        最终确认：将处理 <b>{activeSources.length}</b> 条来源；
+                        写入是整篇覆盖，只移除这些来源，未选材料留在队列。
+                      </p>
+                      {currentMemory != null && editBody.trim() !== "" && editBody.trim() === currentMemory.body.trim() ? (
+                        <label className="check">
+                          <input
+                            type="checkbox"
+                            checked={confirmUnchanged}
+                            onChange={(event) => setConfirmUnchanged(event.target.checked)}
+                          />
+                          <span>
+                            正文与当前正式记忆（rev {currentMemory.rev}）相同：写入不会改变记忆内容，但所选来源仍会被消费。
+                            确认仍要处理。
+                          </span>
+                        </label>
+                      ) : null}
+                      <div className="row">
+                        <button
+                          className="primary"
+                          disabled={
+                            saving ||
+                            !editBody.trim() ||
+                            !(activeSources.length > 0) ||
+                            conflict != null || // B-02：冲突未走完显式合并步骤前禁止提交
+                            memoryLoadError !== "" || // B-12：正式记忆读取失败时禁止提交
+                            (currentMemory != null && editBody.trim() !== "" && editBody.trim() === currentMemory.body.trim() && !confirmUnchanged)
+                          }
+                          onClick={() => void submitEdit(task, editing === "draft" ? "draft" : "manual")}
+                        >
+                          {saving ? "写入中…" : editing === "draft" ? "确认草稿并写入所选来源" : "确认写入所选来源"}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={saving}
+                          onClick={() => {
+                            resetEditor();
+                            setNote(editing === "draft" ? "已退出草稿审核，未写入。" : "已取消编辑，未写入。");
+                          }}
+                        >
+                          取消编辑
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="row">
+                      <button type="button" onClick={() => void openManual(task)}>
+                        手工整理（载入当前整篇记忆，只处理显式勾选）
+                      </button>
+                      {draft && draft.status === "pending" ? (
+                        <button type="button" className="primary" onClick={() => void openDraftReview(task)}>
+                          审核草稿（载入草稿正文与来源 {draft.sourceIds.length} 条）
+                        </button>
+                      ) : null}
+                    </div>
+                  )}
+                </div>
+              )
             ) : null}
           </article>
         );
       })}
-      {matched.length > shown.length ? (
-        <button type="button" onClick={() => setVisible((value) => value + 20)}>
-          显示更多（还有 {matched.length - shown.length} 个作用域）
-        </button>
+      {(hasMore || page > 0) ? (
+        <div className="row">
+          <button type="button" disabled={page === 0 || Boolean(busy)} onClick={() => setPage((value) => Math.max(0, value - 1))}>
+            上一页
+          </button>
+          <span className="muted">第 {page + 1} 页</span>
+          <button type="button" disabled={!hasMore || Boolean(busy)} onClick={() => setPage((value) => value + 1)}>
+            下一页
+          </button>
+        </div>
       ) : null}
-      {needle && !matched.length ? <p className="muted">没有匹配「{filter}」的作用域。</p> : null}
+      {total === 0 && (filter || abnormalOnly) ? <p className="muted">没有匹配的作用域。</p> : null}
     </div>
   );
 }
@@ -899,54 +1711,78 @@ function QueueView({ refreshKey = 0 }: { refreshKey?: number }) {
   );
 }
 
+/** 材料明细：只负责浏览、拒收与自定义入队；蒸馏写入统一在「待蒸馏任务」审核入口完成（M-05）。 */
 function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
   const [inbox, setInbox] = useState<Inbox[]>([]);
   const [hasMore, setHasMore] = useState(false);
+  const [total, setTotal] = useState(0);
   const [queueStatus, setQueueStatus] = useState<"proposed" | "rejected">("proposed");
+  const [scopeFilter, setScopeFilter] = useState("");
+  const [sourceFilter, setSourceFilter] = useState("");
   const [openId, setOpenId] = useState<string>("");
   const [adding, setAdding] = useState(false);
   const [customTitle, setCustomTitle] = useState("");
   const [customBody, setCustomBody] = useState("");
   const [note, setNote] = useState("");
-  const [draftFor, setDraftFor] = useState("");
-  const [draftBody, setDraftBody] = useState("");
-  const [draftTitle, setDraftTitle] = useState("");
-  const [draftRev, setDraftRev] = useState(0);
-  const [saving, setSaving] = useState(false);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState("");
   const [busyId, setBusyId] = useState("");
+  const [loaded, setLoaded] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
-  const refresh = () =>
-    void api
-      .inbox(queueStatus)
+  const listGen = useRef(0);
+  const refresh = (nextOffset = 0, append = false) => {
+    const gen = ++listGen.current;
+    api
+      .inbox(queueStatus, { scopeId: scopeFilter.trim(), source: sourceFilter.trim(), limit: 50, offset: nextOffset })
       .then((data) => {
-        setInbox(data.inbox);
+        if (gen !== listGen.current) return;
+        setInbox((items) => (append ? [...items, ...data.inbox.filter((item) => !items.some((old) => old.id === item.id))] : data.inbox));
         setHasMore(data.hasMore);
+        setTotal(data.total);
+        setError("");
       })
-      .finally(() => setLoaded(true));
+      .catch((cause) => {
+        if (gen !== listGen.current) return;
+        setError(`读取队列失败：${cause instanceof Error ? cause.message : String(cause)}`);
+      })
+      .finally(() => {
+        if (gen === listGen.current) {
+          setLoaded(true);
+          setLoadingMore(false);
+        }
+      });
+  };
   useEffect(() => {
-    void refresh();
-  }, [refreshKey, queueStatus]);
+    refresh(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey, queueStatus, scopeFilter, sourceFilter]);
   const groups = groupInbox(inbox);
   return (
     <div className="list">
       <p className="muted">{queueStatus === "proposed"
-        ? "待蒸馏材料按仓库名收拢。整理整篇记忆并确认写入后，材料才会从队列移除。"
-        : "这里显示已拒收材料的来源与命中规则。正文不展示；可清理 90 天前的记录。"}</p>
+        ? `按仓库名收拢显示，共 ${total} 条匹配的待蒸馏材料（每次最多取 50 条）。整篇蒸馏写入请在「待蒸馏任务」的审核入口完成；这里只浏览与拒收。`
+        : `这里显示已拒收材料的来源与命中规则（共 ${total} 条）。正文不展示；可清理 90 天前的记录。`}</p>
       <div className="row">
         <button type="button" className={queueStatus === "proposed" ? "active" : ""} onClick={() => setQueueStatus("proposed")}>待蒸馏</button>
         <button type="button" className={queueStatus === "rejected" ? "active" : ""} onClick={() => setQueueStatus("rejected")}>已拒收</button>
+        <label>
+          仓库名
+          <input value={scopeFilter} onChange={(event) => setScopeFilter(event.target.value)} placeholder="精确作用域名，如 OneLedger" />
+        </label>
+        <label>
+          来源
+          <input value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value)} placeholder="如 cursor / workbuddy" />
+        </label>
       </div>
+      {error ? <p className="error" role="alert">{error}</p> : null}
       {queueStatus === "rejected" ? <button type="button" disabled={busyId === "prune"} onClick={async () => {
         if (!window.confirm("清理 90 天前的拒收记录，并将过期脱敏事件汇总归档？")) return;
         setBusyId("prune");
         try {
           const result = await api.pruneHistory();
           setNote(`已清理 ${result.removedRejected} 条拒收记录，归档 ${result.archivedEvents} 条脱敏事件。`);
-          refresh();
-        } catch (error) {
-          setNote(`清理失败：${String(error)}`);
+          refresh(0);
+        } catch (cause) {
+          setError(`清理失败：${cause instanceof Error ? cause.message : String(cause)}`);
         } finally {
           setBusyId("");
         }
@@ -961,19 +1797,19 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
           className="form"
           onSubmit={async (event) => {
             event.preventDefault();
-            if (!customBody.trim() || saving) return;
-            setSaving(true);
+            if (!customBody.trim()) return;
+            setBusyId("add");
             try {
               await api.queueCustom(customBody.trim(), customTitle.trim() || undefined);
               setCustomTitle("");
               setCustomBody("");
               setAdding(false);
               setNote("已加入队列。");
-              refresh();
+              refresh(0);
             } catch (cause) {
-              setNote(`加入失败：${cause instanceof Error ? cause.message : String(cause)}`);
+              setError(`加入失败：${cause instanceof Error ? cause.message : String(cause)}`);
             } finally {
-              setSaving(false);
+              setBusyId("");
             }
           }}
         >
@@ -985,14 +1821,14 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
             自定义原文
             <textarea rows={6} value={customBody} onChange={(event) => setCustomBody(event.target.value)} />
           </label>
-          <button className="primary" type="submit" disabled={saving}>
-            {saving ? "加入中…" : "加入队列"}
+          <button className="primary" type="submit" disabled={busyId === "add"}>
+            {busyId === "add" ? "加入中…" : "加入队列"}
           </button>
         </form>
       ) : null}
       {note ? <p className="ok">{note}</p> : null}
       {!loaded ? <Loading /> : (<>
-      {inbox.length === 0 && !adding ? <p className="muted">{queueStatus === "rejected" ? "暂无拒收记录。" : "队列是空的。"}</p> : null}
+      {inbox.length === 0 && !adding && !error ? <p className="muted">{queueStatus === "rejected" ? "暂无拒收记录。" : "队列是空的。"}</p> : null}
       {groups.map((group) => (
         <details className="queue-group" key={group.key} open={groups.length <= 3}>
           <summary>
@@ -1013,95 +1849,31 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
                   {item.source}
                   {item.scopeId ? ` · ${item.scopeId}` : ""}
                   {item.sensitivity && item.sensitivity !== "public" ? ` · ${item.sensitivity}` : ""}
-                  {item.source.toLowerCase().includes("workbuddy") ? " · 高信号" : ""}
                   {item.hits?.length ? ` · 命中 ${item.hits.join("、")}` : ""}
                 </p>
                 {open ? (
                   <>
                     <p>{item.body}</p>
-                    <p className="muted">{item.createdAt}</p>
+                    <p className="mono muted">{item.id} · {item.createdAt}</p>
                     <div className="row" onClick={(event) => event.stopPropagation()}>
-                      {queueStatus === "proposed" ? <label>
-                        <input type="checkbox" checked={selectedIds.includes(item.id)} onChange={(event) => {
-                          if (!event.target.checked) {
-                            setSelectedIds((ids) => ids.filter((id) => id !== item.id));
-                          } else {
-                            setSelectedIds((ids) => {
-                              const sameScope = ids.filter((id) => inbox.some((candidate) => candidate.id === id && candidate.scopeKind === item.scopeKind && candidate.scopeId === item.scopeId));
-                              return [...sameScope, item.id];
-                            });
-                          }
-                        }} />
-                        选入本次蒸馏
-                      </label> : null}
                       {queueStatus === "proposed" ? <button
                         disabled={Boolean(busyId)}
-                        onClick={async () => {
-                          setBusyId(`draft:${item.id}`);
-                          try {
-                            const { memories } = await api.memories({ scopeKind: item.scopeKind ?? "personal", scopeId: item.scopeId });
-                            const current = memories[0];
-                            setDraftFor(item.id);
-                            setDraftBody(current?.body ?? "");
-                            setDraftTitle(current?.title ?? item.title);
-                            setDraftRev(current?.rev ?? 0);
-                            setSelectedIds((ids) => ids.includes(item.id) ? ids : [item.id]);
-                            setNote("");
-                          } catch (cause) {
-                            setNote(`载入失败：${cause instanceof Error ? cause.message : String(cause)}`);
-                          } finally {
-                            setBusyId("");
-                          }
-                        }}
-                      >
-                        {busyId === `draft:${item.id}` ? "载入中…" : "蒸馏写入"}
-                      </button> : null}
-                      <button
-                        disabled={busyId === `reject:${item.id}`}
                         onClick={async () => {
                           setBusyId(`reject:${item.id}`);
                           try {
                             await api.reject(item.id);
                             setOpenId("");
-                            refresh();
+                            refresh(0);
                           } catch (cause) {
-                            setNote(`丢弃失败：${cause instanceof Error ? cause.message : String(cause)}`);
+                            setError(`丢弃失败：${cause instanceof Error ? cause.message : String(cause)}`);
                           } finally {
                             setBusyId("");
                           }
                         }}
                       >
                         {busyId === `reject:${item.id}` ? "丢弃中…" : "丢弃"}
-                      </button>
+                      </button> : null}
                     </div>
-                    {queueStatus === "proposed" && draftFor === item.id ? (
-                      <div className="form" onClick={(event) => event.stopPropagation()}>
-                        <p className="muted">请根据已选的 {selectedIds.length} 条同作用域材料整理完整记忆。成功写入后，这些材料会从待蒸馏队列移除。</p>
-                        <label>标题<input value={draftTitle} onChange={(event) => setDraftTitle(event.target.value)} /></label>
-                        <label>蒸馏后的正文<textarea rows={12} value={draftBody} onChange={(event) => setDraftBody(event.target.value)} /></label>
-                        <button className="primary" disabled={saving || !draftBody.trim()} onClick={async () => {
-                          setSaving(true);
-                          try {
-                            const result = await api.resolveInbox(selectedIds.length ? selectedIds : [item.id], draftBody.trim(), draftTitle.trim(), draftRev);
-                            if (result.status === "stored" || result.status === "unchanged") {
-                              setDraftFor("");
-                              setOpenId("");
-                              setSelectedIds([]);
-                              setNote("记忆已保存，材料已处理。");
-                              refresh();
-                            } else if (result.status === "conflict") {
-                              setNote(`记忆已更新到 rev ${result.currentRev}，请核对后再写入。`);
-                            } else {
-                              setNote(`写入未成功：${result.status}。`);
-                            }
-                          } catch (error) {
-                            setNote(`写入失败：${String(error)}`);
-                          } finally {
-                            setSaving(false);
-                          }
-                        }}>确认写入</button>
-                      </div>
-                    ) : null}
                   </>
                 ) : (
                   <p className="preview">{preview.length > 72 ? `${preview.slice(0, 72)}…` : preview || "（无正文）"}</p>
@@ -1111,21 +1883,14 @@ function QueuePanel({ refreshKey = 0 }: { refreshKey?: number }) {
           })}
         </details>
       ))}
-      {hasMore ? <button type="button" disabled={loadingMore} onClick={async () => {
+      {hasMore ? <button type="button" disabled={loadingMore} onClick={() => {
         setLoadingMore(true);
-        try {
-          const data = await api.inbox(queueStatus, inbox.length);
-          setInbox((items) => [...items, ...data.inbox.filter((item) => !items.some((old) => old.id === item.id))]);
-          setHasMore(data.hasMore);
-        } finally {
-          setLoadingMore(false);
-        }
-      }}>{loadingMore ? "加载中…" : "加载更多材料"}</button> : null}
+        refresh(inbox.length, true);
+      }}>{loadingMore ? "加载中…" : `加载更多材料（已显示 ${inbox.length}/${total}）`}</button> : null}
       </>)}
     </div>
   );
 }
-
 function AgentsPanel({ refreshKey = 0, collecting = false }: { refreshKey?: number; collecting?: boolean }) {
   const [agents, setAgents] = useState<AgentRow[]>([]);
   const [name, setName] = useState("");
@@ -1860,9 +2625,16 @@ function SettingsPanel({
               存储
               <select value={form.driver} onChange={(event) => setForm({ ...form, driver: event.target.value })}>
                 <option value="sqlite">本机 SQLite</option>
-                <option value="postgres">Postgres</option>
+                {/* B-09：本期只支持 SQLite。PG 在启动前即明确拒绝（避免撞 SQLite 方言报错），
+                    这里保留禁用项向用户说明边界，而不是让用户切过去之后随机失败。 */}
+                <option value="postgres" disabled>
+                  Postgres（本期未支持）
+                </option>
               </select>
             </label>
+            {form.driver === "postgres" ? (
+              <p className="error">当前产品边界：仅支持本机 SQLite。PostgreSQL 支持尚未交付，请改回「本机 SQLite」。</p>
+            ) : null}
             <label>
               SQLite 路径
               <input value={form.sqlitePath} onChange={(event) => setForm({ ...form, sqlitePath: event.target.value })} />

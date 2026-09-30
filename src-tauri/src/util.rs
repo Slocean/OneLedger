@@ -12,10 +12,12 @@ pub fn silent_command(program: &str) -> Command {
     cmd
 }
 
-pub const APP_VERSION: &str = "0.4.13";
+pub const APP_VERSION: &str = "0.4.14";
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
-pub const DATA_SCHEMA_VERSION: i64 = 9;
+pub const DATA_SCHEMA_VERSION: i64 = 12;
 pub const SCAN_RULES_VERSION: i64 = 1;
+/// 一次归并确认最多移动的材料条数；更多材料需要管理员分批确认。
+pub const MERGE_BATCH_LIMIT: i64 = 1000;
 pub const PROTOCOL_VERSION: i32 = 1;
 
 pub fn now_iso() -> String {

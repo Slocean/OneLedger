@@ -22,7 +22,7 @@ export interface DistillDraft {
   expectedRev: number;
   provider: string;
   model: string;
-  status: "pending" | "stale" | "failed" | "discarded";
+  status: "pending" | "stale" | "failed" | "discarded" | "applied";
   staleReason: string;
   error: string;
   attempts: number;
@@ -35,8 +35,9 @@ export interface DistillTask {
   scopeId: string;
   pending: number;
   oldestWaitingAt?: string;
-  highSignal: number;
-  sources: Array<{ id: string; title: string; source: string; sensitivity: string; createdAt: string; redacted: boolean }>;
+  /** WorkBuddy 来源的材料条数（如实计数，不再称作“高信号”）。 */
+  workbuddy: number;
+  abnormal: boolean;
   draft?: DistillDraft;
   lastResult?: { status: string; error: string; attempts: number; at: string };
 }
@@ -51,40 +52,27 @@ export class DistillJobService {
     private readonly config: AppConfig,
   ) {}
 
-  /** 采集完成后按作用域聚合待蒸馏材料，附上待审草稿与最近一次处理结果。 */
-  async tasks(): Promise<DistillTask[]> {
-    const summary = await this.store.inboxScopeSummary();
-    const samples = new Map<string, InboxRecord[]>();
-    for (const item of await this.store.inboxSamplesByScope(40)) {
-      const key = `${item.scopeKind}\u0000${item.scopeId}`;
-      const list = samples.get(key) ?? [];
-      list.push(item);
-      samples.set(key, list);
-    }
-    const drafts = await this.store.allLatestDrafts();
-    return summary.map(({ scopeKind, scopeId, pending, highSignal, oldestAt }) => {
-      const key = `${scopeKind}\u0000${scopeId}`;
-      const draft = drafts.get(key);
+  /** 采集完成后按作用域聚合待蒸馏材料，附上待审草稿与最近一次处理结果。
+   *  服务端分页：本页作用域的摘要与最新草稿各一次查询，样本与明细由 /api/inbox 按需加载。 */
+  async tasksPage(query: string, onlyAbnormal: boolean, limit: number, offset: number): Promise<{ tasks: DistillTask[]; total: number }> {
+    const { rows, total } = await this.store.inboxScopePage(query, onlyAbnormal, limit, offset);
+    const drafts = await this.store.latestDraftsForScopes(rows.map((row) => ({ scopeKind: row.scopeKind, scopeId: row.scopeId })));
+    const tasks = rows.map((row) => {
+      const draft = drafts.get(`${row.scopeKind}\u0000${row.scopeId}`);
       return {
-        scopeKind,
-        scopeId,
-        pending,
-        oldestWaitingAt: oldestAt,
-        highSignal,
-        sources: (samples.get(key) ?? []).map((item) => ({
-          id: item.id,
-          title: item.title,
-          source: item.source,
-          sensitivity: item.sensitivity,
-          createdAt: item.createdAt,
-          redacted: item.redacted === 1,
-        })),
+        scopeKind: row.scopeKind,
+        scopeId: row.scopeId,
+        pending: row.pending,
+        oldestWaitingAt: row.oldestAt,
+        workbuddy: row.workbuddy,
+        abnormal: row.scopeKind === "project" && this.store.scopeIdLooksLikePath(row.scopeId),
         draft,
         lastResult: draft
           ? { status: draft.status, error: draft.error, attempts: draft.attempts, at: draft.updatedAt }
           : undefined,
       };
     });
+    return { tasks, total };
   }
 
   /** 只把通过安全扫描的材料交给模型；任何残留 secret 直接排除并记录。
@@ -160,27 +148,39 @@ export class DistillJobService {
     return { title: title.slice(0, 60), body: rest };
   }
 
-  /** 管理员侧生成草稿：按作用域分批读取安全材料，记录来源与 expectedRev。绝不自动晋升。 */
-  async generateDraft(scopeKind: string, scopeId: string, actor: string): Promise<Record<string, unknown>> {
+  /** 管理员侧生成草稿：只接收管理员显式选中的来源 ID，逐条复核作用域与状态。
+   *  绝不自动晋升。 */
+  async generateDraft(scopeKind: string, scopeId: string, sourceIds: string[], actor: string): Promise<Record<string, unknown>> {
     if (!this.config.distill.provider || this.config.distill.provider === "none") {
       return { status: "error", error: "distill.provider=none：请手工整理正文，或先配置模型提供方。" };
     }
-    const pending = await this.store.inboxScopeSample(scopeKind, scopeId, 200);
-    if (!pending.length) return { status: "error", error: "该作用域没有待蒸馏材料" };
-    const { safe, blocked } = this.safeSources(pending);
-    if (!safe.length) return { status: "error", error: "材料全部未通过安全扫描，未发送给模型", blocked };
-    const used = safe.slice(0, MAX_SOURCES);
+    if (!sourceIds.length) return { status: "error", error: "请先勾选本次要蒸馏的材料" };
+    if (sourceIds.length > MAX_SOURCES) return { status: "error", error: `一次最多选择 ${MAX_SOURCES} 条材料` };
+    const unique = [...new Set(sourceIds)];
+    if (unique.length !== sourceIds.length) return { status: "error", error: "来源材料重复选择" };
+    const scoped: InboxRecord[] = [];
+    for (const id of sourceIds) {
+      const item = await this.store.getInbox(id);
+      if (!item || item.queueStatus !== "proposed" || item.scopeKind !== scopeKind || item.scopeId !== scopeId) {
+        return { status: "error", error: "材料不存在、已被处理或不属于该作用域", inboxId: id };
+      }
+      scoped.push(item);
+    }
+    const { safe, blocked } = this.safeSources(scoped);
+    if (!safe.length) return { status: "error", error: "所选材料全部未通过安全扫描，未发送给模型", blocked };
+    const safeIds = new Set(safe.map((item) => item.id));
+    const used = scoped.filter((item) => safeIds.has(item.id));
     const existing = await this.store.listActiveByScope(scopeKind as InboxRecord["scopeKind"], scopeId);
     const expectedRev = existing[0]?.rev ?? 0;
     const scopeLabel = scopeId ? `${scopeKind}/${scopeId}` : scopeKind;
-    const { system, user } = this.buildPrompt(scopeLabel, existing[0]?.title ?? "", used);
+    const { system, user } = this.buildPrompt(scopeLabel, existing[0]?.title ?? "", safe.map(({ source, body }) => ({ source, body })));
 
     const previous = await this.store.latestDraft(scopeKind, scopeId);
     const attempts = (previous?.attempts ?? 0) + 1;
     if (attempts > MAX_ATTEMPTS) {
       return { status: "error", error: `同一作用域已连续失败 ${MAX_ATTEMPTS} 次，请检查配置后手动重试。` };
     }
-    const fingerprintById = new Map(pending.map((item) => [item.id, sourceFingerprint(item)]));
+    const fingerprintById = new Map(scoped.map((item) => [item.id, sourceFingerprint(item)]));
     const base: DistillDraft = {
       id: previous?.id ?? `dd_${randomUUID().replaceAll("-", "").slice(0, 24)}`,
       scopeKind,

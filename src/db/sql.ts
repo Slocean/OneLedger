@@ -76,4 +76,19 @@ export const INIT_SQL = `
   CREATE INDEX IF NOT EXISTS memories_hash ON memories(content_hash);
   CREATE INDEX IF NOT EXISTS redactions_at ON redaction_events(at);
   CREATE INDEX IF NOT EXISTS inbox_dedupe_prefix ON inbox(source, scope_kind, scope_id, substr(body, 1, 128));
+
+  CREATE TABLE IF NOT EXISTS scope_merge_operations (
+    id TEXT PRIMARY KEY,
+    from_scope_kind TEXT NOT NULL,
+    from_scope_id TEXT NOT NULL,
+    to_scope_kind TEXT NOT NULL,
+    to_scope_id TEXT NOT NULL,
+    moved_ids TEXT NOT NULL,
+    moved_count INTEGER NOT NULL,
+    source_breakdown TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    reverted_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS scope_merge_ops_status ON scope_merge_operations(status, created_at);
 `;

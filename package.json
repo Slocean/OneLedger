@@ -1,6 +1,6 @@
 {
   "name": "oneledger",
-  "version": "0.4.13",
+  "version": "0.4.14",
   "private": true,
   "type": "module",
   "description": "Self-hosted shared memory ledger for coding agents, exposed over MCP.",
@@ -17,7 +17,7 @@
     "icons": "node scripts/sync-icons.mjs",
     "tauri:dev": "node scripts/sync-icons.mjs && tauri dev",
     "tauri:build": "node scripts/sync-icons.mjs && vite build --config web/vite.config.ts && node scripts/sync-web-embed.mjs && tauri build --bundles nsis",
-    "check": "node scripts/validate-release.mjs && tsc --noEmit -p tsconfig.json && vitest run",
+    "check": "node scripts/validate-release.mjs && tsc --noEmit -p tsconfig.json && tsc --noEmit -p web/tsconfig.json && vitest run",
     "test": "vitest run",
     "pack": "node scripts/validate-release.mjs && npm run tauri:build && node scripts/stage-tauri-release.mjs",
     "release": "node scripts/validate-release.mjs && node scripts/trigger-release.mjs"

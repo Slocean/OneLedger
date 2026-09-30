@@ -42,8 +42,9 @@ pub struct DistillTask {
     pub scope_id: String,
     pub pending: i64,
     pub oldest_waiting_at: Option<String>,
-    pub high_signal: i64,
-    pub sources: Vec<serde_json::Value>,
+    /// WorkBuddy 来源的材料条数（如实计数，不再称作“高信号”）。
+    pub workbuddy: i64,
+    pub abnormal: bool,
     pub draft: Option<DistillDraft>,
     pub last_result: Option<serde_json::Value>,
 }
@@ -79,7 +80,7 @@ fn map_draft(row: &rusqlite::Row) -> rusqlite::Result<DistillDraft> {
     })
 }
 
-fn upsert_draft(conn: &Connection, draft: &DistillDraft) -> rusqlite::Result<()> {
+pub(crate) fn upsert_draft(conn: &Connection, draft: &DistillDraft) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO distill_drafts (
            id, scope_kind, scope_id, title, body, source_ids, source_fingerprints,
@@ -145,36 +146,24 @@ fn source_fingerprint(item: &InboxRecord) -> String {
 }
 
 /// 采集完成后按作用域聚合待蒸馏材料，附上待审草稿与最近一次处理结果。
-/// 查询次数固定为 3 次，与作用域数量无关。
-pub fn tasks(conn: &Connection) -> rusqlite::Result<Vec<DistillTask>> {
-    let summary = store::inbox_scope_summary(conn)?;
-    let mut samples: std::collections::HashMap<(String, String), Vec<InboxRecord>> = std::collections::HashMap::new();
-    for item in store::inbox_samples_by_scope(conn, 40)? {
-        samples.entry((item.scope_kind.clone(), item.scope_id.clone())).or_default().push(item);
-    }
-    let mut drafts = all_latest_drafts(conn)?;
+/// 服务端分页：本页作用域的摘要与最新草稿各一次查询，样本与明细由 /api/inbox 按需加载。
+pub fn tasks_page(
+    conn: &Connection,
+    query: &str,
+    only_abnormal: bool,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<(Vec<DistillTask>, i64)> {
+    let (scopes, total) = store::inbox_scope_page(conn, query, only_abnormal, limit, offset)?;
+    let keys: Vec<(String, String)> = scopes
+        .iter()
+        .map(|row| (row.scope_kind.clone(), row.scope_id.clone()))
+        .collect();
+    let mut drafts = latest_drafts_for_scopes(conn, &keys)?;
     let mut out = Vec::new();
-    for (scope_kind, scope_id, pending, high_signal, oldest_at, _) in summary {
-        let key = (scope_kind.clone(), scope_id.clone());
+    for scope in scopes {
+        let key = (scope.scope_kind.clone(), scope.scope_id.clone());
         let draft = drafts.remove(&key);
-        let sources: Vec<serde_json::Value> = samples
-            .get(&key)
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| {
-                        serde_json::json!({
-                            "id": item.id,
-                            "title": item.title,
-                            "source": item.source,
-                            "sensitivity": item.sensitivity,
-                            "createdAt": item.created_at,
-                            "redacted": item.redacted == 1,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         let last_result = draft.as_ref().map(|draft| {
             serde_json::json!({
                 "status": draft.status,
@@ -183,31 +172,49 @@ pub fn tasks(conn: &Connection) -> rusqlite::Result<Vec<DistillTask>> {
                 "at": draft.updated_at,
             })
         });
+        let abnormal = scope.scope_kind == "project" && store::scope_id_looks_like_path(&scope.scope_id);
         out.push(DistillTask {
-            scope_kind,
-            scope_id,
-            pending,
-            oldest_waiting_at: oldest_at,
-            high_signal,
-            sources,
+            scope_kind: scope.scope_kind,
+            scope_id: scope.scope_id,
+            pending: scope.pending,
+            oldest_waiting_at: scope.oldest_at,
+            workbuddy: scope.workbuddy,
+            abnormal,
             draft,
             last_result,
         });
     }
-    Ok(out)
+    Ok((out, total))
 }
 
-/// 一次取回每个作用域的最新草稿。
-fn all_latest_drafts(conn: &Connection) -> rusqlite::Result<std::collections::HashMap<(String, String), DistillDraft>> {
-    let mut stmt = conn.prepare(
+/// 一次取回给定作用域集合各自的最新草稿。
+fn latest_drafts_for_scopes(
+    conn: &Connection,
+    keys: &[(String, String)],
+) -> rusqlite::Result<std::collections::HashMap<(String, String), DistillDraft>> {
+    let mut out = std::collections::HashMap::new();
+    if keys.is_empty() {
+        return Ok(out);
+    }
+    let mut sql = String::from(
         "SELECT * FROM (
            SELECT distill_drafts.*,
                   ROW_NUMBER() OVER (PARTITION BY scope_kind, scope_id ORDER BY updated_at DESC) AS scope_rank
            FROM distill_drafts
-         ) WHERE scope_rank = 1",
-    )?;
-    let rows = stmt.query_map([], map_draft)?;
-    let mut out = std::collections::HashMap::new();
+           WHERE (scope_kind, scope_id) IN (VALUES ",
+    );
+    let mut params: Vec<&str> = Vec::new();
+    for (index, (kind, id)) in keys.iter().enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push_str("(? , ?)");
+        params.push(kind);
+        params.push(id);
+    }
+    sql.push_str(")) WHERE scope_rank = 1");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), map_draft)?;
     for row in rows {
         let draft = row?;
         out.insert((draft.scope_kind.clone(), draft.scope_id.clone()), draft);
@@ -246,7 +253,7 @@ fn build_prompt(task_scope: &str, title: &str, sources: &[(String, String)]) -> 
 
 /// 只把通过安全扫描的材料交给模型；任何残留 secret 直接排除并记录。
 /// 二次验证：替换后的文本仍命中规则时同样排除。
-fn safe_sources(items: &[InboxRecord]) -> (Vec<(String, String)>, Vec<String>) {
+fn safe_sources(items: &[InboxRecord]) -> (Vec<InboxRecord>, Vec<String>) {
     let mut safe = Vec::new();
     let mut blocked = Vec::new();
     for item in items {
@@ -259,7 +266,7 @@ fn safe_sources(items: &[InboxRecord]) -> (Vec<(String, String)>, Vec<String>) {
             blocked.push(item.id.clone());
             continue;
         }
-        safe.push((item.source.clone(), scanned.clean_text));
+        safe.push(item.clone());
     }
     (safe, blocked)
 }
@@ -314,38 +321,59 @@ fn split_title_body(text: &str) -> (String, String) {
     (title.chars().take(60).collect(), rest)
 }
 
-/// 管理员侧生成草稿：按作用域分批读取安全材料，记录来源与 expectedRev。
-/// 草稿只落库待审核，绝不自动晋升为正式记忆。
+/// 管理员侧生成草稿：只接收管理员显式选中的来源 ID，逐条复核作用域与状态，
+/// 记录来源与 expectedRev。草稿只落库待审核，绝不自动晋升为正式记忆。
 pub fn generate_draft(
     conn: &Connection,
     config: &Config,
     scope_kind: &str,
     scope_id: &str,
+    source_ids: &[String],
     actor: &str,
 ) -> serde_json::Value {
     if config.distill.provider == "none" || config.distill.provider.trim().is_empty() {
         return serde_json::json!({"status": "error", "error": "distill.provider=none：请手工整理正文，或先配置模型提供方。"});
     }
-    let scoped: Vec<InboxRecord> = store::inbox_scope_sample(conn, scope_kind, scope_id, 200).unwrap_or_default();
-    if scoped.is_empty() {
-        return serde_json::json!({"status": "error", "error": "该作用域没有待蒸馏材料"});
+    if source_ids.is_empty() {
+        return serde_json::json!({"status": "error", "error": "请先勾选本次要蒸馏的材料"});
+    }
+    if source_ids.len() > MAX_SOURCES {
+        return serde_json::json!({"status": "error", "error": format!("一次最多选择 {MAX_SOURCES} 条材料")});
+    }
+    let mut unique = source_ids.to_vec();
+    unique.sort();
+    unique.dedup();
+    if unique.len() != source_ids.len() {
+        return serde_json::json!({"status": "error", "error": "来源材料重复选择"});
+    }
+    let mut scoped: Vec<InboxRecord> = Vec::new();
+    for id in source_ids {
+        match store::get_inbox(conn, id) {
+            Ok(Some(item))
+                if item.queue_status == "proposed"
+                    && item.scope_kind == scope_kind
+                    && item.scope_id == scope_id =>
+            {
+                scoped.push(item)
+            }
+            Ok(Some(item)) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error": format!("材料不在作用域 {scope_kind}/{scope_id} 或状态已变化"),
+                    "inboxId": item.id,
+                });
+            }
+            _ => {
+                return serde_json::json!({"status": "error", "error": "材料不存在或已被处理", "inboxId": id});
+            }
+        }
     }
     let (safe, blocked) = safe_sources(&scoped);
     if safe.is_empty() {
-        return serde_json::json!({"status": "error", "error": "材料全部未通过安全扫描，未发送给模型", "blocked": blocked});
+        return serde_json::json!({"status": "error", "error": "所选材料全部未通过安全扫描，未发送给模型", "blocked": blocked});
     }
-    let used: Vec<&InboxRecord> = scoped
-        .iter()
-        .filter(|item| !blocked.contains(&item.id))
-        .take(MAX_SOURCES)
-        .collect();
-    let safe_for_prompt: Vec<(String, String)> = used
-        .iter()
-        .map(|item| {
-            let scanned = scan_and_redact(&format!("{}\n{}", item.title, item.body));
-            (item.source.clone(), scanned.clean_text)
-        })
-        .collect();
+    let safe_ids: std::collections::HashSet<&str> = safe.iter().map(|item| item.id.as_str()).collect();
+    let used: Vec<&InboxRecord> = scoped.iter().filter(|item| safe_ids.contains(item.id.as_str())).collect();
     let existing = store::list_active_by_scope(conn, scope_kind, scope_id).unwrap_or_default();
     let expected_rev = existing.first().map(|item| item.rev).unwrap_or(0);
     let existing_title = existing.first().map(|item| item.title.clone()).unwrap_or_default();
@@ -354,6 +382,13 @@ pub fn generate_draft(
     } else {
         format!("{scope_kind}/{scope_id}")
     };
+    let safe_for_prompt: Vec<(String, String)> = used
+        .iter()
+        .map(|item| {
+            let scanned = scan_and_redact(&format!("{}\n{}", item.title, item.body));
+            (item.source.clone(), scanned.clean_text)
+        })
+        .collect();
     let (system, user) = build_prompt(&scope_label, &existing_title, &safe_for_prompt);
 
     let previous = latest_draft(conn, scope_kind, scope_id).ok().flatten();
@@ -468,9 +503,27 @@ pub fn discard_draft(conn: &Connection, id: &str, actor: &str) -> bool {
     true
 }
 
+/// B-02：草稿提交遇到 rev 冲突时把草稿标记为过期——
+/// 禁止给旧 draftId 换新 rev 重试，管理员必须废弃后重新生成或从最新正文手工整理。
+pub fn mark_draft_stale(conn: &Connection, id: &str, reason: &str) -> bool {
+    let Ok(Some(draft)) = get_draft(conn, id) else { return false };
+    if draft.status != "pending" {
+        return false;
+    }
+    let mut next = draft;
+    next.status = "stale".into();
+    next.stale_reason = reason.chars().take(200).collect();
+    next.updated_at = now_iso();
+    if upsert_draft(conn, &next).is_err() {
+        return false;
+    }
+    let _ = store::audit(conn, "system", "distill.stale_on_conflict", id);
+    true
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{discard_draft, generate_draft, latest_draft, mark_stale_if_changed, tasks};
+    use super::{discard_draft, generate_draft, latest_draft, mark_stale_if_changed, tasks_page, MAX_SOURCES};
     use crate::config;
     use crate::db;
     use crate::service::MemoryService;
@@ -482,20 +535,81 @@ mod tests {
     }
 
     #[test]
-    fn groups_pending_material_into_tasks_with_high_signal_first() {
+    fn groups_pending_material_into_tasks_with_workbuddy_counted() {
         let conn = db::open_db(":memory:").expect("db");
         let config = config::default_config();
         queue(&conn, &config, "第一条采集材料");
         queue(&conn, &config, "第二条采集材料");
         let workbuddy = MemoryService::remember(&conn, &config, "WorkBuddy 摘要材料", None, "workbuddy", Some("project"), Some("OneLedger"), "collector:workbuddy", false, None);
         assert_eq!(workbuddy["status"], "queued");
-        let items = tasks(&conn).expect("tasks");
+        let (items, total) = tasks_page(&conn, "", false, 50, 0).expect("tasks");
+        assert_eq!(total, 1);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].scope_id, "OneLedger");
         assert_eq!(items[0].pending, 3);
-        assert_eq!(items[0].high_signal, 1);
-        assert_eq!(items[0].sources[0]["source"], "workbuddy");
+        assert_eq!(items[0].workbuddy, 1);
+        assert!(!items[0].abnormal);
         assert!(items[0].oldest_waiting_at.is_some());
+        // 归属待修正筛选：正常作用域不出现
+        let (abnormal, abnormal_total) = tasks_page(&conn, "", true, 50, 0).expect("abnormal");
+        assert_eq!(abnormal_total, 0);
+        assert!(abnormal.is_empty());
+    }
+
+    #[test]
+    fn abnormal_filter_surfaces_path_scopes_for_review() {
+        let conn = db::open_db(":memory:").expect("db");
+        let config = config::default_config();
+        queue(&conn, &config, "正常仓库材料");
+        MemoryService::remember(&conn, &config, "路径型作用域材料", None, "cursor", Some("project"), Some("skills\\system\\x"), "collector:cursor", false, None);
+        let (abnormal, total) = tasks_page(&conn, "", true, 50, 0).expect("abnormal");
+        assert_eq!(total, 1);
+        assert_eq!(abnormal[0].scope_id, "skills\\system\\x");
+        assert!(abnormal[0].abnormal);
+    }
+
+    #[test]
+    fn draft_generation_requires_explicit_selected_sources() {
+        let conn = db::open_db(":memory:").expect("db");
+        let mut config = config::default_config();
+        config.distill.provider = "openai-compatible".into();
+        config.distill.base_url = "http://127.0.0.1:9/never".into();
+        config.distill.model = "test-model".into();
+        let source = queue(&conn, &config, "没有模型时也要能手工整理");
+        // 未选中：禁止生成
+        let refused = generate_draft(&conn, &config, "project", "OneLedger", &[], "admin");
+        assert_eq!(refused["status"], "error");
+        // 选中后才会调用模型（这里模型不可达，应失败且来源保留）
+        let result = generate_draft(&conn, &config, "project", "OneLedger", &[source], "admin");
+        assert_eq!(result["status"], "failed");
+        assert_eq!(crate::store::list_inbox(&conn).expect("inbox").len(), 1);
+    }
+
+    #[test]
+    fn draft_generation_rejects_sources_outside_scope_or_over_limit() {
+        let conn = db::open_db(":memory:").expect("db");
+        let mut config = config::default_config();
+        config.distill.provider = "openai-compatible".into();
+        config.distill.base_url = "http://127.0.0.1:9/never".into();
+        config.distill.model = "test-model".into();
+        let source = queue(&conn, &config, "归属正确的一条材料");
+        // 其他作用域的材料被拒绝
+        let other = MemoryService::remember(&conn, &config, "别的作用域的材料", None, "cursor", Some("project"), Some("Elsewhere"), "collector:cursor", false, None);
+        assert_eq!(other["status"], "queued");
+        let other_id = other["inboxId"].as_str().unwrap().to_string();
+        let mismatch = generate_draft(&conn, &config, "project", "OneLedger", &[other_id], "admin");
+        assert_eq!(mismatch["status"], "error");
+        assert!(mismatch["inboxId"].as_str().is_some());
+        // 超过单批上限被拒绝
+        let many: Vec<String> = (0..MAX_SOURCES + 1)
+            .map(|index| {
+                let item = MemoryService::remember(&conn, &config, &format!("批量材料第{index}条，内容足够长以通过最短限制"), None, "cursor", Some("project"), Some("OneLedger"), "collector:cursor", false, None);
+                item["inboxId"].as_str().unwrap().to_string()
+            })
+            .collect();
+        let over = generate_draft(&conn, &config, "project", "OneLedger", &many, "admin");
+        assert_eq!(over["status"], "error");
+        let _ = source;
     }
 
     #[test]
@@ -503,11 +617,11 @@ mod tests {
         let conn = db::open_db(":memory:").expect("db");
         let config = config::default_config();
         let source = queue(&conn, &config, "没有模型时也要能手工整理");
-        let result = generate_draft(&conn, &config, "project", "OneLedger", "admin");
+        let result = generate_draft(&conn, &config, "project", "OneLedger", &[source.clone()], "admin");
         assert_eq!(result["status"], "error");
         assert!(result["error"].as_str().unwrap().contains("手工整理"));
         assert!(crate::store::list_active(&conn).expect("active").is_empty());
-        let done = MemoryService::confirm_sources(&conn, &config, &[source], "手工整理的整篇", None, "admin", Some(0));
+        let done = MemoryService::confirm_sources(&conn, &config, &[source], "手工整理的整篇", None, "admin", Some(0), None);
         assert_eq!(done["status"], "stored");
     }
 
@@ -518,8 +632,8 @@ mod tests {
         config.distill.provider = "openai-compatible".into();
         config.distill.base_url = "http://127.0.0.1:9/never".into();
         config.distill.model = "test-model".into();
-        queue(&conn, &config, "模型失败时来源不能丢");
-        let result = generate_draft(&conn, &config, "project", "OneLedger", "admin");
+        let source = queue(&conn, &config, "模型失败时来源不能丢");
+        let result = generate_draft(&conn, &config, "project", "OneLedger", &[source], "admin");
         assert_eq!(result["status"], "failed");
         assert!(!result["error"].as_str().unwrap_or("").is_empty());
         assert_eq!(crate::store::list_inbox(&conn).expect("inbox").len(), 1);
@@ -554,15 +668,28 @@ mod tests {
             updated_at: crate::util::now_iso(),
         };
         crate::store::audit(&conn, "admin", "distill.draft", &draft.id).expect("audit");
-        draft.source_fingerprints = draft.source_ids.clone();
+        // B-03：草稿必须携带与来源一致的指纹快照，否则提交会在事务内被拒
+        draft.source_fingerprints = draft
+            .source_ids
+            .iter()
+            .filter_map(|id| crate::store::get_inbox(&conn, id).ok().flatten().map(|item| super::source_fingerprint(&item)))
+            .collect();
         assert!(super::upsert_draft(&conn, &draft).is_ok());
         // 未审核：Agent 看不到
         assert!(MemoryService::search(&conn, &config, "未审核的草稿正文", "agent", 8, None, None).is_empty());
         assert!(MemoryService::get(&conn, &config, "agent", None, Some("project"), Some("OneLedger")).is_empty());
         assert!(crate::store::list_active(&conn).expect("active").is_empty());
-        // 审核通过后才进入正式记忆
-        let done = MemoryService::confirm_sources(&conn, &config, &[source], "未经审核的草稿正文", Some("草稿标题"), "admin", Some(0));
+        // 审核通过后才进入正式记忆：按草稿入口提交（draft_id 校验来源集合一致）
+        let done = MemoryService::confirm_sources(&conn, &config, &[source], "未经审核的草稿正文", Some("草稿标题"), "admin", Some(0), Some("dd_test"));
         assert_eq!(done["status"], "stored");
+        let applied = latest_draft(&conn, "project", "OneLedger").expect("draft").expect("row");
+        assert_eq!(applied.status, "applied");
+        // 草稿应用后：Agent 才能看到
+        assert!(!MemoryService::search(&conn, &config, "未经审核的草稿正文", "agent", 8, None, None).is_empty());
+        // 手工路径在草稿应用后恢复可用
+        let another = queue(&conn, &config, "草稿应用后的新材料");
+        let manual = MemoryService::confirm_sources(&conn, &config, &[another], "手工整理的整篇", None, "admin", Some(1), None);
+        assert_eq!(manual["status"], "stored");
     }
 
     #[test]
@@ -597,7 +724,7 @@ mod tests {
         assert_eq!(after.status, "stale");
         assert!(after.body.contains("过期草稿正文"));
         assert_eq!(crate::store::list_inbox(&conn).expect("inbox").len(), 1);
-        let conflict = MemoryService::confirm_sources(&conn, &config, &[source], "过期草稿正文", Some("草稿标题"), "admin", Some(0));
+        let conflict = MemoryService::confirm_sources(&conn, &config, &[source], "过期草稿正文", Some("草稿标题"), "admin", Some(0), None);
         assert_eq!(conflict["status"], "conflict");
         assert_eq!(crate::store::list_active(&conn).expect("active").len(), 1);
     }

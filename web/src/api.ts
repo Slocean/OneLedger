@@ -82,10 +82,10 @@ export const api = {
       body: JSON.stringify({ body, title }),
     }),
   reject: (id: string) => request<{ ok: boolean }>(`/api/inbox/${id}/reject`, { method: "POST" }),
-  resolveInbox: (ids: string[], body: string, title: string, expectedRev: number) =>
-    request<{ status: string; currentRev?: number; hits?: Array<{ type: string; field?: string; line?: number }> }>("/api/inbox/resolve", {
+  resolveInbox: (ids: string[], body: string, title: string, expectedRev: number, opts?: { draftId?: string }) =>
+    request<ResolveResult>("/api/inbox/resolve", {
       method: "POST",
-      body: JSON.stringify({ ids, body, title, expectedRev }),
+      body: JSON.stringify({ ids, body, title, expectedRev, draftId: opts?.draftId }),
     }),
   updates: () => {
     const controller = new AbortController();
@@ -98,15 +98,56 @@ export const api = {
     request<{ ok: boolean; message?: string; error?: string; html_url?: string }>("/api/updates/install", {
       method: "POST",
     }),
-  inbox: (status: "proposed" | "rejected" = "proposed", offset = 0) => request<{ inbox: Inbox[]; hasMore: boolean }>(`/api/inbox?status=${status}&offset=${offset}`),
+  inbox: (
+    status: "proposed" | "rejected" = "proposed",
+    opts?: { scopeKind?: string; scopeId?: string; source?: string; limit?: number; offset?: number; ids?: string[]; draftId?: string },
+  ) => {
+    const params = new URLSearchParams({ status });
+    if (opts?.scopeKind) params.set("scopeKind", opts.scopeKind);
+    if (opts?.scopeId) params.set("scopeId", opts.scopeId);
+    if (opts?.source) params.set("source", opts.source);
+    if (opts?.ids?.length) params.set("ids", opts.ids.join(","));
+    if (opts?.draftId) params.set("draftId", opts.draftId);
+    params.set("limit", String(opts?.limit ?? 50));
+    params.set("offset", String(opts?.offset ?? 0));
+    return request<{ inbox: Inbox[]; total: number; limit: number; offset: number; hasMore: boolean }>(
+      `/api/inbox?${params.toString()}`,
+    );
+  },
   pruneHistory: () => request<{ ok: boolean; archivedEvents: number; removedRejected: number }>("/api/history/prune", { method: "POST" }),
-  distillTasks: () => request<{ tasks: DistillTask[]; provider: string; model: string }>("/api/distill/tasks"),
-  distillDraft: (scopeKind: string, scopeId: string) =>
+  distillTasks: (opts?: { query?: string; abnormal?: boolean; limit?: number; offset?: number }) => {
+    const params = new URLSearchParams();
+    if (opts?.query) params.set("query", opts.query);
+    if (opts?.abnormal) params.set("abnormal", "1");
+    params.set("limit", String(opts?.limit ?? 30));
+    params.set("offset", String(opts?.offset ?? 0));
+    return request<{ tasks: DistillTask[]; total: number; limit: number; offset: number; hasMore: boolean; provider: string; model: string }>(
+      `/api/distill/tasks?${params.toString()}`,
+    );
+  },
+  distillDraft: (scopeKind: string, scopeId: string, sourceIds: string[]) =>
     request<{ status: string; draft?: DistillDraft; error?: string; blocked?: string[]; attempts?: number }>("/api/distill/draft", {
       method: "POST",
-      body: JSON.stringify({ scopeKind, scopeId }),
+      body: JSON.stringify({ scopeKind, scopeId, sourceIds }),
     }),
   discardDraft: (id: string) => request<{ ok: boolean }>(`/api/distill/draft/${id}/discard`, { method: "POST" }),
+  mergePreview: (fromScopeId: string, toScopeId: string, fromScopeKind = "project") =>
+    request<ScopeMergePreview>("/api/scopes/merge/preview", {
+      method: "POST",
+      body: JSON.stringify({ fromScopeKind, fromScopeId, toScopeId }),
+    }),
+  /** B-07：确认只归并管理员显式勾选、经核对的精确 ID 子集。 */
+  mergeConfirm: (fromScopeId: string, toScopeId: string, digest: string, ids: string[], fromScopeKind = "project") =>
+    request<ScopeMergeResult>("/api/scopes/merge/confirm", {
+      method: "POST",
+      body: JSON.stringify({ fromScopeKind, fromScopeId, toScopeId, digest, ids }),
+    }),
+  mergeRevert: (operationId: string) =>
+    request<ScopeMergeRevert>("/api/scopes/merge/revert", { method: "POST", body: JSON.stringify({ operationId }) }),
+  mergeOperations: (offset = 0) =>
+    request<{ operations: ScopeMergeOperationRow[]; total: number }>(`/api/scopes/merge/operations?limit=20&offset=${offset}`),
+  fingerprintReport: () =>
+    request<{ status: string; note: string; operations: Array<Record<string, unknown>> }>("/api/scopes/merge/fingerprint-report"),
   audit: () => request<{ audit: Audit[]; redactions: Redaction[] }>("/api/audit"),
   collect: () => request<{ results: Collect[] }>("/api/collect", { method: "POST" }),
   agents: () => request<{ agents: AgentRow[] }>("/api/agents"),
@@ -195,10 +236,23 @@ export interface Inbox {
   scopeKind?: string;
   scopeId?: string;
   sensitivity: string;
+  /** 与后端一致：整数（0/1）。Rust API 返回整数；前端只做真值判断。 */
+  redacted?: number;
   createdAt: string;
   queueStatus: string;
   conflictIds: string[];
   hits?: string[];
+}
+
+/** /api/inbox/resolve 的结果：conflict 时前端必须进入阻断合并，不得直接改用 currentRev 重试。 */
+export interface ResolveResult {
+  status: "stored" | "unchanged" | "conflict" | "rejected" | "error";
+  memoryId?: string;
+  rev?: number;
+  currentRev?: number;
+  error?: string;
+  draftId?: string;
+  hits?: Array<{ type: string; field?: string; line?: number }>;
 }
 
 export interface DistillDraft {
@@ -225,10 +279,65 @@ export interface DistillTask {
   scopeId: string;
   pending: number;
   oldestWaitingAt?: string;
-  highSignal: number;
-  sources: Array<{ id: string; title: string; source: string; sensitivity: string; createdAt: string; redacted: boolean }>;
+  workbuddy: number;
+  abnormal: boolean;
   draft?: DistillDraft;
   lastResult?: { status: string; error: string; attempts: number; at: string };
+}
+
+export interface ScopeMergePreview {
+  status: string;
+  error?: string;
+  fromScopeId?: string;
+  toScopeId?: string;
+  pending?: number;
+  /** 本批将移动的条数（≤ batchLimit）。 */
+  batch?: number;
+  /** 本批之后来源作用域剩余的待处理条数。 */
+  remaining?: number;
+  batchLimit?: number;
+  sourceBreakdown?: Array<{ source: string; count: number }>;
+  /** 来源分布截断说明（top20 之外）。 */
+  otherCount?: number;
+  otherKinds?: number;
+  /** 本批全部条目的脱敏元数据（≤1000 条），供逐条核对归属并勾选子集（B-07）。 */
+  batchItems?: Array<{ id: string; title: string; source: string; createdAt: string; sensitivity: string }>;
+  toPending?: number;
+  toMemory?: { id: string; rev: number; updatedAt: string } | null;
+  drafts?: Array<{ scopeId: string; id: string; status: string; updatedAt: string; staleReason: string }>;
+  blocked?: string[];
+  digest?: string;
+}
+
+export interface ScopeMergeResult {
+  status: "applied" | "conflict" | "blocked" | "error" | "unsupported";
+  operationId?: string;
+  moved?: number;
+  toScopeId?: string;
+  /** applied 后来源作用域剩余的待处理条数。 */
+  remaining?: number;
+  error?: string;
+  preview?: ScopeMergePreview;
+}
+
+export interface ScopeMergeRevert {
+  status: "reverted" | "already-reverted" | "conflict" | "error" | "unsupported";
+  operationId?: string;
+  reverted?: number;
+  error?: string;
+}
+
+export interface ScopeMergeOperationRow {
+  id: string;
+  fromScopeKind: string;
+  fromScopeId: string;
+  toScopeKind: string;
+  toScopeId: string;
+  movedCount: number;
+  sourceBreakdown: Record<string, number>;
+  status: string;
+  createdAt: string;
+  revertedAt: string | null;
 }
 
 export interface Audit {

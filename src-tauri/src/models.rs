@@ -34,6 +34,10 @@ pub struct InboxRecord {
     pub queue_status: String,
     pub conflict_ids: Vec<String>,
     pub created_at: String,
+    /// 稳定来源键（规范化绝对路径等）；空串表示人工创建或 v12 之前的历史行。
+    /// 同仓库不同文件同文时靠它区分，不再把其他文件的相同正文当唯一依据（B-05）。
+    #[serde(default)]
+    pub source_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,4 +91,7 @@ pub struct CollectResult {
     pub queued: i64,
     pub skipped: i64,
     pub redacted: i64,
+    /// 事务失败（含采集指纹登记失败）而本轮未处理的文件数；失败文件不写指纹，下一轮重扫重试。
+    #[serde(default)]
+    pub errors: i64,
 }

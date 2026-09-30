@@ -16,6 +16,9 @@ pub struct Config {
     pub security: SecurityConfig,
     pub update_url: String,
     pub admin_token: String,
+    /// 开发验收通道（WebView 内 dev driver）。默认关闭；隔离验收实例显式开启。
+    #[serde(default)]
+    pub dev_ui: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +142,7 @@ pub fn default_config() -> Config {
         },
         update_url: String::new(),
         admin_token: random_secret(24),
+        dev_ui: false,
     }
 }
 

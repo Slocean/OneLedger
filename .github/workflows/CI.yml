@@ -12,7 +12,12 @@ permissions:
 
 jobs:
   verify:
-    runs-on: windows-latest
+    # AGENTS.md 门槛：Linux 的 check 与 Windows 的 CI 都要过（P1-08）
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
 
     steps:
