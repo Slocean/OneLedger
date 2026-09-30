@@ -1,6 +1,18 @@
 # ZCode 存量材料治理一期：修复与复验结果
 
-## Codex 最终独立复验（2026-09-30，Windows 验收，当前有效结论）
+## v0.4.14 正式发版完成（2026-09-30，发布进度事实）
+
+**OneLedger v0.4.14 已正式发布。** 本节记录发布链路与上传成品核实；「Windows 已验收」边界不变，不把发布成功说成 Linux 业务 UI 验收（Linux 仅 CI check 通过）。用户已授权完整发版流程；真实账本与凭据未触碰。
+
+- **提交与 CI**：`main` 新提交 `4389337`（Release v0.4.14 with governance security hardening，63 文件 +9363/−787，含业务源码/测试/前端正式资产/CI/文档/验收工具/AGENTS/.zcode 模板；不含临时 DB、secret、.governance-test 证据——该目录 Git 忽略）。推送后 CI：`check.yml` run `36722022853` success（27s）；`CI.yml` run `36722023008` success（1m22s），job `verify (ubuntu-latest)` 与 `verify (windows-latest)` 均 success——**Linux check 首次真实通过**。
+- **tag 与 Release**：tag `v0.4.14` 指向 `4389337`；Release run `36722273492` success（9m44s），job `quality / verify (windows-latest)`、`quality / verify (ubuntu-latest)`、`build-and-release` 全部 success。
+- **发布成品**（https://github.com/Slocean/OneLedger/releases/tag/v0.4.14 ，非 draft、非 prerelease、Latest，target main）：`OneLedger-Setup.exe`（2,988,238 字节，SHA-256 `b34b6add9f8d8088fb0f1439a55ebd76c1dc2cc755a5f7c2eef574e5e2430357`）、`OneLedger-Portable.exe`（8,050,688 字节，SHA-256 `7a8477f7c3bbade61d4c136955a95508016e3641c5133735c57e00ae2ab1f771`）及两个 `.sha256` 文件。**上传成品已下载回核验**：hash 与 .sha256 一致，portable 内嵌 0.4.14（4 处）、0 处 dev 路由/driver 字符串。
+- **本地产物链**：app_update.json 顶部 0.4.14 body 的「从 0.4.13 升级」改述为「从上一版本升级」，`validate-release.mjs --notes` 重新生成 release-notes.md（无旧字面版本，validate PASS）；正式前端构建（无 `ONELEDGER_DEV_DRIVER`，资产 `index-j_X-1YtX.js` 与内嵌逐字节一致）；`tauri build --bundles nsis` 重新打包（NSIS `OneLedger_0.4.14_x64-setup.exe` SHA-256 `d9ff998faddd6fbd6ddd3d08663a4612bfceece0e572a42002a3bdbba3a925a6`；portable `OneLedger.exe` SHA-256 `00af9de512074e858e094462407f45ac7d3831b58fd957276fadf5246feac43f`，21:25 staging 至 `release/`，不复用 19:51 旧 setup）。CI 打包的 exe hash 与本机不同属正常（环境差异），上传成品以 CI 产物与 .sha256 为准。
+- **发布冒烟**：新增 `scripts/acceptance-release-smoke.mjs`——隔离 HOME + 端口 17460、采集全关、devUi=false 启动 `release/OneLedger-Portable.exe`：`/api/health` ok（oneledger 0.4.14）、`/api/version` 0.4.14 + dataSchema 12、签发 Agent 密钥 + trusted_mcp_sources 预置后 MCP `initialize` 返回 oneledger 0.4.14、`memory.get(project, OneLedger)` 按约定返回空数组；PASS，测试进程与隔离目录已清理。
+- **主动召回记录**：本发版会话开始时按 AGENTS 尝试 OneLedger `memory.get(project, OneLedger)`——本会话工具清单没有 OneLedger memory MCP 工具，如实记录未取到正式记忆，未把 .zcode 自带 Memory 当正式记忆。
+- **构建环境备注**：本机 `npm run pack` / `tauri build` 在部分调用形态下会静默空操作（exit 0、无输出、产物不动；直跑原生 `run()` 回调正常）——重建前端/打包必须核实真实产物 mtime/hash，不能只看命令成功。
+
+## Codex 最终独立复验（2026-09-30，Windows 验收；其「远程 CI 尚未运行」一句已被上方发版完成取代）
 
 **按用户最新要求，本次暂时只验收 Windows；Windows 范围验收通过，已复现的缺陷修复完成。** 本轮按用户指示，经 ZCode MCP 反复交回失败条件、修复、再独立验收。后续验证只通过项目 MCP 和隔离测试执行，未再使用电脑桌面自动化。
 

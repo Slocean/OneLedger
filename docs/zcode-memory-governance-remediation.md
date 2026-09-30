@@ -1,6 +1,8 @@
 # ZCode 执行任务书：存量材料治理一期完整修复与复验
 
-**最终独立复验状态（2026-09-30，当前有效）：用户限定本次暂时只验收 Windows，Windows 范围已通过。** Codex 经 ZCode MCP 多轮反馈并独立验收：Windows 上 Node 22 check 82 项、Rust 84 项通过；stdio MCP 隔离 Tauri 55/55 项、最终正式构建 HTTP MCP/API 12/12 项通过，负向复现和产物核对均通过。测试实例与端口已关闭，真实存量材料未参与。Linux 暂不在本次验收范围；远程 CI 未运行作为后续验证事项保留，不阻断本次 Windows 本机验收。本次未请求或执行发版。最终证据和产物见[结果文档顶部](zcode-memory-governance-results.md)。下方状态均为各轮当时的历史记录。
+**v0.4.14 正式发版完成（2026-09-30）。** 用户已授权完整发版流程并执行完毕：提交 `4389337` 推送 main、CI `check` run 36722022853 与 `CI` run 36722023008 全绿（verify ubuntu+windows 双 job）、tag `v0.4.14`、Release run 36722273492（quality + build-and-release）成功、GitHub Release https://github.com/Slocean/OneLedger/releases/tag/v0.4.14 已发布（非 draft/prerelease、Latest；Setup/Portable + 两个 .sha256 上传完整，成品已下载回核验 hash 与内嵌版本）。发布链路细节、本地产物 hash 与发布冒烟见[结果文档顶部「v0.4.14 正式发版完成」](zcode-memory-governance-results.md)。边界：Linux 仅 CI check 通过，业务 UI 未在 Linux 验收；真实账本未触碰。
+
+**最终独立复验状态（2026-09-30）：用户限定本次暂时只验收 Windows，Windows 范围已通过（其「远程 CI 未运行」一句已被上方发版完成取代）。** Codex 经 ZCode MCP 多轮反馈并独立验收：Windows 上 Node 22 check 82 项、Rust 84 项通过；stdio MCP 隔离 Tauri 55/55 项、最终正式构建 HTTP MCP/API 12/12 项通过，负向复现和产物核对均通过。测试实例与端口已关闭，真实存量材料未参与。最终证据和产物见[结果文档顶部](zcode-memory-governance-results.md)。下方状态均为各轮当时的历史记录。
 
 **第六轮收尾历史状态（2026-09-30，ZCode 自报，已由上方 Windows 独立验收取代）。** 当时 Codex 已独立验证源码（npm run check 82 用例、cargo 84 通过 + 2 ignored、负向复现通过）；ZCode 已完成来源安全复核、数据库失败关闭、平台路径身份和 MCP 确认/取消语义修复，等待独立 MCP 验收。产物与本轮结果见[结果文档](zcode-memory-governance-results.md)。
 
